@@ -162,6 +162,9 @@ pub struct MediaRequest {
     pub uri: String,
     pub source_hint: MediaSourceHint,
     pub http_headers: Vec<(String, String)>,
+    /// DASH 双流的音频流 URI。有值时分流打开（Demuxer::open_video_audio），
+    /// 音频请求复用 `http_headers`（同一 CDN 签名直链）。
+    pub audio_uri: Option<String>,
 }
 
 /// Hand-written so that credentials carried by custom headers (`Authorization`,
@@ -171,6 +174,7 @@ impl std::fmt::Debug for MediaRequest {
         formatter
             .debug_struct("MediaRequest")
             .field("uri", &self.uri)
+            .field("audio_uri", &self.audio_uri)
             .field("source_hint", &self.source_hint)
             .field(
                 "http_headers",
@@ -190,11 +194,18 @@ impl MediaRequest {
             uri: uri.into(),
             source_hint: MediaSourceHint::Auto,
             http_headers: Vec::new(),
+            audio_uri: None,
         }
     }
 
     pub fn with_http_headers(mut self, http_headers: Vec<(String, String)>) -> Self {
         self.http_headers = http_headers;
+        self
+    }
+
+    /// 附加 DASH 音频流 URI（与主 URI 组成双流播放）。
+    pub fn with_audio_uri(mut self, audio_uri: impl Into<String>) -> Self {
+        self.audio_uri = Some(audio_uri.into());
         self
     }
 }
@@ -615,6 +626,9 @@ pub enum WgpuSurfaceKind {
     MacOsCaMetalLayer,
     IosUiView,
     WindowsHwnd,
+    /// WinUI 3 `SwapChainPanel` 嵌入：`raw_window` 携带 `ISwapChainPanelNative*` 指针。
+    /// 渲染经 composition swap chain（`CreateSwapChainForComposition`）写入 XAML 树。
+    WindowsSwapChainPanel,
     XlibWindow,
     WaylandSurface,
     AndroidNativeWindow,
@@ -725,7 +739,7 @@ impl FlutterTextureHandle {
     }
 }
 
-pub trait RendererBackend {
+pub trait RendererBackend: Send {
     fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()>;
     fn detach_surface(&mut self) -> Result<()>;
     fn resize_surface(&mut self, metrics: SurfaceMetrics) -> Result<()>;
@@ -870,6 +884,8 @@ struct PlayerInner {
     audio_frame_sender: Option<Sender<PlayerAudioFrame>>,
     subtitle_frame_sender: Option<Sender<PlayerSubtitleFrame>>,
     subtitle_frame_backpressure_drops: u64,
+    /// 异步 open 期间收到的 play() 请求：Ready 后自动播放
+    pending_play: bool,
 }
 
 struct PlayerLifecycle {
@@ -1003,6 +1019,7 @@ impl Player {
                 audio_frame_sender: None,
                 subtitle_frame_sender: None,
                 subtitle_frame_backpressure_drops: 0,
+                pending_play: false,
             })),
             lifecycle: Arc::new(Mutex::new(PlayerLifecycle {
                 epoch: 1,
@@ -1125,6 +1142,12 @@ impl Player {
         receiver
     }
 
+    /// 打开媒体（**异步**）：引擎创建（网络 IO + 解封装探测 + 解码器初始化，
+    /// 慢网络下可耗时数秒至数十秒）在后台线程执行，本方法**立即返回**，
+    /// 不阻塞调用线程（UI）。
+    ///
+    /// 完成时发出 `StateChanged(Ready)` 事件；期间调用 `play()` 会排队，
+    /// Ready 后自动播放。并发 open 以最后一次为准（epoch 检查）。
     pub fn open(&self, media: MediaRequest) -> Result<()> {
         let epoch = {
             let mut lifecycle = self
@@ -1142,20 +1165,46 @@ impl Player {
             self.transition(PlayerState::Opening)?;
             epoch
         };
+        let player = self.clone();
+        std::thread::spawn(move || {
+            let _ = player.complete_open_in_background(media, epoch);
+        });
+        Ok(())
+    }
+
+    /// 后台线程：创建引擎并完成 open（状态机回填 + 事件 + 排队的 play）。
+    fn complete_open_in_background(&self, media: MediaRequest, epoch: u64) -> Result<()> {
+        trace::diagnostic(
+            serde_json::json!({
+                "event": "bg_open_start",
+                "epoch": epoch,
+                "uri": &media.uri,
+                "audio": &media.audio_uri,
+            })
+            .to_string(),
+        );
         let mut engine = match VideoPlaybackEngine::open_with_decoder_resources(
             &media,
-            self.config.playback,
+            self.config.playback.clone(),
             self.decoder_resources.clone(),
         ) {
             Ok(engine) => engine,
             Err(error) => {
                 let error = PlayerError::Playback(error.to_string());
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "bg_open_failed",
+                        "epoch": epoch,
+                        "error": error.to_string(),
+                    })
+                    .to_string(),
+                );
                 let lifecycle = self
                     .lifecycle
                     .lock()
                     .expect("player lifecycle mutex poisoned");
                 if lifecycle.epoch != epoch {
-                    return Err(self.superseded_open_error());
+                    return Ok(()); // 已被更新的 open 顶替
                 }
                 self.transition(PlayerState::Error)?;
                 self.emit(PlayerEvent::Error(error.clone()));
@@ -1169,7 +1218,7 @@ impl Player {
             .lock()
             .expect("player lifecycle mutex poisoned");
         if lifecycle.epoch != epoch {
-            return Err(self.superseded_open_error());
+            return Ok(()); // 顶替
         }
         let generation = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
@@ -1193,6 +1242,16 @@ impl Player {
             self.config.event_channel_capacity,
             generation,
         ));
+        trace::diagnostic(
+            serde_json::json!({
+                "event": "bg_open_ok",
+                "epoch": epoch,
+                "generation": generation,
+                "tracks": info.tracks.len(),
+                "duration_secs": info.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            })
+            .to_string(),
+        );
         self.emit(PlayerEvent::DurationChanged(info.duration));
         self.emit(PlayerEvent::TracksChanged(info.tracks.clone()));
         self.emit(PlayerEvent::TrackSelectionChanged(info.track_selection()));
@@ -1203,16 +1262,44 @@ impl Player {
             self.emit(PlayerEvent::VideoDecoderChanged(event));
         }
         self.transition(PlayerState::Ready)?;
+        // 排队中的 play()：Ready 后自动播放
+        let pending_play = {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            let pending = inner.pending_play;
+            inner.pending_play = false;
+            pending
+        };
+        if pending_play {
+            // 必须先释放 lifecycle 锁：play() 内部 playback_commands() 要重新获取
+            // lifecycle 锁（std Mutex 非递归，持锁调用会死锁）。
+            drop(lifecycle);
+            let _ = self.play();
+        }
         Ok(())
     }
 
     pub fn play(&self) -> Result<()> {
         self.ensure_not_closed()?;
-        let commands = self.playback_commands()?;
+        // 状态检查必须先于 playback_commands()：Opening 时 playback 可能尚未创建
+        // （open 异步、open() 已 take 旧 playback），若先取 commands 会返回 Err
+        // 提前 return，pending_play 排队分支永远到不了——首次 play() 被静默丢弃
+        // （黑屏根因：worker 停在 Paused，直到第二次 play 才真正播放）。
         let (sequence, generation) = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             match inner.state {
-                PlayerState::Ready | PlayerState::Paused | PlayerState::Stopped => {}
+                // 异步 open 进行中：排队，Ready 后自动播放（宿主无需轮询状态）
+                PlayerState::Opening => {
+                    inner.pending_play = true;
+                    return Ok(());
+                }
+                PlayerState::Ready | PlayerState::Paused | PlayerState::Stopped => {
+                    inner.playback_command_sequence =
+                        inner.playback_command_sequence.saturating_add(1).max(1);
+                    (
+                        inner.playback_command_sequence,
+                        inner.playback_generation.max(1),
+                    )
+                }
                 from => {
                     return Err(PlayerError::InvalidStateTransition {
                         from,
@@ -1220,13 +1307,8 @@ impl Player {
                     });
                 }
             }
-            inner.playback_command_sequence =
-                inner.playback_command_sequence.saturating_add(1).max(1);
-            (
-                inner.playback_command_sequence,
-                inner.playback_generation.max(1),
-            )
         };
+        let commands = self.playback_commands()?;
         commands
             .send(PlaybackCommand::Play {
                 sequence,

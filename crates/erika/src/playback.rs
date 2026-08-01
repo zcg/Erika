@@ -801,14 +801,48 @@ impl PlaybackSession {
             request.source_hint,
             request.http_headers.clone(),
         )?;
-        let mut demuxer = Demuxer::open_source(source)?;
+        trace::log(format!(
+            "[erika-open-trace] stage=source_video_created uri={}",
+            request.uri
+        ));
+        // DASH 双流：请求带 audio_uri 时独立打开音频源，由 Demuxer 合并
+        // 成统一时间轴（video 全局 stream 0，audio 全局 stream 1）。
+        let mut demuxer = match request.audio_uri.as_deref() {
+            Some(audio_uri) => {
+                let audio_source = source_from_uri_with_hint_and_headers(
+                    audio_uri,
+                    request.source_hint,
+                    request.http_headers.clone(),
+                )?;
+                trace::log(format!(
+                    "[erika-open-trace] stage=source_audio_created uri={audio_uri}"
+                ));
+                let demux_started = std::time::Instant::now();
+                let demuxer = Demuxer::open_video_audio(source, audio_source)?;
+                trace::log(format!(
+                    "[erika-open-trace] stage=demux_opened_dash elapsed_ms={:.1}",
+                    demux_started.elapsed().as_secs_f64() * 1000.0
+                ));
+                demuxer
+            }
+            None => Demuxer::open_source(source)?,
+        };
         let mut probe = demuxer.probe().clone();
+        trace::log(format!(
+            "[erika-open-trace] stage=probe_done tracks={} duration_secs={:.3}",
+            probe.tracks.len(),
+            probe.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0)
+        ));
         let subtitle_fonts = probe.subtitle_fonts.clone();
         let codec_parameters = probe
             .tracks
             .iter()
             .map(|track| demuxer.owned_codec_parameters(track.id as i32))
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        trace::log(format!(
+            "[erika-open-trace] stage=codec_params_done tracks={}",
+            codec_parameters.len()
+        ));
         let selected_video_track = demuxer
             .probe()
             .tracks
@@ -837,6 +871,11 @@ impl PlaybackSession {
             let parameters = codec_parameters_for(&codec_parameters, stream_index)?;
             let codec = parameters.codec_name();
             let decoder_config = config.video_decode.decoder_config();
+            trace::log(format!(
+                "[erika-open-trace] stage=video_decoder_open_start codec={} backend={:?}",
+                codec.as_deref().unwrap_or("?"),
+                decoder_config.backend,
+            ));
             video_decoder = Some(
                 match open_video_decoder(parameters, decoder_config, &decoder_resources) {
                     Ok(decoder) => {
@@ -5048,7 +5087,13 @@ fn playback_timing_for_request(
 fn request_uses_http_source(request: &MediaRequest) -> bool {
     match request.source_hint {
         MediaSourceHint::Http => true,
-        MediaSourceHint::Auto => is_http_uri(&request.uri),
+        MediaSourceHint::Auto => {
+            is_http_uri(&request.uri)
+                || request
+                    .audio_uri
+                    .as_deref()
+                    .is_some_and(is_http_uri)
+        }
         MediaSourceHint::LocalFile => false,
     }
 }
@@ -5366,6 +5411,7 @@ mod tests {
             uri: path.to_string_lossy().into_owned(),
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
+            audio_uri: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,

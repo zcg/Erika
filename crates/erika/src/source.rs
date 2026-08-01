@@ -7,7 +7,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "android")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::mpsc;
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -45,10 +47,48 @@ impl ByteRange {
     }
 }
 
+/// 宿主可轮询的 `HttpRangeSource` 实时诊断快照（网络/缓冲状态）。
+///
+/// demux 线程写、宿主 UI 线程读：单播放窗口约束下通过全局槽传递，
+/// 复用 Erika 现有的进程级诊断先例（`trace`）。宿主用它渲染"流诊断
+/// 浮窗"——显示缓存窗口覆盖到哪里、还有多少段在下载、累计下载量
+/// （差分得实时速度），从而判断"为什么卡"（网络慢 / 窗口外 seek 等预取）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceDiagSnapshot {
+    /// 媒体总长度（字节），HEAD/Content-Range 得到；未知为 None。
+    pub content_length: Option<u64>,
+    /// 当前缓存窗口起点（字节）。
+    pub cache_start: u64,
+    /// 当前缓存窗口终点（字节，含）。
+    pub cache_end: u64,
+    /// 正在下载的预取段数（多连接并行 in-flight）。
+    pub prefetch_in_flight: usize,
+    /// 累计已下载字节（同步 fetch + 已消费预取段；用于差分下载速度）。
+    pub downloaded_bytes: u64,
+}
+
+static SOURCE_DIAG: Mutex<SourceDiagSnapshot> = Mutex::new(SourceDiagSnapshot {
+    content_length: None,
+    cache_start: 0,
+    cache_end: 0,
+    prefetch_in_flight: 0,
+    downloaded_bytes: 0,
+});
+
+/// 读取当前 `HttpRangeSource` 诊断快照（宿主轮询用；无播放时为零值/上次残留）。
+pub fn source_diag_snapshot() -> SourceDiagSnapshot {
+    SOURCE_DIAG.lock().unwrap().clone()
+}
+
 pub trait MediaSource: Send {
     fn uri(&self) -> &str;
     fn len(&mut self) -> Result<Option<u64>>;
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>>;
+    /// 播放层在已知目标读取位置时给出预取提示（例如 seek 到缓存窗口外时
+    /// avformat 即将从该字节位置开始读）。默认无操作；`HttpRangeSource` 用它
+    /// 把目标窗口提前拉入后台多段预取，避免窗口外 seek 后 demux 线程同步阻塞
+    /// 在单个慢 HTTP 请求上。
+    fn prefetch_hint(&mut self, _target: u64) {}
 }
 
 #[derive(Debug)]
@@ -343,12 +383,21 @@ pub struct HttpRangeSource {
     cache_start: u64,
     cache_bytes: Vec<u8>,
     read_ahead_bytes: u64,
-    prefetch: Option<PendingHttpFetch>,
+    /// 多段并行预取队列。窗口重设（cache_start/cache_bytes 变更）时清空，
+    /// `maybe_start_prefetch` 按需从 cache_end 向后填充多段 in-flight 下载。
+    prefetch: Vec<PendingHttpFetch>,
+    /// 最近一次窗口外预取提示的目标位置（`prefetch_hint`）。用于防抖：
+    /// `av_seek_frame` 内部可能对相近位置多次 seek，同一窗口内不重复预取。
+    prefetch_target: Option<u64>,
+    /// 累计已下载字节（同步 fetch 完成 + 预取段被消费时累加）。仅供诊断
+    /// 快照差分计算实时下载速度，不参与任何取数逻辑。
+    downloaded_bytes: u64,
 }
 
 struct PendingHttpFetch {
     range: ByteRange,
-    handle: JoinHandle<Result<HttpRangeResponse>>,
+    handle: JoinHandle<()>,
+    receiver: mpsc::Receiver<Result<HttpRangeResponse>>,
 }
 
 /// Bytes fetched for one HTTP range request plus the resource total reported
@@ -362,6 +411,19 @@ struct HttpRangeResponse {
 
 impl HttpRangeSource {
     const DEFAULT_READ_AHEAD_BYTES: u64 = 2 * 1024 * 1024;
+    /// 并行预取的最大 in-flight 段数。多连接叠加带宽：单连接（B站 CDN）
+    /// 吞吐约 1-3MB/s 且波动，read_range 在 demux 线程同步阻塞——缓存耗尽
+    /// 即冻结播放（一顿一顿）。多段并行让总吞吐翻数倍，缓存窗口内永远有数据。
+    const MAX_PREFETCH_IN_FLIGHT: usize = 3;
+    /// 窗口外 seek 的目标预取用 2MB 小段：seek 后 demux 从目标前关键帧起读，
+    /// `read_range` 会 join 覆盖该次读取的段。小段 join 快（2MB/单连接约 1 秒），
+    /// 大段（read_ahead/MAX，约 10.6MB）要等 10 秒级——seek 是一次性动作，
+    /// 不需要大缓冲，后续顺序读取由 `maybe_start_prefetch` 用大段接管。
+    const SEEK_PREFETCH_SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
+    /// 预取段 join 上限。超过即放弃该段（read_range 走同步小范围 fetch 兜底），
+    /// 防止慢段无限阻塞 demux 线程（日志实测 seek 后 join 11MB 段卡 28.9s）。
+    /// 同步兜底只取当前读取所需（≤1MB），比等 10MB 级慢段快得多。
+    const PREFETCH_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 
     pub fn new(uri: impl Into<String>) -> Self {
         Self::with_http_headers(uri, Vec::new())
@@ -377,13 +439,26 @@ impl HttpRangeSource {
             cache_start: 0,
             cache_bytes: Vec::new(),
             read_ahead_bytes: http_read_ahead_bytes(),
-            prefetch: None,
+            prefetch: Vec::new(),
+            prefetch_target: None,
+            downloaded_bytes: 0,
         }
     }
 
     fn cache_end(&self) -> u64 {
         self.cache_start
             .saturating_add(self.cache_bytes.len() as u64)
+    }
+
+    /// 把当前网络/缓冲状态发布到全局诊断槽（宿主 UI 轮询读取）。
+    fn publish_diag(&self) {
+        *SOURCE_DIAG.lock().unwrap() = SourceDiagSnapshot {
+            content_length: self.content_length,
+            cache_start: self.cache_start,
+            cache_end: self.cache_end(),
+            prefetch_in_flight: self.prefetch.len(),
+            downloaded_bytes: self.downloaded_bytes,
+        };
     }
 
     fn cached_slice(&self, range: ByteRange) -> Option<Vec<u8>> {
@@ -421,6 +496,8 @@ impl HttpRangeSource {
         if self.content_length.is_none() {
             self.content_length = response.total_length;
         }
+        self.downloaded_bytes = self.downloaded_bytes.saturating_add(response.bytes.len() as u64);
+        self.publish_diag();
         Ok(response.bytes)
     }
 
@@ -428,7 +505,11 @@ impl HttpRangeSource {
         let requested_length = range.length.unwrap_or(0);
         Ok(match range.length {
             Some(length) => {
-                let mut length = length.max(self.read_ahead_bytes);
+                // 同步请求（demux 正在等数据）用 1MB 小段：读多段（64KB 的
+                // demux 粒度）会让网络往返频繁拖慢；直接用 read_ahead 全量
+                // （如 32MB）会让 open 等首次大段下载完（实测 24 秒）。
+                // 持续预取由 maybe_start_prefetch 用 read_ahead 全量负责。
+                let mut length = length.max(1024 * 1024);
                 if let Some(total) = self.content_length.or_else(|| self.len().ok().flatten()) {
                     if range.start >= total {
                         return Ok(Some(0));
@@ -442,11 +523,12 @@ impl HttpRangeSource {
     }
 
     fn take_prefetch(&mut self, range: ByteRange) -> Option<Result<(u64, Vec<u8>)>> {
-        let pending = self.prefetch.as_ref()?;
-        if !range_contains(pending.range, range) {
-            let _ = self.prefetch.take();
-            return None;
-        }
+        // 多段队列：只取覆盖请求的那一段，其余段保留（它们预取的是未来数据）。
+        let idx = self
+            .prefetch
+            .iter()
+            .position(|pending| range_contains(pending.range, range))?;
+        let pending = self.prefetch.remove(idx);
         if !pending.is_finished() {
             // The pending fetch covers the requested bytes and they are needed
             // now: joining the in-flight thread is expected to be much cheaper
@@ -465,14 +547,34 @@ impl HttpRangeSource {
             ));
         }
 
-        let pending = self.prefetch.take()?;
         let join_started = Instant::now();
         let start = pending.range.start;
-        let result = pending
-            .handle
-            .join()
-            .map_err(|_| SourceError::Http("http prefetch thread panicked".to_string()))
-            .and_then(|response| response);
+        // 带超时 join：慢段会卡死 demux 线程。超过上限放弃该段（后台线程
+        // 继续下载、结果丢弃），返回 None 让 read_range 走同步小范围 fetch
+        // 兜底——同步只取当前读取所需（≤1MB），比等 10MB 级慢段快得多。
+        let result = match pending
+            .receiver
+            .recv_timeout(Self::PREFETCH_JOIN_TIMEOUT)
+        {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                http_trace_log(format!(
+                    "{{\"event\":\"http_prefetch_join_timeout\",\"start\":{},\"length\":{},\"waited_ms\":{:.3}}}",
+                    start,
+                    pending
+                        .range
+                        .length
+                        .map_or_else(|| "null".to_string(), |length| length.to_string()),
+                    join_started.elapsed().as_secs_f64() * 1000.0,
+                ));
+                return None;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Some(Err(SourceError::Http(
+                    "http prefetch thread panicked".to_string(),
+                )));
+            }
+        };
         http_trace_log(format!(
             "{{\"event\":\"http_prefetch_join\",\"start\":{},\"length\":{},\"elapsed_ms\":{:.3}}}",
             start,
@@ -486,12 +588,26 @@ impl HttpRangeSource {
             if self.content_length.is_none() {
                 self.content_length = response.total_length;
             }
+            self.downloaded_bytes =
+                self.downloaded_bytes.saturating_add(response.bytes.len() as u64);
+            self.publish_diag();
             (start, response.bytes)
         }))
     }
 
+    /// 重设缓存窗口。保留窗口末尾之后仍在下载的预取段（顺序读取时它们是
+    /// 未来数据——无脑清空会浪费在飞下载，每次消费一段就丢两段进度）；
+    /// 清掉与新窗口重叠的作废段（seek 跳走后旧位置段无用了）。
+    fn reset_cache(&mut self, start: u64, bytes: Vec<u8>) {
+        let new_end = start.saturating_add(bytes.len() as u64);
+        self.prefetch.retain(|p| p.range.start >= new_end);
+        self.cache_start = start;
+        self.cache_bytes = bytes;
+        self.publish_diag();
+    }
+
     fn maybe_start_prefetch(&mut self, range: ByteRange) {
-        if self.prefetch.is_some() || self.cache_bytes.is_empty() {
+        if self.cache_bytes.is_empty() {
             return;
         }
         let Some(length) = range.length else {
@@ -511,19 +627,89 @@ impl HttpRangeSource {
         if remaining > self.read_ahead_bytes / 2 {
             return;
         }
-        let length = self.read_ahead_bytes.min(total.saturating_sub(cache_end));
-        if length == 0 {
+        // 多连接并行：把 cache_end 后方 read_ahead 窗口拆成多段同时下载。
+        // 单连接吞吐（B站 CDN 约 1-3MB/s）波动时，一段跟不上就缓存耗尽 →
+        // demux 线程同步阻塞 → 一顿一顿。N 段并行让总吞吐翻数倍。
+        let seg_len =
+            (self.read_ahead_bytes / Self::MAX_PREFETCH_IN_FLIGHT as u64).max(256 * 1024);
+        self.spawn_prefetch_window(cache_end, seg_len);
+    }
+
+    /// 从指定字节位置起把 read_ahead 窗口拆成多段并行下载。顺序预取
+    /// （`maybe_start_prefetch`）与窗口外 seek 预取（`prefetch_hint`）共用，
+    /// 避免两处维护重复的分段/去重逻辑。
+    fn spawn_prefetch_window(&mut self, from: u64, seg_len: u64) {
+        let Some(total) = self.content_length else {
+            return;
+        };
+        if from >= total {
             return;
         }
-        let prefetch_range = ByteRange {
-            start: cache_end,
-            length: Some(length),
+        let target_end = from.saturating_add(self.read_ahead_bytes).min(total);
+        let mut next_start = from;
+        while next_start < target_end && self.prefetch.len() < Self::MAX_PREFETCH_IN_FLIGHT {
+            // 跳过已被 in-flight 段覆盖的区间，避免重复下载同一段。任何与
+            // 窗口重叠的段都参与（无论其起点在窗口内还是窗外）：`prefetch`
+            // 里只可能有两种——顺序预取从 cache_end 起、seek 预取从目标前起，
+            // 与当前窗口重叠即视为已覆盖。
+            if let Some(p) = self.prefetch.iter().find(|p| {
+                p.range.start < target_end && next_start < p.range_end()
+            }) {
+                next_start = next_start.max(p.range_end());
+                continue;
+            }
+            let len = seg_len.min(target_end - next_start);
+            if len == 0 {
+                break;
+            }
+            let prefetch_range = ByteRange {
+                start: next_start,
+                length: Some(len),
+            };
+            http_trace_log(format!(
+                "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{},\"in_flight\":{}}}",
+                prefetch_range.start,
+                len,
+                self.prefetch.len(),
+            ));
+            self.prefetch.push(PendingHttpFetch::spawn(
+                self.uri.clone(),
+                self.http_headers.clone(),
+                prefetch_range,
+            ));
+            next_start += len;
+        }
+        self.publish_diag();
+    }
+
+    /// 窗口外 seek 的目标预取提示（由 AVIO seek 钩子调用）。target 超出
+    /// 已缓存窗口时，清掉旧窗口的顺序预取段，从 target 前一个小段起用 2MB
+    /// 小段并行拉目标窗口——seek 后 demux 第一次 read 命中这些小段并 join，
+    /// 从"同步单请求抓大段（可卡 60s）"降为"join 2MB 小段（约 1s 就绪）"。
+    fn prefetch_hint(&mut self, target: u64) {
+        let Some(total) = self.content_length else {
+            return;
         };
-        self.prefetch = Some(PendingHttpFetch::spawn(
-            self.uri.clone(),
-            self.http_headers.clone(),
-            prefetch_range,
-        ));
+        if target >= total {
+            return;
+        }
+        let cache_end = self.cache_end();
+        // 目标仍在已缓存窗口内（含向前留一个小段给 BACKWARD 关键帧），无需预取。
+        if target < cache_end.saturating_add(Self::SEEK_PREFETCH_SEGMENT_BYTES) {
+            return;
+        }
+        // 防抖：`av_seek_frame` 内部可能对相近位置多次 seek，同一窗口不重复预取。
+        if let Some(prev) = self.prefetch_target {
+            if target < prev.saturating_add(Self::SEEK_PREFETCH_SEGMENT_BYTES) {
+                return;
+            }
+        }
+        self.prefetch_target = Some(target);
+        // seek 跳走：旧窗口的顺序预取段作废。in-flight 线程独立运行，drop
+        // 只丢弃结果（避免无谓的 join 等待），带宽浪费可接受。
+        self.prefetch.clear();
+        let from = target.saturating_sub(Self::SEEK_PREFETCH_SEGMENT_BYTES);
+        self.spawn_prefetch_window(from, Self::SEEK_PREFETCH_SEGMENT_BYTES);
     }
 }
 
@@ -536,23 +722,53 @@ impl PendingHttpFetch {
                 .length
                 .map_or_else(|| "null".to_string(), |length| length.to_string()),
         ));
+        // 结果经 channel 送达：`take_prefetch` 用 recv_timeout 支持超时放弃
+        // 慢段（无限 join 会卡死 demux 线程），线程跑完后自动退出。
+        let (sender, receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
             let agent = http_agent();
-            fetch_http_range(&agent, &uri, &http_headers, range, "http_prefetch_range")
+            let result =
+                fetch_http_range(&agent, &uri, &http_headers, range, "http_prefetch_range");
+            let _ = sender.send(result);
         });
-        Self { range, handle }
+        Self {
+            range,
+            handle,
+            receiver,
+        }
     }
 
     fn is_finished(&self) -> bool {
         self.handle.is_finished()
     }
+
+    fn range_end(&self) -> u64 {
+        self.range
+            .length
+            .map_or(u64::MAX, |length| self.range.start.saturating_add(length))
+    }
+}
+
+impl Drop for HttpRangeSource {
+    fn drop(&mut self) {
+        // source 销毁（播放停止/换源）→ 清空诊断，宿主读到零值即"无播放"。
+        *SOURCE_DIAG.lock().unwrap() = SourceDiagSnapshot::default();
+    }
 }
 
 fn http_agent() -> ureq::Agent {
+    // bili-rs 宿主可能以 IP 直连（绕过 DNS 污染/IPv6 不可达），
+    // 证书按 IP 校验会失败——关闭证书校验（播放器场景可接受）
+    let tls = ureq::tls::TlsConfig::builder()
+        .disable_verification(true)
+        .build();
     ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(10)))
+        // 连接超时 4s：宿主在 UI 线程同步 open，超时太长会卡死界面
+        // （慢 CDN 快速失败 → bili-rs 回退官方源）
+        .timeout_connect(Some(Duration::from_secs(4)))
         .timeout_recv_response(Some(Duration::from_secs(15)))
         .timeout_recv_body(Some(Duration::from_secs(60)))
+        .tls_config(tls)
         .build()
         .into()
 }
@@ -734,6 +950,19 @@ fn fetch_http_range(
         {
             request = request.header("If-Range", validator);
         }
+        // 请求"发出"即记录（此前只在完成/失败时打 http_range/..._error；若 CDN
+        // 响应挂起，请求在途期间无任何日志——seek 后定格时无法区分"没发请求"与
+        // "请求在途卡住"。start 日志让在途请求可见并可计算其等待时长）。
+        http_trace_log(format!(
+            "{{\"event\":\"{}_start\",\"attempt\":{},\"start\":{},\"length\":{},\"received\":{},\"status_pending\":true}}",
+            event,
+            attempt,
+            resume_range.start,
+            resume_range
+                .length
+                .map_or_else(|| "null".to_string(), |length| length.to_string()),
+            received,
+        ));
         let mut response = match request.call() {
             Ok(response) => response,
             Err(error) => {
@@ -938,6 +1167,7 @@ impl MediaSource for HttpRangeSource {
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| value.parse::<u64>().ok());
                     self.content_length = length;
+                    self.publish_diag();
                     http_trace_log(format!(
                         "[erika-http-trace] stage=head_response status={} length={} elapsed_ms={:.3}",
                         status,
@@ -979,10 +1209,15 @@ impl MediaSource for HttpRangeSource {
         match probe_http_total_length(&self.agent, &self.uri, &self.http_headers) {
             Ok(total_length) => {
                 self.content_length = total_length;
+                self.publish_diag();
                 Ok(self.content_length)
             }
             Err(_) => Err(SourceError::Http(head_error.to_string())),
         }
+    }
+
+    fn prefetch_hint(&mut self, target: u64) {
+        HttpRangeSource::prefetch_hint(self, target)
     }
 
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
@@ -1013,15 +1248,13 @@ impl MediaSource for HttpRangeSource {
                 if range_contains(prefetch_range, suffix_range) {
                     let mut cache_bytes = prefix;
                     cache_bytes.extend_from_slice(&prefetch_bytes);
-                    self.cache_start = range.start;
-                    self.cache_bytes = cache_bytes;
+                    self.reset_cache(range.start, cache_bytes);
                     self.maybe_start_prefetch(range);
                     let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
                     return Ok(self.cache_bytes[..copy_len].to_vec());
                 }
             }
 
-            let _ = self.prefetch.take();
             let fetch_length = self.fetch_length(suffix_range)?;
             if fetch_length == Some(0) {
                 return Ok(prefix);
@@ -1032,8 +1265,7 @@ impl MediaSource for HttpRangeSource {
             })?;
             let mut cache_bytes = prefix;
             cache_bytes.extend_from_slice(&suffix);
-            self.cache_start = range.start;
-            self.cache_bytes = cache_bytes;
+            self.reset_cache(range.start, cache_bytes);
             self.maybe_start_prefetch(range);
             let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
             return Ok(self.cache_bytes[..copy_len].to_vec());
@@ -1044,8 +1276,7 @@ impl MediaSource for HttpRangeSource {
         }
         let fetched = match self.take_prefetch(range) {
             Some(Ok((start, bytes))) => {
-                self.cache_start = start;
-                self.cache_bytes = bytes;
+                self.reset_cache(start, bytes);
                 if let Some(bytes) = self.cached_slice(range) {
                     self.maybe_start_prefetch(range);
                     return Ok(bytes);
@@ -1077,8 +1308,7 @@ impl MediaSource for HttpRangeSource {
             return Ok(fetched);
         }
 
-        self.cache_start = range.start;
-        self.cache_bytes = fetched;
+        self.reset_cache(range.start, fetched);
         self.maybe_start_prefetch(range);
         let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
         Ok(self.cache_bytes[..copy_len].to_vec())
@@ -1621,6 +1851,99 @@ mod tests {
     }
 
     #[test]
+    fn prefetch_fills_multiple_parallel_segments() {
+        let body: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(1024 * 1024, 128 * 1024 * 1024, &body)),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 2 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+        ]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(128 * 1024 * 1024);
+        source.read_ahead_bytes = 2 * 1024 * 1024;
+        source.cache_start = 0;
+        source.cache_bytes = vec![0u8; 1024 * 1024];
+        // 请求末端 == 缓存末尾（remaining=0）→ 立即触发多段并行预取
+        let range = ByteRange {
+            start: 0,
+            length: Some(1024 * 1024),
+        };
+        source.maybe_start_prefetch(range);
+        // 填满上限个并行段，且从 cache_end 起连续、覆盖 read_ahead 窗口
+        assert_eq!(
+            source.prefetch.len(),
+            HttpRangeSource::MAX_PREFETCH_IN_FLIGHT
+        );
+        let mut start = source.cache_end();
+        for p in &source.prefetch {
+            assert_eq!(p.range.start, start);
+            start = p.range_end();
+        }
+        assert!(start <= source.cache_end() + source.read_ahead_bytes);
+        // 三个后台请求均已发出（互不阻塞、并行发起）
+        for _ in 0..HttpRangeSource::MAX_PREFETCH_IN_FLIGHT {
+            let _ = recv_request_head(&requests);
+        }
+    }
+
+    #[test]
+    fn reset_cache_keeps_segments_beyond_new_window() {
+        // 顺序读取：消费并合并第一段后窗口前移，窗口末尾之后的在飞段是
+        // 未来数据，reset_cache 必须保留（无脑清空会浪费在飞下载）。
+        let body: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(1024 * 1024, 128 * 1024 * 1024, &body)),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 2 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+        ]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(128 * 1024 * 1024);
+        source.read_ahead_bytes = 2 * 1024 * 1024;
+        source.cache_start = 0;
+        source.cache_bytes = vec![0u8; 1024 * 1024];
+        let range = ByteRange {
+            start: 0,
+            length: Some(1024 * 1024),
+        };
+        source.maybe_start_prefetch(range);
+        assert_eq!(
+            source.prefetch.len(),
+            HttpRangeSource::MAX_PREFETCH_IN_FLIGHT
+        );
+        let segments: Vec<u64> = source.prefetch.iter().map(|p| p.range.start).collect();
+        // 模拟 read_range 合并了第一段（take_prefetch 已 remove 它）：
+        // 新窗口 [0, 第一段末尾)，窗口末尾之后的段应保留
+        let merged_end = segments[1]; // 段连续：第二段起点即第一段末尾
+        source.reset_cache(0, vec![0u8; merged_end as usize]);
+        assert_eq!(
+            source.prefetch.len(),
+            HttpRangeSource::MAX_PREFETCH_IN_FLIGHT - 1
+        );
+        for p in &source.prefetch {
+            assert!(p.range.start >= source.cache_end());
+        }
+        for _ in 0..HttpRangeSource::MAX_PREFETCH_IN_FLIGHT {
+            let _ = recv_request_head(&requests);
+        }
+    }
+
+    #[test]
     fn take_prefetch_joins_inflight_thread_instead_of_refetching() {
         let body: Vec<u8> = (0..100u8).collect();
         let (uri, requests) = spawn_mock_http_server(vec![MockResponse::delayed(
@@ -1633,7 +1956,7 @@ mod tests {
             start: 0,
             length: Some(100),
         };
-        source.prefetch = Some(PendingHttpFetch::spawn(uri, Vec::new(), range));
+        source.prefetch = vec![PendingHttpFetch::spawn(uri, Vec::new(), range)];
         assert_eq!(source.read_range(range).unwrap(), body);
         let _ = recv_request_head(&requests);
         // Joining the pending prefetch must not issue a duplicate download.
@@ -1654,7 +1977,7 @@ mod tests {
             start: 0,
             length: Some(100),
         };
-        source.prefetch = Some(PendingHttpFetch::spawn(uri, Vec::new(), range));
+        source.prefetch = vec![PendingHttpFetch::spawn(uri, Vec::new(), range)];
         // A short prefetch must trigger the synchronous fallback, not an
         // empty (fake-EOF) read.
         assert_eq!(source.read_range(range).unwrap(), body);

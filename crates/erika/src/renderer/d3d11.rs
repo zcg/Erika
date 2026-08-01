@@ -28,14 +28,15 @@ use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM,
     DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
     DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R32G32_FLOAT, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_SAMPLE_DESC,
 };
 use ::windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_WAS_STILL_DRAWING, DXGI_HDR_METADATA_HDR10, DXGI_HDR_METADATA_TYPE_HDR10,
     DXGI_HDR_METADATA_TYPE_NONE, DXGI_PRESENT_DO_NOT_WAIT, DXGI_PRESENT_PARAMETERS,
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice,
-    IDXGIFactory2, IDXGIResource, IDXGISwapChain1, IDXGISwapChain3, IDXGISwapChain4,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIResource,
+    IDXGISwapChain1, IDXGISwapChain3, IDXGISwapChain4,
 };
 use ::windows::core::{Interface, PCSTR};
 
@@ -522,6 +523,10 @@ struct D3d11DeviceState {
 
 struct AttachedSurface {
     hwnd: HWND,
+    /// WinUI 3 `SwapChainPanel` 嵌入模式：Some 时经 composition swap chain
+    /// 渲染进 XAML 树（`raw_window` 传入 `ISwapChainPanelNative*`）。
+    /// 裸指针：接口由宿主（SwapChainPanel）持有，生命周期长于渲染器。
+    panel: Option<*mut c_void>,
     metrics: SurfaceMetrics,
     output_mode: D3d11OutputMode,
     swapchain: Option<IDXGISwapChain1>,
@@ -681,6 +686,10 @@ pub struct D3d11Renderer {
     stats: D3d11RendererStats,
 }
 
+// D3D11 设备/交换链/纹理均为自由线程 COM 对象；渲染器由宿主单线程独占访问
+// （bili-rs 将 PresenterRuntime 移入后台播放线程，UI 线程不再触碰）。
+unsafe impl Send for D3d11Renderer {}
+
 impl D3d11Renderer {
     pub fn new() -> Result<Self> {
         Self::with_config(MetalRendererConfig::default())
@@ -752,6 +761,7 @@ impl D3d11Renderer {
         surface.swapchain = Some(create_swapchain(
             &state.device,
             surface.hwnd,
+            surface.panel,
             surface.metrics.physical_extent.width,
             surface.metrics.physical_extent.height,
             output_mode.swapchain_format(),
@@ -859,6 +869,7 @@ impl D3d11Renderer {
     }
 
     fn import_d3d11va_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        trace("import_d3d11va_frame: enter");
         let Some(texture_ref) = frame.frame.d3d11va_texture() else {
             return Err(PlayerError::Renderer(
                 "d3d11: hardware frame is not a D3D11VA texture".to_string(),
@@ -1288,6 +1299,7 @@ impl D3d11Renderer {
     }
 
     fn render_video(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
+        trace("render_video: enter");
         if self.current_video.is_none() {
             return Ok(false);
         }
@@ -1412,22 +1424,27 @@ impl RendererBackend for D3d11Renderer {
     fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()> {
         let PlatformSurface::Wgpu(handle) = surface else {
             return Err(PlayerError::Renderer(
-                "d3d11: only Windows HWND surfaces are supported".to_string(),
+                "d3d11: only Windows HWND or SwapChainPanel surfaces are supported".to_string(),
             ));
         };
-        if handle.kind != WgpuSurfaceKind::WindowsHwnd {
-            return Err(PlayerError::Renderer(format!(
-                "d3d11: surface kind {:?} is not supported",
-                handle.kind
-            )));
-        }
         if handle.raw_window == 0 {
             return Err(PlayerError::Renderer(
-                "d3d11: Windows HWND surface handle is null".to_string(),
+                "d3d11: Windows surface handle is null".to_string(),
             ));
         }
+        let panel = match handle.kind {
+            WgpuSurfaceKind::WindowsHwnd => None,
+            WgpuSurfaceKind::WindowsSwapChainPanel => Some(handle.raw_window as *mut c_void),
+            _ => {
+                return Err(PlayerError::Renderer(format!(
+                    "d3d11: surface kind {:?} is not supported",
+                    handle.kind
+                )));
+            }
+        };
         self.surface = Some(AttachedSurface {
             hwnd: HWND(handle.raw_window as *mut c_void),
+            panel,
             metrics: handle.metrics,
             output_mode: D3d11OutputMode::Sdr,
             swapchain: None,
@@ -1953,9 +1970,35 @@ fn create_default_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     Ok((device, context))
 }
 
+/// `ISwapChainPanelNative::SetSwapChain` 的最小 COM 绑定。
+/// crates.io 的 windows 0.62.2 未导出该接口（GUID
+/// f92f19d2-3ade-45a6-a20c-f6f1ea90554b），手写 vtbl 调用保持零依赖改动。
+#[repr(C)]
+struct ISwapChainPanelNativeVtbl {
+    base: ::windows::core::IUnknown_Vtbl,
+    set_swap_chain: unsafe extern "system" fn(this: *mut c_void, swapchain: *const c_void) -> i32,
+}
+
+fn panel_set_swap_chain(panel: *mut c_void, swapchain: &IDXGISwapChain1) -> Result<()> {
+    unsafe {
+        let vtbl = &*((*(panel as *mut *mut c_void)) as *const ISwapChainPanelNativeVtbl);
+        // 注意：COM 参数是接口指针本身（as_raw），不能传 &swapchain 的地址
+        let hr = (vtbl.set_swap_chain)(panel, swapchain.as_raw() as *const c_void);
+        let hresult = ::windows::core::HRESULT(hr);
+        if hresult.is_err() {
+            return Err(crate::core::PlayerError::Renderer(format!(
+                "ISwapChainPanelNative::SetSwapChain failed with {:?}",
+                hresult
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn create_swapchain(
     device: &ID3D11Device,
     hwnd: HWND,
+    panel: Option<*mut c_void>,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -1970,7 +2013,8 @@ fn create_swapchain(
     trace("create_swapchain: get factory");
     let factory: IDXGIFactory2 = unsafe { adapter.GetParent() }
         .map_err(|error| d3d_error("IDXGIAdapter::GetParent<IDXGIFactory2>", error))?;
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
+
+    let mut desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: width.max(1),
         Height: height.max(1),
         Format: format,
@@ -1986,6 +2030,21 @@ fn create_swapchain(
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
         Flags: 0,
     };
+
+    if let Some(panel) = panel {
+        // WinUI 3 SwapChainPanel 嵌入：composition swap chain，
+        // 要求 FLIP_SEQUENTIAL + PREMULTIPLIED alpha。
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        trace("create_swapchain: CreateSwapChainForComposition");
+        let swapchain = unsafe { factory.CreateSwapChainForComposition(device, &desc, None) }
+            .map_err(|error| d3d_error("IDXGIFactory2::CreateSwapChainForComposition", error))?;
+        trace("create_swapchain: ISwapChainPanelNative::SetSwapChain");
+        panel_set_swap_chain(panel, &swapchain)?;
+        trace("create_swapchain: done");
+        return Ok(swapchain);
+    }
+
     trace("create_swapchain: CreateSwapChainForHwnd");
     let swapchain = unsafe { factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }
         .map_err(|error| d3d_error("IDXGIFactory2::CreateSwapChainForHwnd", error))?;
@@ -2126,6 +2185,7 @@ fn create_linear_render_target(
 }
 
 fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Result<()> {
+    trace("present_swapchain: enter");
     let params = DXGI_PRESENT_PARAMETERS {
         DirtyRectsCount: 0,
         pDirtyRects: ptr::null_mut(),
@@ -2646,6 +2706,15 @@ fn blob_to_string(blob: &ID3DBlob) -> String {
 fn trace(message: &str) {
     if std::env::var_os("ERIKA_D3D11_TRACE").is_some() {
         eprintln!("erika d3d11: {message}");
+        // 崩溃定位：同时写文件（GUI 宿主 stderr 不可见）
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("erika_d3d11_trace.log"))
+        {
+            let _ = writeln!(f, "{message}");
+        }
     }
 }
 

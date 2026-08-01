@@ -3399,11 +3399,21 @@ impl WgpuRenderer {
                     "wgpu surface exposes no usable SDR presentation format".to_string(),
                 )
             })?;
+            // Fifo present 在交换链满时阻塞 UI 线程等待 vsync——宿主是
+            // WinUI SwapChainPanel 时与 XAML 合成器同线程双重 vsync 竞争，
+            // 拖拽/缩放窗口时 UI 帧率骤降、系统记录挂起。AutoVsync 由
+            // 合成器协调时序，present 不阻塞调用线程。
             let present_mode = caps
                 .present_modes
                 .iter()
                 .copied()
-                .find(|mode| *mode == wgpu::PresentMode::Fifo)
+                .find(|mode| *mode == wgpu::PresentMode::AutoVsync)
+                .or_else(|| {
+                    caps.present_modes
+                        .iter()
+                        .copied()
+                        .find(|mode| *mode == wgpu::PresentMode::Fifo)
+                })
                 .or_else(|| caps.present_modes.first().copied())
                 .ok_or_else(|| {
                     PlayerError::Renderer("wgpu surface exposes no present modes".to_string())

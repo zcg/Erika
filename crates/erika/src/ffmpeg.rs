@@ -18,7 +18,7 @@ use crate::renderer::pipeline::{
 use crate::source::{ByteRange, MediaSource};
 use crate::subtitle::{
     AssTrackResources, DecodedSubtitleFrame, SubtitleBitmapPlane, SubtitleFontAttachment,
-    SubtitleTextFormat, SubtitleTextSegment, SubtitleTrackConfig,
+    SubtitleTextFormat, SubtitleTextSegment, SubtitleTrackConfig, SubtitleTrackSource,
 };
 use erika_ffmpeg_sys as sys;
 use libc::{EAGAIN, EINVAL, EIO, ESPIPE, SEEK_CUR, SEEK_END, SEEK_SET};
@@ -268,11 +268,59 @@ impl StreamSelection {
     }
 }
 
-pub struct Demuxer {
+/// 单个解复用输入：一个独立容器上下文 + 其时间轴与全局流偏移。
+///
+/// DASH 双流（video m4s + audio m4s）由两个输入组成；每个输入内部
+/// stream index 均从 0 起，通过 `stream_offset` 平移到统一全局 index。
+struct DemuxInput {
     context: FormatContext,
-    probe: MediaProbe,
     stream_time_bases: Vec<Option<TimeBase>>,
     timeline_origin_micros: i64,
+    stream_offset: i32,
+}
+
+impl DemuxInput {
+    /// 从本输入读一包：时间基取自本输入的流表，时间轴用本输入原点归一化。
+    fn read_packet(&mut self) -> Result<Option<Packet>> {
+        let mut packet = Packet::alloc()?;
+        let code = unsafe { sys::av_read_frame(self.context.as_mut_ptr(), packet.as_mut_ptr()) };
+        if code == AVERROR_EOF {
+            return Ok(None);
+        }
+        check(code, "av_read_frame")?;
+        let stream_index = packet.stream_index();
+        packet.time_base = self
+            .stream_time_bases
+            .get(stream_index as usize)
+            .copied()
+            .flatten();
+        packet.normalize_timeline(self.timeline_origin_micros);
+        Ok(Some(packet))
+    }
+
+    /// 全局 stream index → 本输入内局部 index（不属于本输入则 None）。
+    ///
+    /// 双流合并后必须同时校验上界：video 输入只拥有 [offset, offset+nb_streams)，
+    /// 否则 `find_map` 会让 video 输入吞掉所有 index ≥ offset 的查询（audio 全局
+    /// index 1 被当成 video 的局部 index 1 → 越界报 unknown stream index）。
+    fn local_index(&self, global: i32) -> Option<i32> {
+        if global < self.stream_offset {
+            return None;
+        }
+        let local = global - self.stream_offset;
+        let stream_count = unsafe { (*self.context.as_ptr()).nb_streams as i32 };
+        (local < stream_count).then_some(local)
+    }
+}
+
+pub struct Demuxer {
+    inputs: Vec<DemuxInput>,
+    /// 每个输入缓存的下一包（PTS 交错读取）
+    pending: Vec<Option<Packet>>,
+    /// 每个输入是否已 EOF
+    eof: Vec<bool>,
+    probe: MediaProbe,
+    stream_time_bases: Vec<Option<TimeBase>>,
     selection: StreamSelection,
 }
 
@@ -286,30 +334,142 @@ impl Demuxer {
     pub fn open_uri(uri: &str) -> Result<Self> {
         let mut context = open_format_context(uri)?;
         find_stream_info(&mut context)?;
-        let timeline_origin_micros = format_timeline_origin_micros(context.as_ptr());
-        trace_timeline_origin(timeline_origin_micros);
-        let (probe, stream_time_bases) = inspect_format_context(uri, context.as_ptr());
-        Ok(Self {
-            context,
-            probe,
-            stream_time_bases,
-            timeline_origin_micros,
-            selection: StreamSelection::all(),
-        })
+        Self::from_single_input(uri, context)
     }
 
     pub fn open_source(source: Box<dyn MediaSource>) -> Result<Self> {
         let uri = source.uri().to_string();
         let mut context = open_source_format_context(source)?;
         find_stream_info(&mut context)?;
+        Self::from_single_input(&uri, context)
+    }
+
+    /// 单个输入（本地文件 / MP4 直链 / 直播等既有路径）。
+    fn from_single_input(uri: &str, context: FormatContext) -> Result<Self> {
         let timeline_origin_micros = format_timeline_origin_micros(context.as_ptr());
         trace_timeline_origin(timeline_origin_micros);
-        let (probe, stream_time_bases) = inspect_format_context(&uri, context.as_ptr());
+        let (probe, stream_time_bases) = inspect_format_context(uri, context.as_ptr());
         Ok(Self {
-            context,
+            inputs: vec![DemuxInput {
+                context,
+                stream_time_bases: stream_time_bases.clone(),
+                timeline_origin_micros,
+                stream_offset: 0,
+            }],
+            pending: vec![None],
+            eof: vec![false],
             probe,
             stream_time_bases,
-            timeline_origin_micros,
+            selection: StreamSelection::all(),
+        })
+    }
+
+    /// DASH 双流：独立打开 video/audio 两个 m4s 输入并合并为统一时间轴。
+    ///
+    /// video 流占据全局 stream 0..video_streams，audio 流平移到其后的全局
+    /// index。两个输入时间轴各自从 0 起、互相对齐（fMP4 起点一致），
+    /// PTS 交错的 read_packet 按最小 PTS 输出；音频主时钟与视频渲染时间均
+    /// 基于统一后的包时间戳，无需额外时钟改动。
+    pub fn open_video_audio(
+        video_source: Box<dyn MediaSource>,
+        audio_source: Box<dyn MediaSource>,
+    ) -> Result<Self> {
+        let video_uri = video_source.uri().to_string();
+        let audio_uri = audio_source.uri().to_string();
+        crate::trace::log(format!(
+            "[erika-open-trace] stage=dash_open_start uri={video_uri} | {audio_uri}"
+        ));
+        let video_input_started = std::time::Instant::now();
+        let mut video_context = open_source_format_context(video_source)?;
+        crate::trace::log(format!(
+            "[erika-open-trace] stage=avformat_open_done kind=video elapsed_ms={:.1}",
+            video_input_started.elapsed().as_secs_f64() * 1000.0
+        ));
+        let video_probe_started = std::time::Instant::now();
+        find_stream_info(&mut video_context)?;
+        crate::trace::log(format!(
+            "[erika-open-trace] stage=find_stream_info_done kind=video elapsed_ms={:.1} streams={}",
+            video_probe_started.elapsed().as_secs_f64() * 1000.0,
+            unsafe { (*video_context.as_ptr()).nb_streams },
+        ));
+        let audio_input_started = std::time::Instant::now();
+        let mut audio_context = open_source_format_context(audio_source)?;
+        crate::trace::log(format!(
+            "[erika-open-trace] stage=avformat_open_done kind=audio elapsed_ms={:.1}",
+            audio_input_started.elapsed().as_secs_f64() * 1000.0
+        ));
+        let audio_probe_started = std::time::Instant::now();
+        find_stream_info(&mut audio_context)?;
+        crate::trace::log(format!(
+            "[erika-open-trace] stage=find_stream_info_done kind=audio elapsed_ms={:.1} streams={}",
+            audio_probe_started.elapsed().as_secs_f64() * 1000.0,
+            unsafe { (*audio_context.as_ptr()).nb_streams },
+        ));
+
+        let video_origin = format_timeline_origin_micros(video_context.as_ptr());
+        trace_timeline_origin(video_origin);
+        let audio_origin = format_timeline_origin_micros(audio_context.as_ptr());
+        trace_timeline_origin(audio_origin);
+
+        let (video_probe, video_time_bases) =
+            inspect_format_context(&video_uri, video_context.as_ptr());
+        let (audio_probe, audio_time_bases) =
+            inspect_format_context(&audio_uri, audio_context.as_ptr());
+
+        let video_stream_count = video_time_bases.len();
+        let audio_offset = video_stream_count as i32;
+
+        let inputs = vec![
+            DemuxInput {
+                context: video_context,
+                stream_time_bases: video_time_bases.clone(),
+                timeline_origin_micros: video_origin,
+                stream_offset: 0,
+            },
+            DemuxInput {
+                context: audio_context,
+                stream_time_bases: audio_time_bases.clone(),
+                timeline_origin_micros: audio_origin,
+                stream_offset: audio_offset,
+            },
+        ];
+
+        // 合并 probe：audio 输入的 track id / source 平移到全局 index
+        let mut probe = video_probe.clone();
+        probe.uri = format!("{video_uri} | {audio_uri}");
+        probe.duration = probe.duration.max(audio_probe.duration);
+        for mut track in audio_probe.tracks {
+            track.id += audio_offset as i64;
+            probe.tracks.push(track);
+        }
+        for mut video in audio_probe.video {
+            video.track_id += audio_offset as i64;
+            probe.video.push(video);
+        }
+        for mut audio in audio_probe.audio {
+            audio.track_id += audio_offset as i64;
+            probe.audio.push(audio);
+        }
+        for mut subtitle in audio_probe.subtitles {
+            subtitle.id += audio_offset as i64;
+            if let SubtitleTrackSource::Embedded { stream_index } = &mut subtitle.source {
+                *stream_index += audio_offset as i64;
+            }
+            probe.subtitles.push(subtitle);
+        }
+        let mut subtitle_fonts = probe.subtitle_fonts.to_vec();
+        subtitle_fonts.extend(audio_probe.subtitle_fonts.iter().cloned());
+        probe.subtitle_fonts = Arc::from(subtitle_fonts);
+
+        let mut stream_time_bases = video_time_bases;
+        stream_time_bases.extend(audio_time_bases);
+
+        Ok(Self {
+            inputs,
+            pending: vec![None, None],
+            eof: vec![false, false],
+            probe,
+            stream_time_bases,
             selection: StreamSelection::all(),
         })
     }
@@ -348,9 +508,12 @@ impl Demuxer {
         if stream_index < 0 {
             return Err(FfmpegError::UnknownStream(stream_index));
         }
-        let raw = self.context.as_ptr();
+        let (input, local) = self
+            .locate_input(stream_index)
+            .ok_or(FfmpegError::UnknownStream(stream_index))?;
+        let raw = input.context.as_ptr();
         let stream_count = unsafe { (*raw).nb_streams as usize };
-        let Some(stream_slot) = (stream_index as usize)
+        let Some(stream_slot) = (local as usize)
             .checked_sub(0)
             .filter(|index| *index < stream_count)
         else {
@@ -370,6 +533,13 @@ impl Demuxer {
             time_base: TimeBase::from_av(unsafe { (*stream).time_base }),
             _owner: PhantomData,
         })
+    }
+
+    /// 全局 stream index → 所属输入 + 局部 index。
+    fn locate_input(&self, stream_index: i32) -> Option<(&DemuxInput, i32)> {
+        self.inputs
+            .iter()
+            .find_map(|input| input.local_index(stream_index).map(|local| (input, local)))
     }
 
     pub fn owned_codec_parameters(&self, stream_index: i32) -> Result<OwnedCodecParameters> {
@@ -392,28 +562,76 @@ impl Demuxer {
     }
 
     pub fn read_packet(&mut self) -> Result<Option<Packet>> {
-        loop {
-            let mut packet = Packet::alloc()?;
-            let code =
-                unsafe { sys::av_read_frame(self.context.as_mut_ptr(), packet.as_mut_ptr()) };
-            if code == AVERROR_EOF {
-                return Ok(None);
+        // 补齐每个输入的待处理包
+        for index in 0..self.inputs.len() {
+            if !self.eof[index] && self.pending[index].is_none() {
+                match self.inputs[index].read_packet()? {
+                    Some(packet) => self.pending[index] = Some(packet),
+                    None => self.eof[index] = true,
+                }
             }
-            check(code, "av_read_frame")?;
-
-            let stream_index = packet.stream_index();
-            packet.time_base = self.stream_time_base(stream_index);
-            packet.normalize_timeline(self.timeline_origin_micros);
-            if self.selection.accepts(stream_index) {
-                return Ok(Some(packet));
+        }
+        // 选择 DTS 最早的一包（双流按解码进度交错，保证音画同步）。
+        // 视频含 B 帧时 PTS 在解码序下会回退，故必须用 DTS 做比较基准。
+        let mut chosen: Option<usize> = None;
+        for index in 0..self.inputs.len() {
+            let Some(packet) = self.pending[index].as_ref() else {
+                continue;
+            };
+            let decode_ts = packet
+                .dts()
+                .or_else(|| packet.pts())
+                .map(|ts| ts.seconds())
+                .unwrap_or(f64::MIN);
+            let is_earlier = match chosen {
+                None => true,
+                Some(current) => {
+                    let current_ts = self.pending[current]
+                        .as_ref()
+                        .and_then(Packet::dts)
+                        .or_else(|| {
+                            self.pending[current]
+                                .as_ref()
+                                .and_then(Packet::pts)
+                        })
+                        .map(|ts| ts.seconds())
+                        .unwrap_or(f64::MIN);
+                    decode_ts < current_ts
+                }
+            };
+            if is_earlier {
+                chosen = Some(index);
             }
+        }
+        let Some(input_index) = chosen else {
+            return Ok(None);
+        };
+        let mut packet = self.pending[input_index].take().expect("pending ensured");
+        packet.set_stream_index(packet.stream_index() + self.inputs[input_index].stream_offset);
+        if self.selection.accepts(packet.stream_index()) {
+            Ok(Some(packet))
+        } else {
+            self.read_packet()
         }
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
         let relative_target = position.as_micros().min(i64::MAX as u128) as i64;
-        let absolute_target =
-            absolute_seek_target_micros(relative_target, self.timeline_origin_micros);
+        for index in 0..self.inputs.len() {
+            self.seek_input(index, relative_target)?;
+            self.pending[index] = None;
+            self.eof[index] = false;
+        }
+        Ok(())
+    }
+
+    /// 对单个输入执行 seek：优先选输入内视频流做 backward keyframe 锚点，
+    /// 无视频流（如音频输入）则整文件 seek；seek 后清掉该输入的交错缓存。
+    fn seek_input(&mut self, index: usize, relative_target: i64) -> Result<()> {
+        let absolute_target = absolute_seek_target_micros(
+            relative_target,
+            self.inputs[index].timeline_origin_micros,
+        );
         let seek_stream = self.selected_video_seek_stream();
         let selected_streams = match &self.selection {
             StreamSelection::All => None,
@@ -427,21 +645,23 @@ impl Demuxer {
             .map(|track| track.id)
             .collect::<Vec<_>>();
         let (stream_index, target) = seek_stream.map_or((-1, absolute_target), |stream_index| {
+            // 视频流只属于 video 输入；音频输入用整文件 seek（stream=-1）
+            let Some(local) = self.inputs[index].local_index(stream_index) else {
+                return (-1, absolute_target);
+            };
             let time_base = self
                 .stream_time_base(stream_index)
                 .expect("selected video stream has a time base");
-            (
-                stream_index,
-                rescale_microseconds_to_time_base(absolute_target, time_base),
-            )
+            (local, rescale_microseconds_to_time_base(absolute_target, time_base))
         });
         crate::trace::diagnostic(
             serde_json::json!({
                 "event": "ffmpeg_seek",
                 "stage": "backward_keyframe_request",
+                "inputIndex": index,
                 "streamIndex": stream_index,
                 "relativeTargetMicros": relative_target,
-                "timelineOriginMicros": self.timeline_origin_micros,
+                "timelineOriginMicros": self.inputs[index].timeline_origin_micros,
                 "absoluteTargetMicros": absolute_target,
                 "targetInSeekTimeBase": target,
                 "selectedStreams": selected_streams,
@@ -451,7 +671,7 @@ impl Demuxer {
         );
         let backward = unsafe {
             sys::av_seek_frame(
-                self.context.as_mut_ptr(),
+                self.inputs[index].context.as_mut_ptr(),
                 stream_index,
                 target,
                 sys::AVSEEK_FLAG_BACKWARD as i32,
@@ -465,7 +685,7 @@ impl Demuxer {
             // accepted the primary request.
             let fallback = unsafe {
                 sys::avformat_seek_file(
-                    self.context.as_mut_ptr(),
+                    self.inputs[index].context.as_mut_ptr(),
                     stream_index,
                     i64::MIN,
                     target,
@@ -480,9 +700,10 @@ impl Demuxer {
                 serde_json::json!({
                     "event": "ffmpeg_seek",
                     "stage": "full_range_fallback",
+                    "inputIndex": index,
                     "streamIndex": stream_index,
                     "relativeTargetMicros": relative_target,
-                    "timelineOriginMicros": self.timeline_origin_micros,
+                    "timelineOriginMicros": self.inputs[index].timeline_origin_micros,
                     "absoluteTargetMicros": absolute_target,
                     "targetInSeekTimeBase": target,
                     "backwardError": error_string(backward),
@@ -491,7 +712,7 @@ impl Demuxer {
             );
         }
         check(
-            unsafe { sys::avformat_flush(self.context.as_mut_ptr()) },
+            unsafe { sys::avformat_flush(self.inputs[index].context.as_mut_ptr()) },
             "avformat_flush",
         )?;
         Ok(())
@@ -1760,14 +1981,17 @@ fn d3d11va_surface_alignment(codec_id: sys::AVCodecID) -> i32 {
 
 #[cfg(target_os = "windows")]
 fn d3d11va_pool_size(codec_id: sys::AVCodecID) -> i32 {
+    // bili-rs 宿主：快 CDN 源下解码器产帧快，20 帧静态池在渲染消费
+    // 不及时（open 暂停窗口等）时会耗尽（get_buffer failed → 有声音无画面）。
+    // 增大池容量吸收突发：h264/hevc 60 帧，vp9/av1 40 帧。
     if codec_id == sys::AVCodecID_AV_CODEC_ID_H264 || codec_id == sys::AVCodecID_AV_CODEC_ID_HEVC {
-        20
+        60
     } else if codec_id == sys::AVCodecID_AV_CODEC_ID_VP9
         || codec_id == sys::AVCodecID_AV_CODEC_ID_AV1
     {
-        12
+        40
     } else {
-        5
+        10
     }
 }
 
@@ -3285,6 +3509,12 @@ impl Packet {
         unsafe { (*self.ptr).stream_index }
     }
 
+    /// 改写流索引。DASH 双流中两个输入内部流 index 都是 0 起，需平移到
+    /// 全局 index（video=0，audio=1）后才能与解码器/路由对齐。
+    pub fn set_stream_index(&mut self, stream_index: i32) {
+        unsafe { (*self.ptr).stream_index = stream_index };
+    }
+
     pub fn size(&self) -> usize {
         unsafe { (*self.ptr).size.max(0) as usize }
     }
@@ -3525,6 +3755,19 @@ impl CustomAvio {
         };
         if target < 0 {
             return av_error(EINVAL) as i64;
+        }
+        if whence == SEEK_SET {
+            // 窗口外 seek 的目标预取提示：avformat 即将从 target 开始读
+            // （seek 到目标关键帧），把目标窗口提前拉入后台多段预取，使
+            // seek 后 read 走 take_prefetch（join 小段）而非同步单请求。
+            // HttpRangeSource 内部判断 target 是否超出缓存窗口并防抖。
+            self.source.prefetch_hint(target as u64);
+        }
+        if crate::trace::enabled() && whence != sys::AVSEEK_SIZE as c_int {
+            crate::trace::log(format!(
+                "[erika-avio] stage=seek whence={whence} target={target} prev_offset={}",
+                self.offset
+            ));
         }
         self.offset = target as u64;
         self.offset.min(i64::MAX as u64) as i64

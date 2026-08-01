@@ -739,7 +739,7 @@ impl AudioRingBuffer {
     }
 }
 
-pub trait AudioOutputBackend {
+pub trait AudioOutputBackend: Send {
     fn configure(&mut self, format: PcmFormat) -> Result<()>;
     fn start(&mut self) -> Result<()>;
     fn pause(&mut self) -> Result<()>;
