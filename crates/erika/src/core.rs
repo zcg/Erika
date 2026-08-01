@@ -443,6 +443,9 @@ pub enum PlayerEvent {
     AudioOutputChanged(AudioOutputEvent),
     SurfaceAttached(PlatformSurface),
     SurfaceDetached,
+    /// 预载完成（源缓存就绪）。宿主可据此更新 UI（如"已就绪"），
+    /// 之后用户点播放即命中缓存秒开。
+    PreloadCompleted,
     Error(PlayerError),
 }
 
@@ -886,6 +889,8 @@ struct PlayerInner {
     subtitle_frame_backpressure_drops: u64,
     /// 异步 open 期间收到的 play() 请求：Ready 后自动播放
     pending_play: bool,
+    /// 异步 open 期间收到的 preload() 请求：Ready 后自动执行（进入界面即缓存第一段）
+    pending_preload: Option<Duration>,
 }
 
 struct PlayerLifecycle {
@@ -900,6 +905,12 @@ enum PlaybackCommand {
     },
     Pause {
         sequence: u64,
+    },
+    Preload {
+        sequence: u64,
+        generation: u64,
+        /// 预载目标：缓存统一时间轴上前 `target` 时长的源数据
+        target: Duration,
     },
     Seek {
         position: Duration,
@@ -1020,6 +1031,7 @@ impl Player {
                 subtitle_frame_sender: None,
                 subtitle_frame_backpressure_drops: 0,
                 pending_play: false,
+                pending_preload: None,
             })),
             lifecycle: Arc::new(Mutex::new(PlayerLifecycle {
                 epoch: 1,
@@ -1232,6 +1244,7 @@ impl Player {
             inner.playback_generation = generation;
             inner.playback_command_sequence = 0;
             inner.ended = false;
+            inner.pending_preload = None;
             inner.tracks = info.tracks.clone();
             inner.track_selection = info.track_selection();
             generation
@@ -1262,18 +1275,23 @@ impl Player {
             self.emit(PlayerEvent::VideoDecoderChanged(event));
         }
         self.transition(PlayerState::Ready)?;
-        // 排队中的 play()：Ready 后自动播放
-        let pending_play = {
+        // 排队中的 play()/preload()：Ready 后执行。play 优先（播放取消预载）。
+        let (pending_play, pending_preload) = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
-            let pending = inner.pending_play;
+            let play = inner.pending_play;
+            let preload = inner.pending_preload.take();
             inner.pending_play = false;
-            pending
+            inner.pending_preload = None;
+            (play, preload)
         };
         if pending_play {
             // 必须先释放 lifecycle 锁：play() 内部 playback_commands() 要重新获取
             // lifecycle 锁（std Mutex 非递归，持锁调用会死锁）。
             drop(lifecycle);
             let _ = self.play();
+        } else if let Some(target) = pending_preload {
+            drop(lifecycle);
+            let _ = self.preload(target);
         }
         Ok(())
     }
@@ -1289,6 +1307,8 @@ impl Player {
             match inner.state {
                 // 异步 open 进行中：排队，Ready 后自动播放（宿主无需轮询状态）
                 PlayerState::Opening => {
+                    // 播放优先：取消排队中的预载
+                    inner.pending_preload = None;
                     inner.pending_play = true;
                     return Ok(());
                 }
@@ -1343,6 +1363,47 @@ impl Player {
             Some(PlayerState::Paused),
         );
         Ok(())
+    }
+
+    /// 预载：提前缓存媒体前 `target` 时长的源数据（**不播放、不渲染、不发声**）。
+    /// 用于"进入播放界面即缓存第一段，点播放即点即播"。完成时发出
+    /// `PreloadCompleted` 事件。
+    ///
+    /// Ready/Paused/Stopped 直接执行；异步 open（Opening）排队，Ready 后
+    /// 自动执行；播放（Playing）中调用被忽略。播放开始会取消未完成的预载。
+    pub fn preload(&self, target: Duration) -> Result<()> {
+        self.ensure_not_closed()?;
+        let (sequence, generation) = {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            match inner.state {
+                PlayerState::Opening => {
+                    inner.pending_preload = Some(target);
+                    return Ok(());
+                }
+                PlayerState::Ready | PlayerState::Paused | PlayerState::Stopped => {
+                    inner.playback_command_sequence =
+                        inner.playback_command_sequence.saturating_add(1).max(1);
+                    (
+                        inner.playback_command_sequence,
+                        inner.playback_generation.max(1),
+                    )
+                }
+                from => {
+                    return Err(PlayerError::InvalidStateTransition {
+                        from,
+                        to: PlayerState::Ready,
+                    });
+                }
+            }
+        };
+        let commands = self.playback_commands()?;
+        commands
+            .send(PlaybackCommand::Preload {
+                sequence,
+                generation,
+                target,
+            })
+            .map_err(|_| PlayerError::Playback("playback worker is not running".to_string()))
     }
 
     pub fn seek(&self, position: Duration) -> Result<()> {
@@ -1760,12 +1821,19 @@ fn run_playback_worker(
         loop_count = loop_count.saturating_add(1);
         let loop_started = std::time::Instant::now();
         let mut command_count = 0usize;
-        match commands.recv_timeout(playback_poll_interval(
-            engine.state(),
-            // A quiesced output cannot present the pending preview frame, so
-            // fast polling for it would never terminate.
-            engine.has_pending_paused_seek_frame() && !frame_output_quiesced,
-        )) {
+        // 预载期间 2ms 快速轮询驱动 demux 消费（tick 每轮拉取一批）；
+        // 否则按状态用常规间隔（非播放空闲时 50ms，省 CPU）。
+        let poll = if engine.has_active_preload() {
+            Duration::from_millis(2)
+        } else {
+            playback_poll_interval(
+                engine.state(),
+                // A quiesced output cannot present the pending preview frame, so
+                // fast polling for it would never terminate.
+                engine.has_pending_paused_seek_frame() && !frame_output_quiesced,
+            )
+        };
+        match commands.recv_timeout(poll) {
             Ok(command) => {
                 command_count += 1;
                 observe_audio_pump_command(
@@ -1883,6 +1951,11 @@ fn run_playback_worker(
             &mut last_worker_clock,
         );
         let after_video = std::time::Instant::now();
+
+        // 预载完成：对外发事件（tick 内部已完成 demux 复位，宿主据此更新 UI）
+        if engine.take_preload_completed() {
+            emit_from_worker(&inner, PlayerEvent::PreloadCompleted);
+        }
 
         if !frame_output_quiesced && engine.state() == PlaybackRunState::Playing {
             if should_prefill_audio_from_worker(engine, last_audio_snapshot, last_audio_snapshot_at)
@@ -2366,6 +2439,28 @@ fn handle_playback_command(
                 None,
                 None,
                 Some(PlayerState::Paused),
+            );
+        }
+        PlaybackCommand::Preload {
+            sequence,
+            generation,
+            target,
+        } => {
+            if !begin_playback_command_execution(sequence, last_executed_playback_command_sequence)
+            {
+                return true;
+            }
+            if engine.state() == PlaybackRunState::Playing {
+                return true; // 播放中不预载
+            }
+            *playback_generation = (*playback_generation).max(generation).max(1);
+            engine.start_preload(target);
+            let _ = commit_playback_command_intent(
+                inner,
+                sequence,
+                Some(*playback_generation),
+                None,
+                None,
             );
         }
         PlaybackCommand::Seek {

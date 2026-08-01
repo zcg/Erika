@@ -81,6 +81,10 @@ const AUDIO_SEEK_INVALID_PACKET_LIMIT: usize = 64;
 const DECODER_EOF_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const DECODER_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const AUDIO_EOF_OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// 预载（preload）消费预算：与视频 pump 一致，一次 tick 的合理工作量。
+/// worker 每轮 tick 调用一次，按此限额分片消费，避免单轮阻塞过久。
+const PRELOAD_PACKET_BUDGET: usize = 64;
+const PRELOAD_TIME_BUDGET: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlaybackQueueLimits {
@@ -709,6 +713,9 @@ pub struct PlaybackSession {
     eof_drain_pending_logged: bool,
     eof_drain_last_progress_at: Option<Instant>,
     eof: bool,
+    /// 预载消费到的最大 demux pts（统一时间轴，视频/音频交错取 max）。
+    /// preload 据此判断是否达到目标时长。
+    preload_last_pts: Option<Duration>,
 }
 
 fn open_video_decoder(
@@ -1185,6 +1192,7 @@ impl PlaybackSession {
             eof_drain_pending_logged: false,
             eof_drain_last_progress_at: None,
             eof: false,
+            preload_last_pts: None,
         })
     }
 
@@ -1691,6 +1699,8 @@ impl PlaybackSession {
         }
         self.audio_resampler = None;
         self.reset_eof_drain_state();
+        // demux 位置已复位，预载进度追踪随之清空（否则 preload 目标判定残留旧位置）
+        self.preload_last_pts = None;
         Ok(())
     }
 
@@ -2047,6 +2057,11 @@ impl PlaybackSession {
     }
 
     fn route_packet(&mut self, packet: ffmpeg::Packet) -> Result<()> {
+        // 预载进度：统一时间轴上消费到的最大 pts（视频/音频交错取 max）
+        if let Some(pts) = packet.pts().and_then(|pts| pts.as_duration()) {
+            self.preload_last_pts =
+                Some(self.preload_last_pts.map_or(pts, |prev| prev.max(pts)));
+        }
         if self
             .video_decoder
             .as_ref()
@@ -3731,6 +3746,12 @@ pub struct VideoPlaybackEngine {
     video_seek_preroll_started_at: Option<Instant>,
     video_seek_preroll_dropped_frames: u64,
     last_video_seek_preroll_log: Option<Instant>,
+    /// 预载目标（统一时间轴）。Some 时 `tick` 进入预载分支：只消费 demux
+    /// 填充源缓存（不输出帧、不推进时钟、不发声）；达到目标或 EOF 后
+    /// 复位 demux 到 0（缓存保留），再发 `PreloadCompleted`。
+    preload_target: Option<Duration>,
+    /// 预载完成标记（一次性，worker 轮询取走后清除并对外发事件）
+    preload_completed: bool,
 }
 
 unsafe impl Send for VideoPlaybackEngine {}
@@ -3812,6 +3833,8 @@ impl VideoPlaybackEngine {
             video_seek_preroll_started_at: None,
             video_seek_preroll_dropped_frames: 0,
             last_video_seek_preroll_log: None,
+            preload_target: None,
+            preload_completed: false,
         }
     }
 
@@ -4145,6 +4168,10 @@ impl VideoPlaybackEngine {
     }
 
     fn play_checked_with_now(&mut self, now: impl FnOnce() -> Instant) -> Result<bool> {
+        // 播放取消未完成的预载：demux 位置可能已前进到 preload 目标，
+        // 残留 preload 状态会让 tick 继续走预载分支（丢弃帧不播放）。
+        self.preload_target = None;
+        self.preload_completed = false;
         self.session.ensure_video_decoder_available("play")?;
         if self.state == PlaybackRunState::Playing {
             return Ok(false);
@@ -4256,6 +4283,8 @@ impl VideoPlaybackEngine {
     }
 
     fn stop_checked_with_now(&mut self, now: impl FnOnce() -> Instant) -> Result<()> {
+        self.preload_target = None;
+        self.preload_completed = false;
         self.discard_pending_frames_for_seek();
         // Stop must remain available after a final decoder failure so callers
         // can quiesce playback and release audio even though replay is blocked.
@@ -4263,6 +4292,86 @@ impl VideoPlaybackEngine {
         // deliberately preserves the recorded video-decoder failure.
         self.session.seek_for_stop(Duration::ZERO)?;
         self.commit_stopped_at(now(), "stop");
+        Ok(())
+    }
+
+    /// 启动预载：缓存媒体前 `target` 时长的源数据（不播放、不渲染、不发声）。
+    /// 播放中调用无效果（播放优先）。
+    pub fn start_preload(&mut self, target: Duration) {
+        if self.state == PlaybackRunState::Playing {
+            return;
+        }
+        self.preload_target = Some(target);
+        self.preload_completed = false;
+        trace::log(format!(
+            "[erika-playback-trace] stage=preload_start target={} state={:?}",
+            trace::duration_label(Some(target)),
+            self.state,
+        ));
+    }
+
+    pub fn has_active_preload(&self) -> bool {
+        self.preload_target.is_some()
+    }
+
+    /// 取走一次性完成标记（worker 轮询后调用并对外发 `PreloadCompleted`）
+    pub fn take_preload_completed(&mut self) -> bool {
+        let completed = self.preload_completed;
+        self.preload_completed = false;
+        completed
+    }
+
+    /// 预载消费一批：丢弃已解码帧/包保持队列空 → pump 消费 demux 填充源缓存，
+    /// 直到达到目标 pts、EOF 或时间片/包数预算耗尽。返回是否已完成。
+    fn preload_batch(&mut self) -> Result<bool> {
+        let Some(target) = self.preload_target else {
+            return Ok(true);
+        };
+        let started = Instant::now();
+        let mut pumped = 0usize;
+        loop {
+            if self.session.preload_last_pts.is_some_and(|pts| pts >= target) {
+                return Ok(true);
+            }
+            // 丢弃现有队列，让 pump 持续拉取新数据（demux 消费驱动
+            // HttpRangeSource 顺序下载；缓存剩余低于 read_ahead/2 时自动
+            // 触发多段并行预取窗口，进一步加速第一段就绪）。
+            self.session.discard_video_frames_and_packets();
+            self.session.discard_queued_audio_frames();
+            if !self.session.pump_once(PlaybackPumpDemand::Video)? {
+                if self.session.demux_eof {
+                    return Ok(true); // 全部缓存完
+                }
+                return Ok(false); // 阻塞（队列已空不应发生），下一轮重试
+            }
+            pumped += 1;
+            if pumped >= PRELOAD_PACKET_BUDGET || started.elapsed() >= PRELOAD_TIME_BUDGET {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// 预载完成后的复位：demux 回到 0（source cache 保留命中），保持 Paused、
+    /// 不设 paused_seek_frame_pending（避免 worker 进入 2ms 快轮询空转）。
+    fn reset_demux_for_preload(&mut self) -> Result<()> {
+        self.discard_pending_frames_for_seek();
+        self.session.seek_with_decoder_flush(Duration::ZERO, true, true)?;
+        let now = Instant::now();
+        self.clock.reset(Duration::ZERO, false, now);
+        self.last_presented_pts = None;
+        self.eof = false;
+        self.state = PlaybackRunState::Paused;
+        self.buffering = false;
+        self.buffering_video_pts = None;
+        self.waiting_for_first_frame = false;
+        self.paused_seek_frame_pending = false;
+        self.video_seek_floor = Some(Duration::ZERO);
+        self.audio_seek_floor = Some(Duration::ZERO);
+        self.reset_video_seek_preroll_budget(now);
+        trace::log(format!(
+            "[erika-playback-trace] stage=preload_reset_demux state={:?}",
+            self.state,
+        ));
         Ok(())
     }
 
@@ -4605,6 +4714,32 @@ impl VideoPlaybackEngine {
         &mut self,
         mut now: impl FnMut() -> Instant,
     ) -> Result<Option<TimedVideoFrame>> {
+        // 预载优先：只消费 demux 填充源缓存，不输出帧、不推进时钟、不发声。
+        // worker 每轮 tick 调用，以 PRELOAD_*_BUDGET 分片限速，避免单轮阻塞。
+        if self.preload_target.is_some() {
+            match self.preload_batch() {
+                Ok(true) => {
+                    self.preload_target = None;
+                    self.preload_completed = true;
+                    self.reset_demux_for_preload()?;
+                    trace::log(
+                        "[erika-playback-trace] stage=preload_completed target_reached"
+                            .to_string(),
+                    );
+                }
+                Ok(false) => {} // 时间片未够，下一轮继续
+                Err(error) => {
+                    self.preload_target = None;
+                    self.preload_completed = false;
+                    trace::log(format!(
+                        "[erika-playback-trace] stage=preload_error error={}",
+                        error,
+                    ));
+                    return Err(error);
+                }
+            }
+            return Ok(None);
+        }
         let paused_seek_preview =
             self.state == PlaybackRunState::Paused && self.paused_seek_frame_pending;
         if self.state != PlaybackRunState::Playing && !paused_seek_preview {

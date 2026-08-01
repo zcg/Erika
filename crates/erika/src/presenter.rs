@@ -762,6 +762,13 @@ impl PresenterRuntime {
         result
     }
 
+    /// 预载：提前缓存媒体前 `target` 时长的源数据（**不播放、不渲染、不发声**）。
+    /// 宿主在进入播放界面时调用——用户点播放即命中缓存秒开。异步 open 进行中
+    /// 会排队，Ready 后自动执行；播放开始自动取消。
+    pub fn preload(&mut self, target: Duration) -> Result<()> {
+        self.player.preload(target)
+    }
+
     pub fn is_playing(&self) -> bool {
         self.player.state() == crate::core::PlayerState::Playing
     }
