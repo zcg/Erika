@@ -3685,9 +3685,11 @@ impl CustomAvio {
             return Err(FfmpegError::NullPointer("avio_alloc_context"));
         }
         if !avio.source.seekable() {
-            // 直播流等不可 seek 源：avio_alloc_context 默认置 seekable，这里
-            // 清掉——flv demuxer 据此进入 live 模式（不 seek、按墙钟推进），
-            // avformat 内部 seek 也被拒绝（avio_seek 检查 seekable）。
+            // 直播流等不可 seek 源：avio_alloc_context 因传入了 seek 回调而
+            // 默认置 AVIO_SEEKABLE_NORMAL，这里清掉。flv demuxer 据 seekable
+            // 位进入 live 模式（顺序读、不建索引、不 seek 探测 duration）。
+            // 注意 avio_seek 本身不检查 seekable 位，真正的防跳转由 seek()
+            // 对不可 seek 源的拒绝 + read_range 的 offset 校验兜底。
             unsafe { (*context).seekable = 0; }
         }
         avio.context = context;
@@ -3761,6 +3763,16 @@ impl CustomAvio {
         };
         if target < 0 {
             return av_error(EINVAL) as i64;
+        }
+        if !self.source.seekable() && target as u64 != self.offset {
+            // 直播流等不可 seek 源：只放行原地 seek（avformat 可能用它查询
+            // 当前位置）；任何真正的跳转都拒绝。avio_seek 不检查 seekable
+            // 位，静默改 offset 会让下一次 read_range 的校验报出令人费解的
+            // EIO，这里在 seek 阶段就明确失败并记录原因。
+            let error = format!("live source is not seekable (seek target {target})");
+            self.last_error = Some(error.clone());
+            crate::trace::log(format!("Erika custom AVIO rejected {error}"));
+            return av_error(ESPIPE) as i64;
         }
         if whence == SEEK_SET {
             // 窗口外 seek 的目标预取提示：avformat 即将从 target 开始读

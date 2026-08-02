@@ -888,6 +888,16 @@ impl MediaSource for HttpLiveStreamSource {
             SourceError::Http(message)
         })?;
         buf.truncate(n);
+        if n == 0 {
+            // 直播源没有"正常结束"概念：read 返回 0 即服务器关闭连接（断流）。
+            // 记录流位置供宿主诊断断流点；空 buf → AVIO EOF → 播放层按流结束
+            // 处理。这里不清空 reader：EOF 后继续 read 仍返回 Ok(0)，保持
+            // ffmpeg 干净的 EOF 语义；清空会让下一次读报 Io 错误、破坏结束路径。
+            http_trace_log(format!(
+                "{{\"event\":\"http_live_eof\",\"stream_offset\":{},\"downloaded_bytes\":{}}}",
+                self.offset, self.downloaded_bytes,
+            ));
+        }
         self.offset = self.offset.saturating_add(n as u64);
         self.downloaded_bytes = self.downloaded_bytes.saturating_add(n as u64);
         self.publish_diag();
