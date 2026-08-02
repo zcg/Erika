@@ -799,6 +799,16 @@ pub trait RendererBackend: Send {
         crate::renderer::output::OutputRuntimeStatus::default()
     }
 
+    /// Whether the underlying GPU device has been removed/lost (e.g. Windows
+    /// TDR → DXGI_ERROR_DEVICE_RESET, or hardware removal →
+    /// DXGI_ERROR_DEVICE_REMOVED). When true, both the renderer's device and
+    /// any hardware decoder device are invalid, so the presenter must rebuild
+    /// the renderer and re-open the media to recover. Backends without
+    /// device-loss tracking default to false.
+    fn device_lost(&self) -> bool {
+        false
+    }
+
     /// Whether this renderer can consume MediaCodec Surface/AHardwareBuffer
     /// frames without a CPU readback. Android uses this before opening the
     /// decoder so unsupported Vulkan implementations start in ByteBuffer mode.

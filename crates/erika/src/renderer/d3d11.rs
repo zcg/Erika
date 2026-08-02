@@ -683,6 +683,10 @@ pub struct D3d11Renderer {
     requested_output_mode: crate::renderer::output::OutputMode,
     upscaler_mode: LumaUpscalerMode,
     hdr10_output_unavailable: bool,
+    /// 设备丢失标记：GPU TDR（通常返回 `DXGI_ERROR_DEVICE_RESET`）或硬件错误
+    /// （`DXGI_ERROR_DEVICE_REMOVED`）后，所有设备操作失败。由
+    /// `render_current_frame` 检测置位，`PresenterRuntime` 据此触发自愈。
+    device_lost: bool,
     stats: D3d11RendererStats,
 }
 
@@ -704,6 +708,7 @@ impl D3d11Renderer {
             requested_output_mode: config.output_mode,
             upscaler_mode: config.luma_upscaler,
             hdr10_output_unavailable: false,
+            device_lost: false,
             stats: D3d11RendererStats::default(),
         })
     }
@@ -735,6 +740,14 @@ impl D3d11Renderer {
         self.current_video = None;
         self.danmaku_atlas_cache = None;
         self.set_device(frame_device, context)
+    }
+
+    /// 设备是否已失效：`GetDeviceRemovedReason` 返回非 S_OK（设备移除/重置）
+    /// 即判定。注意设备正常时该调用返回 S_OK，TDR 后返回失败。
+    fn device_removed(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| unsafe { state.device.GetDeviceRemovedReason().is_err() })
     }
 
     fn set_device(&mut self, device: ID3D11Device, context: ID3D11DeviceContext) -> Result<()> {
@@ -1453,6 +1466,7 @@ impl RendererBackend for D3d11Renderer {
             linear_shader_resource: None,
         });
         self.hdr10_output_unavailable = false;
+        self.device_lost = false;
         self.stats.attached = true;
         self.recreate_surface_targets()?;
         self.render_clear(0.0)
@@ -1519,7 +1533,20 @@ impl RendererBackend for D3d11Renderer {
     }
 
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
-        self.render_video(context)
+        let result = self.render_video(context);
+        if result.is_err() && self.device_removed() {
+            // GPU 设备移除/重置（TDR 通常返回 DXGI_ERROR_DEVICE_RESET，硬件
+            // 错误返回 DEVICE_REMOVED）后所有设备操作失败。用
+            // GetDeviceRemovedReason 确认（而非匹配错误文本），避免把 shader
+            // 编译等普通渲染错误误判为设备丢失。PresenterRuntime 据此自愈。
+            self.device_lost = true;
+            trace("device lost/reset detected; requesting presenter recovery");
+        }
+        result
+    }
+
+    fn device_lost(&self) -> bool {
+        self.device_lost
     }
 
     fn runtime_stats(&self) -> RendererRuntimeStats {

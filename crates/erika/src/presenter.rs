@@ -187,6 +187,8 @@ pub struct PresenterStats {
     pub video_frame_backpressure_drops: u64,
     pub render_failures: u64,
     pub audio_failures: u64,
+    /// GPU 设备移除（TDR）自愈次数
+    pub device_lost_recoveries: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -256,6 +258,18 @@ pub struct PresenterRuntime {
     current_generation: u64,
     current_surface_metrics: Option<SurfaceMetrics>,
     current_danmaku_viewport: Option<DanmakuViewport>,
+    /// 完整配置副本（resolve 之后保存）——device_lost 自愈时重建渲染器用
+    config: PresenterConfig,
+    /// 渲染器后端偏好（build_renderer 重建用）
+    renderer_preference: RendererBackendPreference,
+    /// attach 时的面板 surface（Copy）——自愈后重新 attach
+    attached_surface: Option<PlatformSurface>,
+    /// 当前媒体请求（Clone）——自愈后重新 open
+    last_media: Option<MediaRequest>,
+    /// 自愈进行中（防重入）
+    recovering: bool,
+    /// 设备丢失自愈后待恢复的播放状态（reopen 完成前延迟应用）
+    pending_device_lost_restore: Option<DeviceLostRestore>,
     subtitle_font_scale: f64,
     subtitle_style: SubtitleStyleConfig,
     subtitles: SubtitleFrameState,
@@ -284,6 +298,19 @@ struct RejectedVideoImportRoute {
     backend: DecoderBackend,
     mediacodec_surface: bool,
     generation: u64,
+}
+
+/// 设备丢失自愈后待恢复的播放状态。`Player::open` 是**异步**的（返回时新
+/// playback worker 尚未就绪），恢复命令（seek/rate/play）必须等 worker 就绪
+/// （`Ready`）后才能下发，否则会因 "no media is open" 失败。因此由
+/// `recover_from_device_lost` 缓存、`apply_pending_device_lost_restore` 在
+/// render_tick 中延迟应用。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DeviceLostRestore {
+    position: Duration,
+    rate: f64,
+    was_playing: bool,
+    track_selection: TrackSelection,
 }
 
 impl RejectedVideoImportRoute {
@@ -590,6 +617,9 @@ impl PresenterRuntime {
             renderer_preference,
             supports_mediacodec_surface,
         );
+        // resolve 之后 clone：保存最终生效的配置（含 WgpuFallback→Software 等
+        // 回退），device_lost 自愈时按同一配置重建渲染器。
+        let saved_config = config.clone();
         #[cfg(target_env = "ohos")]
         let player = Player::new_with_ohos_avcodec_surface(config.player, ohos_avcodec_surface);
         #[cfg(not(target_env = "ohos"))]
@@ -631,6 +661,12 @@ impl PresenterRuntime {
             current_generation: 1,
             current_surface_metrics: None,
             current_danmaku_viewport: None,
+            config: saved_config,
+            renderer_preference,
+            attached_surface: None,
+            last_media: None,
+            recovering: false,
+            pending_device_lost_restore: None,
             subtitle_font_scale: DEFAULT_SUBTITLE_FONT_SCALE,
             subtitle_style: SubtitleStyleConfig::default(),
             subtitles: SubtitleFrameState::default(),
@@ -661,6 +697,7 @@ impl PresenterRuntime {
 
     pub fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()> {
         let metrics = surface.metrics();
+        self.attached_surface = Some(surface);
         self.renderer.attach_surface(surface)?;
         if let Err(error) = self.player.attach_surface(surface) {
             let _ = self.renderer.detach_surface();
@@ -673,6 +710,9 @@ impl PresenterRuntime {
 
     pub fn detach_surface(&mut self) -> Result<()> {
         self.current_surface_metrics = None;
+        // 已 detach 的 surface 句柄对自愈无效：设备丢失恢复时绝不能重新
+        // attach 一个已失效的表面。
+        self.attached_surface = None;
         self.clear_current_danmaku_state();
         self.player.detach_surface()?;
         self.renderer.detach_surface()
@@ -733,6 +773,8 @@ impl PresenterRuntime {
         self.drain_pending_player_frames();
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.latest_video_decoder = None;
+        // 保存媒体请求副本（device_lost 自愈时重新 open）
+        self.last_media = Some(media.clone());
         let result = self.player.open(media);
         // Player::open joins the previous producer before returning, so this
         // second drain deterministically removes anything it emitted between
@@ -1055,6 +1097,10 @@ impl PresenterRuntime {
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
         let tick_started = Instant::now();
+        // 设备丢失自愈后，若 reopen 已完成（player 进入 Ready），在此恢复
+        // 速率/位置/播放意图/轨道选择。必须在任何 pump 之前：seek 会重置
+        // 解码与时钟，本帧的 pump 应基于恢复后的状态。
+        self.apply_pending_device_lost_restore();
         let pump_started = Instant::now();
         self.refresh_video_decoder_status();
 
@@ -1170,6 +1216,37 @@ impl PresenterRuntime {
             }
             Err(error) => {
                 self.stats.render_failures += 1;
+                if self.renderer.device_lost() && !self.recovering {
+                    self.recovering = true;
+                    let recovery = self.recover_from_device_lost(&error);
+                    self.recovering = false;
+                    match recovery {
+                        Ok(()) => {
+                            trace::diagnostic(
+                                serde_json::json!({
+                                    "event": "device_lost_recovery",
+                                    "stage": "renderer_rebuilt",
+                                    "recoveries": self.stats.device_lost_recoveries,
+                                })
+                                .to_string(),
+                            );
+                            self.last_tick_duration = tick_started.elapsed();
+                            return Ok(self.stats);
+                        }
+                        Err(recovery_error) => {
+                            trace::diagnostic(
+                                serde_json::json!({
+                                    "event": "device_lost_recovery",
+                                    "stage": "failed",
+                                    "recoveries": self.stats.device_lost_recoveries,
+                                    "reason": recovery_error.to_string(),
+                                })
+                                .to_string(),
+                            );
+                            return Err(recovery_error);
+                        }
+                    }
+                }
                 return Err(error);
             }
         }
@@ -1223,6 +1300,164 @@ impl PresenterRuntime {
             ));
         }
         Ok(self.stats)
+    }
+
+    /// GPU 设备移除（TDR）自愈。Windows 上 D3D11 设备被移除后，渲染器设备与
+    /// FFmpeg D3D11VA 解码器设备**同时失效**，必须重建两者：
+    /// 1. 丢弃坏 renderer（drop），按保存的配置重建；
+    /// 2. 重新 attach 交换链面板（同一 SwapChainPanel raw 指针仍有效）；
+    /// 3. 重新 open 当前媒体（解码器独立创建新的 D3D11VA 设备）；
+    /// 4. 恢复音量。
+    ///
+    /// 速率 / 位置 / 播放意图 / 轨道选择**不能在此同步恢复**：`Player::open`
+    /// 是异步的，返回时新 playback worker 尚未就绪（状态 `Opening`），此时
+    /// 下发 seek/rate 命令会因 "no media is open" 失败。因此把它们缓存到
+    /// `pending_device_lost_restore`，等 player 进入 `Ready` 后由
+    /// `apply_pending_device_lost_restore` 恢复。
+    ///
+    /// 弹幕状态由 danmaku_session 保留（不销毁），无需重设；音频 WASAPI
+    /// 与 GPU 无关，保留复用。TDR 期间音频继续播放，恢复 seek 回跳会产生
+    /// 一次可感知的音频跳变，这是固有代价。TDR 是瞬时的（驱动重置，通常
+    /// 返回 `DXGI_ERROR_DEVICE_RESET`），重建后的设备有效。
+    fn recover_from_device_lost(&mut self, _trigger: &PlayerError) -> Result<()> {
+        let surface = self.attached_surface;
+        let media = self.last_media.clone();
+        let position = self.player.current_media_time();
+        let was_playing = self.is_playing();
+        let volume = self.audio_output.volume();
+        let rate = self.playback_rate;
+        let track_selection = self.player.track_selection();
+
+        trace::diagnostic(
+            serde_json::json!({
+                "event": "device_lost_recovery",
+                "stage": "begin",
+                "positionMs": position.as_millis(),
+                "playing": was_playing,
+                "rate": rate,
+            })
+            .to_string(),
+        );
+
+        // 1. 丢弃坏设备，按保存的配置重建渲染器
+        self.renderer = build_renderer(self.renderer_preference, self.config.renderer)?;
+
+        // 2. 重新 attach 交换链面板
+        if let Some(surface) = surface {
+            self.renderer.attach_surface(surface)?;
+            self.player.attach_surface(surface)?;
+            self.current_surface_metrics = Some(surface.metrics());
+        }
+
+        // 3. 重新 open 当前媒体（重建解码器）；成功后才缓存待恢复状态
+        if let Some(media) = media {
+            self.reset_audio_output();
+            self.drain_pending_player_frames();
+            self.current_generation = self.current_generation.saturating_add(1).max(1);
+            self.latest_video_decoder = None;
+            self.player.open(media)?;
+            self.drain_pending_player_frames();
+            self.pending_device_lost_restore = Some(DeviceLostRestore {
+                position,
+                rate,
+                was_playing,
+                track_selection,
+            });
+        }
+
+        // 4. 恢复音量（音频与 GPU 无关，可立即恢复）
+        self.audio_output.set_volume(volume);
+
+        self.stats.device_lost_recoveries += 1;
+        Ok(())
+    }
+
+    /// 应用设备丢失自愈后的待恢复状态（速率/位置/播放意图/轨道选择）。
+    /// 由 render_tick 每帧调用；player 进入 `Ready`（reopen 完成）前不消费，
+    /// 避免在 playback worker 尚未就绪时下发命令而失败。
+    fn apply_pending_device_lost_restore(&mut self) {
+        let Some(restore) = self.pending_device_lost_restore else {
+            return;
+        };
+        if self.player.state() != crate::core::PlayerState::Ready {
+            // reopen 尚未完成，保持 pending，下一帧再试。
+            return;
+        }
+        self.pending_device_lost_restore = None;
+
+        // 轨道选择：reopen 会重置为默认，按设备丢失前的选择恢复。轨道 id
+        // 对同一媒体稳定；id 变化（媒体已变）时失败可忽略，沿用默认轨。
+        if let Err(error) = self.player.select_audio_track(restore.track_selection.audio) {
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "device_lost_recovery",
+                    "stage": "restore_track_failed",
+                    "kind": "audio",
+                    "reason": error.to_string(),
+                })
+                .to_string(),
+            );
+        }
+        if let Err(error) = self.player.select_subtitle_track(restore.track_selection.subtitle) {
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "device_lost_recovery",
+                    "stage": "restore_track_failed",
+                    "kind": "subtitle",
+                    "reason": error.to_string(),
+                })
+                .to_string(),
+            );
+        }
+
+        // 速率 / 位置 / 播放意图：此时 playback worker 已就绪，命令不再失败。
+        if restore.rate != 1.0 {
+            if let Err(error) = self.set_playback_rate(restore.rate) {
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "device_lost_recovery",
+                        "stage": "restore_rate_failed",
+                        "reason": error.to_string(),
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        if restore.position > Duration::from_secs(1) {
+            if let Err(error) = self.seek(restore.position) {
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "device_lost_recovery",
+                        "stage": "restore_seek_failed",
+                        "reason": error.to_string(),
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        if restore.was_playing {
+            if let Err(error) = self.play() {
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "device_lost_recovery",
+                        "stage": "restore_play_failed",
+                        "reason": error.to_string(),
+                    })
+                    .to_string(),
+                );
+            }
+        }
+
+        trace::diagnostic(
+            serde_json::json!({
+                "event": "device_lost_recovery",
+                "stage": "restore_applied",
+                "positionMs": restore.position.as_millis(),
+                "rate": restore.rate,
+                "resumePlayback": restore.was_playing,
+            })
+            .to_string(),
+        );
     }
 
     fn debug_hud_snapshot(&self) -> DebugHudSnapshot {
@@ -3507,6 +3742,36 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(reported, vec![1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn device_lost_restore_is_deferred_until_player_is_ready() {
+        // 设备丢失恢复命令（track/rate/seek/play）只能在 PlaybackSession 就绪后
+        // 下发：Player::open 是异步的，期间 playback_commands() 会返回
+        // Err("no media is open")，过早执行必然失败。pending 状态必须保留到 Ready。
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let restore = DeviceLostRestore {
+            position: Duration::from_secs(5),
+            rate: 1.5,
+            was_playing: true,
+            track_selection: TrackSelection {
+                audio: Some(1),
+                subtitle: Some(2),
+                ..TrackSelection::default()
+            },
+        };
+        presenter.pending_device_lost_restore = Some(restore);
+
+        // 前提：未 open 任何媒体，player 处于 Idle 而非 Ready。
+        assert_ne!(
+            presenter.player.state(),
+            crate::core::PlayerState::Ready,
+            "test precondition: player must not be Ready"
+        );
+
+        // 非 Ready 时必须保持 pending，不得消费。
+        presenter.apply_pending_device_lost_restore();
+        assert_eq!(presenter.pending_device_lost_restore, Some(restore));
     }
     use crate::danmaku::{DanmakuColor, DanmakuItem, DanmakuMode};
     use crate::subtitle::{
