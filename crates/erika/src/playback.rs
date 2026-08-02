@@ -4170,8 +4170,15 @@ impl VideoPlaybackEngine {
     fn play_checked_with_now(&mut self, now: impl FnOnce() -> Instant) -> Result<bool> {
         // 播放取消未完成的预载：demux 位置可能已前进到 preload 目标，
         // 残留 preload 状态会让 tick 继续走预载分支（丢弃帧不播放）。
+        let had_active_preload = self.preload_target.is_some();
         self.preload_target = None;
         self.preload_completed = false;
+        if had_active_preload {
+            // preload 被 play 取消：demux 已被预载消费向 target 方向推进。
+            // 必须复位到 0（源缓存保留、解码器 flush），否则播放会从
+            // preload 已消费到的中间位置开始，而非媒体开头。
+            self.reset_demux_for_preload()?;
+        }
         self.session.ensure_video_decoder_available("play")?;
         if self.state == PlaybackRunState::Playing {
             return Ok(false);
@@ -6324,6 +6331,37 @@ mod tests {
         assert_eq!(engine.state(), PlaybackRunState::Playing);
         assert_eq!(engine.media_time_at(replay_at), Duration::ZERO);
         let _ = next_fixture_av_at_target(&mut engine, replay_at, Duration::ZERO);
+    }
+
+    #[test]
+    fn playback_fixture_play_cancels_active_preload_and_restarts_from_zero() {
+        let mut engine = playback_fixture_engine();
+        let t0 = Instant::now();
+
+        // 预载尚未完成（demux 已被预载消费推进到 3s）时收到 play()。
+        engine.start_preload(Duration::from_secs(8));
+        engine.session.preload_last_pts = Some(Duration::from_secs(3));
+        assert!(engine.has_active_preload());
+
+        let play_at = t0 + Duration::from_millis(5);
+        assert!(!engine.play_checked_at(play_at).unwrap());
+
+        assert_eq!(engine.state(), PlaybackRunState::Playing);
+        assert!(!engine.has_active_preload(), "play must cancel preload");
+        // play 取消预载时必须复位 demux（复位会清空预载进度追踪），否则播放
+        // 会从预载已消费到的中间位置开始，而非媒体开头。
+        assert!(
+            engine.session.preload_last_pts.is_none(),
+            "play must reset demux to zero after cancelling preload"
+        );
+
+        // 播放从头开始（而非 preload 消费到的位置）
+        let (video, _) = next_fixture_av_at_target(&mut engine, play_at, Duration::ZERO);
+        assert!(
+            video.pts.unwrap() < Duration::from_millis(500),
+            "play after cancelled preload must restart from zero, got {:?}",
+            video.pts
+        );
     }
 
     #[test]
