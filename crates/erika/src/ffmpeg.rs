@@ -3684,6 +3684,12 @@ impl CustomAvio {
             unsafe { sys::av_free(buffer.cast::<c_void>()) };
             return Err(FfmpegError::NullPointer("avio_alloc_context"));
         }
+        if !avio.source.seekable() {
+            // 直播流等不可 seek 源：avio_alloc_context 默认置 seekable，这里
+            // 清掉——flv demuxer 据此进入 live 模式（不 seek、按墙钟推进），
+            // avformat 内部 seek 也被拒绝（avio_seek 检查 seekable）。
+            unsafe { (*context).seekable = 0; }
+        }
         avio.context = context;
         Ok(avio)
     }

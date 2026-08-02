@@ -155,6 +155,10 @@ pub enum MediaSourceHint {
     Auto,
     LocalFile,
     Http,
+    /// 不可 seek 的 HTTP 流式源（直播 HTTP-FLV 等）：GET 建立连接后从响应
+    /// body 顺序读取，无 Content-Length、不支持 Range、连接长驻。与 `Http`
+    /// （可 Range seek 的 VOD）是两种访问模型，AVIO 会清掉 seekable 位。
+    HttpStream,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -200,6 +204,13 @@ impl MediaRequest {
 
     pub fn with_http_headers(mut self, http_headers: Vec<(String, String)>) -> Self {
         self.http_headers = http_headers;
+        self
+    }
+
+    /// 指定源类型。默认 `Auto` 自动识别；直播流必须显式传
+    /// `MediaSourceHint::HttpStream`（不可 seek 的流式读取）。
+    pub fn with_source_hint(mut self, source_hint: MediaSourceHint) -> Self {
+        self.source_hint = source_hint;
         self
     }
 

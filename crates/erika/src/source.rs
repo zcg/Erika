@@ -83,6 +83,12 @@ pub fn source_diag_snapshot() -> SourceDiagSnapshot {
 pub trait MediaSource: Send {
     fn uri(&self) -> &str;
     fn len(&mut self) -> Result<Option<u64>>;
+    /// 是否支持任意位置随机读取（seek）。默认 `true`；直播流等不可 seek
+    /// 源返回 `false`，AVIO 据此清掉 `seekable` 位（flv demuxer 进入 live
+    /// 模式），且 `avformat` 内部的 seek 会被拒绝。
+    fn seekable(&self) -> bool {
+        true
+    }
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>>;
     /// 播放层在已知目标读取位置时给出预取提示（例如 seek 到缓存窗口外时
     /// avformat 即将从该字节位置开始读）。默认无操作；`HttpRangeSource` 用它
@@ -756,6 +762,146 @@ impl Drop for HttpRangeSource {
     }
 }
 
+/// 直播流源：不可 seek 的 HTTP 流（HTTP-FLV over HTTPS）。
+///
+/// B 站直播 CDN 支持 HTTP-FLV，但**不支持 Range、无 Content-Length、
+/// 连接长驻**——与 `HttpRangeSource`（可 Range seek 的 VOD）是完全不同的
+/// 访问模型。本实现 GET 建立连接后从响应 body 顺序读取，demux 线程按需
+/// 阻塞取字节，绝不把无限流一次性读进内存。
+///
+/// `len()` 恒返回 `None`（无总长度）、`seekable()` 恒返回 `false`：AVIO
+/// 清掉 seekable 位后 flv demuxer 进入 live 模式（不 seek、按墙钟推进），
+/// 播放层不会因"EOF"而结束（连接正常关闭才触发 EOF）。
+pub struct HttpLiveStreamSource {
+    uri: String,
+    /// GET 响应 body 的读取器（连接长驻、数据持续推送）。`None` 表示连接已关闭。
+    /// ureq 的 `Response` 类型是私有的，这里持 `Body::as_reader()` 返回的
+    /// `'static` reader（内部 Arc 共享读取位置，可脱离 Response 独立持有）。
+    reader: Option<Box<dyn Read + Send + Sync>>,
+    /// 已消费字节数。直播流不可 seek：`read_range` 校验请求起点 == 此值，
+    /// 失配（AVIO seek 后）报错，防止把流当作可跳转文件读。
+    offset: u64,
+    /// 累计已下载字节（诊断快照差分实时速度）。
+    downloaded_bytes: u64,
+}
+
+impl HttpLiveStreamSource {
+    /// 单次读取上限。AVIO buffer 即 64KB，demux 粒度足够；截断大 `length`
+    /// （如误用 `suffix_from(0)`）避免把无限流一次读进内存。
+    const MAX_READ_BYTES: usize = 256 * 1024;
+
+    pub fn open(uri: &str, http_headers: Vec<(String, String)>) -> Result<Self> {
+        let agent = http_agent();
+        let mut request = agent.get(uri);
+        for (name, value) in &http_headers {
+            request = request.header(name, value);
+        }
+        let response = request.call().map_err(|error| {
+            http_trace_log(format!(
+                "{{\"event\":\"http_live_open_error\",\"error\":\"{}\"}}",
+                json_escape(&error.to_string()),
+            ));
+            SourceError::Http(error.to_string())
+        })?;
+        let status = response.status().as_u16();
+        if status >= 400 {
+            http_trace_log(format!(
+                "{{\"event\":\"http_live_open_status\",\"status\":{}}}",
+                status,
+            ));
+            return Err(SourceError::Http(format!(
+                "live stream HTTP status {status}"
+            )));
+        }
+        http_trace_log(format!(
+            "{{\"event\":\"http_live_open\",\"status\":{},\"content_length\":{}}}",
+            status,
+            response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+                .unwrap_or_else(|| "null".to_string()),
+        ));
+        let reader = response.into_body().into_reader();
+        Ok(Self {
+            uri: uri.to_string(),
+            reader: Some(Box::new(reader)),
+            offset: 0,
+            downloaded_bytes: 0,
+        })
+    }
+
+    fn publish_diag(&self) {
+        *SOURCE_DIAG.lock().unwrap() = SourceDiagSnapshot {
+            content_length: None,
+            cache_start: 0,
+            cache_end: self.offset,
+            prefetch_in_flight: 0,
+            downloaded_bytes: self.downloaded_bytes,
+        };
+    }
+}
+
+impl MediaSource for HttpLiveStreamSource {
+    fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    fn len(&mut self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn seekable(&self) -> bool {
+        false
+    }
+
+    fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
+        if range.start != self.offset {
+            // AVIO seek 改动 offset 后的下一次读会走到这里：直播流不可跳转。
+            http_trace_log(format!(
+                "{{\"event\":\"http_live_seek_rejected\",\"requested\":{},\"stream_at\":{}}}",
+                range.start, self.offset,
+            ));
+            return Err(SourceError::Io(format!(
+                "live stream is not seekable (requested {} at stream offset {})",
+                range.start, self.offset,
+            )));
+        }
+        let Some(reader) = self.reader.as_mut() else {
+            return Err(SourceError::Io(
+                "live stream connection is closed".to_string(),
+            ));
+        };
+        let length = usize::try_from(range.length.unwrap_or(Self::MAX_READ_BYTES as u64))
+            .unwrap_or(Self::MAX_READ_BYTES)
+            .min(Self::MAX_READ_BYTES);
+        let mut buf = vec![0u8; length.max(1)];
+        // 阻塞读：直播流持续推送，read 等到有数据才返回；0 表示服务器关闭
+        // （断流 → AVIO EOF → 播放层按流结束处理）。
+        let n = reader.read(&mut buf).map_err(|error| {
+            let message = format!("live stream read error: {error}");
+            http_trace_log(format!(
+                "{{\"event\":\"http_live_read_error\",\"error\":\"{}\"}}",
+                json_escape(&error.to_string()),
+            ));
+            SourceError::Http(message)
+        })?;
+        buf.truncate(n);
+        self.offset = self.offset.saturating_add(n as u64);
+        self.downloaded_bytes = self.downloaded_bytes.saturating_add(n as u64);
+        self.publish_diag();
+        Ok(buf)
+    }
+}
+
+impl Drop for HttpLiveStreamSource {
+    fn drop(&mut self) {
+        // source 销毁（播放停止/换源）→ 清空诊断。
+        *SOURCE_DIAG.lock().unwrap() = SourceDiagSnapshot::default();
+    }
+}
+
 fn http_agent() -> ureq::Agent {
     // bili-rs 宿主可能以 IP 直连（绕过 DNS 污染/IPv6 不可达），
     // 证书按 IP 校验会失败——关闭证书校验（播放器场景可接受）
@@ -1350,6 +1496,14 @@ pub fn source_from_uri_with_hint_and_headers(
                     uri,
                     http_headers,
                 )))
+            } else {
+                Err(SourceError::Unsupported(uri.to_string()))
+            }
+        }
+        MediaSourceHint::HttpStream => {
+            if uri.starts_with("http://") || uri.starts_with("https://") {
+                HttpLiveStreamSource::open(uri, http_headers)
+                    .map(|source| Box::new(source) as Box<dyn MediaSource>)
             } else {
                 Err(SourceError::Unsupported(uri.to_string()))
             }

@@ -5229,6 +5229,7 @@ fn playback_timing_for_request(
 fn request_uses_http_source(request: &MediaRequest) -> bool {
     match request.source_hint {
         MediaSourceHint::Http => true,
+        MediaSourceHint::HttpStream => true,
         MediaSourceHint::Auto => {
             is_http_uri(&request.uri)
                 || request
