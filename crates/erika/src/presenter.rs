@@ -815,6 +815,13 @@ impl PresenterRuntime {
         self.player.state() == crate::core::PlayerState::Playing
     }
 
+    /// 播放器状态机快照。宿主用于感知**异步 open 失败**：`open()` 立即返回
+    /// （后台线程实际拉流），失败后状态回填 `Error`——宿主据此换源重试，
+    /// 而不是盲目显示"播放中"。
+    pub fn state(&self) -> crate::core::PlayerState {
+        self.player.state()
+    }
+
     pub fn media_time(&self) -> Duration {
         self.player.current_media_time()
     }
