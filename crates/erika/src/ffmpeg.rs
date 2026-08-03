@@ -1981,10 +1981,15 @@ fn d3d11va_surface_alignment(codec_id: sys::AVCodecID) -> i32 {
 
 #[cfg(target_os = "windows")]
 fn d3d11va_pool_size(codec_id: sys::AVCodecID) -> i32 {
-    // bili-rs 宿主：快 CDN 源下解码器产帧快，20 帧静态池在渲染消费
-    // 不及时（open 暂停窗口等）时会耗尽（get_buffer failed → 有声音无画面）。
-    // 增大池容量吸收突发：h264/hevc 60 帧，vp9/av1 40 帧。
-    if codec_id == sys::AVCodecID_AV_CODEC_ID_H264 || codec_id == sys::AVCodecID_AV_CODEC_ID_HEVC {
+    // bili-rs 宿主：快 CDN 源下解码器产帧快，小池在渲染消费不及时
+    // （open 暂停窗口等）会耗尽（get_buffer failed → 有声音无画面），
+    // 曾从 20 增到 60/40 吸收突发。**不得再减容**：实测 1080p 降到 48
+    // 帧即复现 get_buffer failed → 解码中断 → 宿主换源重开（进度归零）。
+    // D3D11VA 表面在核显（共享系统内存）计入工作集的 ~36MB 差值，不值当
+    // 拿播放稳定性换。保持全量缓冲。
+    if codec_id == sys::AVCodecID_AV_CODEC_ID_H264
+        || codec_id == sys::AVCodecID_AV_CODEC_ID_HEVC
+    {
         60
     } else if codec_id == sys::AVCodecID_AV_CODEC_ID_VP9
         || codec_id == sys::AVCodecID_AV_CODEC_ID_AV1
