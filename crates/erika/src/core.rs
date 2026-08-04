@@ -565,6 +565,28 @@ impl PlatformSurface {
             Self::FlutterTexture(handle) => handle.metrics,
         }
     }
+
+    /// 返回更新过尺寸的 surface 副本。设备丢失自愈会用缓存的
+    /// `attached_surface` 重新 attach 重建后的渲染器——若缓存里仍是首次
+    /// attach 的初始尺寸，backbuffer 会回退到初始小尺寸，画面只占面板
+    /// 左上角（L 型空白）。resize 时必须同步刷新缓存，自愈才能用最新尺寸。
+    pub fn resized(self, width: u32, height: u32, content_scale: f64) -> Self {
+        let metrics = SurfaceMetrics::new(width, height, content_scale);
+        match self {
+            Self::Metal(mut handle) => {
+                handle.metrics = metrics;
+                Self::Metal(handle)
+            }
+            Self::Wgpu(mut handle) => {
+                handle.resize(metrics);
+                Self::Wgpu(handle)
+            }
+            Self::FlutterTexture(mut handle) => {
+                handle.metrics = metrics;
+                Self::FlutterTexture(handle)
+            }
+        }
+    }
 }
 
 /// Exact native drawable/swapchain extent. Surface width and height in Erika's

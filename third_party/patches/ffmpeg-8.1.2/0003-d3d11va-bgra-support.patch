@@ -1,0 +1,12 @@
+diff --git a/libavutil/hwcontext_d3d11va.c b/libavutil/hwcontext_d3d11va.c
+--- a/libavutil/hwcontext_d3d11va.c
++++ b/libavutil/hwcontext_d3d11va.c
+@@ -622,7 +622,7 @@
+     HRESULT hr;
+     IDXGIAdapter           *pAdapter = NULL;
+     ID3D10Multithread      *pMultithread;
+-    UINT creationFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
++    UINT creationFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+     int is_debug       = !!av_dict_get(opts, "debug", NULL, 0);
+     int ret;
+     int adapter = -1;

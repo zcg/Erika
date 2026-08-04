@@ -27,10 +27,11 @@ const FFMPEG_ARCHIVE: &str = "ffmpeg-n8.1.2.tar.gz";
 const FFMPEG_DIR: &str = "FFmpeg-n8.1.2";
 const FFMPEG_URLS: &[&str] = &["https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n8.1.2"];
 const FFMPEG_SHA256: &str = "9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7";
-const FFMPEG_PATCHSET_VERSION: &str = "erika-android-mediacodec-v4";
+const FFMPEG_PATCHSET_VERSION: &str = "erika-android-mediacodec-v5";
 const FFMPEG_PATCHES: &[&str] = &[
     "third_party/patches/ffmpeg-8.1.2/0001-erika-mediacodec-bounded-receive.patch",
     "third_party/patches/ffmpeg-8.1.2/0002-windows-msvc-awk-backslash.patch",
+    "third_party/patches/ffmpeg-8.1.2/0003-d3d11va-bgra-support.patch",
 ];
 
 const DAV1D_ARCHIVE: &str = "dav1d-1.5.1.tar.gz";

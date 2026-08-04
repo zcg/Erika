@@ -494,6 +494,12 @@ pub struct D3d11RendererStats {
     pub hdr10_metadata_failures: u64,
     pub hdr10_output_failures: u64,
     pub hdr10_output_active: bool,
+    /// 设备丢失（device lost/reset）累计次数：PresenterRuntime 每自愈一次 +1。
+    pub device_lost_events: u64,
+    /// 最近一次设备丢失的 `GetDeviceRemovedReason` HRESULT：`DXGI_ERROR_DEVICE_RESET`
+    /// (0x887A0006) 是 TDR 驱动重置；`DXGI_ERROR_DEVICE_REMOVED` (0x887A0005)
+    /// 是驱动/显存级错误。0 表示尚未记录。供 HUD/诊断快照区分根因类别。
+    pub last_device_lost_reason: u32,
     pub import_failures: u64,
     pub prepared_overlay_frames: u64,
     pub prepared_overlay_subtitle_planes: u64,
@@ -688,6 +694,9 @@ pub struct D3d11Renderer {
     /// `render_current_frame` 检测置位，`PresenterRuntime` 据此触发自愈。
     device_lost: bool,
     stats: D3d11RendererStats,
+    /// 尺寸诊断节流键：上次记录的视频帧/backbuffer/target_rect 尺寸。
+    /// 任一变化时打一条 `[size-diag]` 日志，避免每帧刷屏。
+    last_size_diag: Option<(u32, u32, u32, u32, u32, u32, u32, u32)>,
 }
 
 // D3D11 设备/交换链/纹理均为自由线程 COM 对象；渲染器由宿主单线程独占访问
@@ -710,6 +719,7 @@ impl D3d11Renderer {
             hdr10_output_unavailable: false,
             device_lost: false,
             stats: D3d11RendererStats::default(),
+            last_size_diag: None,
         })
     }
 
@@ -804,6 +814,14 @@ impl D3d11Renderer {
         self.stats.surface_width = surface.metrics.physical_extent.width;
         self.stats.surface_height = surface.metrics.physical_extent.height;
         self.stats.hdr10_output_active = matches!(output_mode, D3d11OutputMode::Hdr10);
+        // 尺寸诊断：backbuffer 重建打点（定位"播着播着画面变小"是否因 surface
+        // 在某事件（换源/seek/GPU 自愈）后被重建为错误尺寸）。
+        eprintln!(
+            "[size-diag] surface rebuilt: backbuffer={}x{} mode={:?}",
+            surface.metrics.physical_extent.width,
+            surface.metrics.physical_extent.height,
+            output_mode,
+        );
         Ok(())
     }
 
@@ -968,8 +986,22 @@ impl D3d11Renderer {
             if state.device.as_raw() == frame_device.as_raw() {
                 return Ok((texture.clone(), D3d11VideoImportMode::DirectDecoderDevice));
             }
-            return open_shared_texture_on_device(&state.device, texture)
-                .map(|texture| (texture, D3d11VideoImportMode::SharedHandle));
+            // 解码器（ffmpeg d3d11va）与渲染器是不同 D3D11 设备。原先走
+            // OpenSharedResource 跨设备读取 ffmpeg 帧池纹理——SHARED 纹理
+            // 跨设备访问无自动 GPU 同步，解码线程写 + 渲染线程读的并发会
+            // 触发 GPU TDR/设备移除（"GPU 设备实例已经暂停"），并产生花屏
+            // （读到写一半的色度平面 → 粉屏）。
+            // 改为切到解码器设备：ffmpeg 的 d3d11va 设备默认开启
+            // multithread protected，解码/渲染多线程并发提交由 D3D11
+            // runtime 串行化，安全。走 DirectDecoderDevice 同设备路径，
+            // 消除跨设备共享。
+            eprintln!(
+                "[d3d11] import device switch: renderer {:p} -> decoder {:p}",
+                state.device.as_raw(),
+                frame_device.as_raw(),
+            );
+            self.ensure_device_for_texture(texture)?;
+            return Ok((texture.clone(), D3d11VideoImportMode::DirectDecoderDevice));
         }
 
         self.ensure_device_for_texture(texture)?;
@@ -1347,6 +1379,45 @@ impl D3d11Renderer {
         let physical = surface.metrics.physical_extent;
         let target_rect =
             aspect_fit_rect(video.width, video.height, physical.width, physical.height);
+        // 尺寸诊断（变化节流）：对比「视频画面实际占用」与「播放区域
+        // （backbuffer）」。fill≈1.0 表示占满；<1.0 表示画面缩小（等比例
+        // 缩小 → 从左上角出现 L 型空白）。配合 surface rebuilt 打点定位触发源。
+        let diag_key = (
+            video.width,
+            video.height,
+            physical.width,
+            physical.height,
+            target_rect.x as u32,
+            target_rect.y as u32,
+            target_rect.width as u32,
+            target_rect.height as u32,
+        );
+        if self.last_size_diag != Some(diag_key) {
+            self.last_size_diag = Some(diag_key);
+            let fill_w = if physical.width > 0 {
+                target_rect.width as f64 / physical.width as f64
+            } else {
+                0.0
+            };
+            let fill_h = if physical.height > 0 {
+                target_rect.height as f64 / physical.height as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[size-diag] video={}x{} backbuffer={}x{} target_rect=({:.0},{:.0} {:.0}x{:.0}) fill={:.3}x{:.3}",
+                video.width,
+                video.height,
+                physical.width,
+                physical.height,
+                target_rect.x,
+                target_rect.y,
+                target_rect.width,
+                target_rect.height,
+                fill_w,
+                fill_h,
+            );
+        }
         unsafe {
             state
                 .context
@@ -1534,13 +1605,45 @@ impl RendererBackend for D3d11Renderer {
 
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         let result = self.render_video(context);
-        if result.is_err() && self.device_removed() {
+        // 无帧可渲染（Ok(false)，current_video 为空）时同样检查设备是否已失效：
+        // import 切设备失败会清空 current_video，且错误被 pump_video 吞掉（仅
+        // eprintln 记录、不触发自愈）；若此时设备已被 TDR 移除，render_video
+        // 空转返回 Ok(false)，走不到下方 Err 分支的 device_lost 检测——在此
+        // 补检，否则 presenter 永不触发自愈，画面永久黑屏。设备正常时短路
+        // 不调用 GetDeviceRemovedReason，无额外开销。
+        let frame_absent = matches!(&result, Ok(false));
+        if (result.is_err() || frame_absent) && self.device_removed() {
             // GPU 设备移除/重置（TDR 通常返回 DXGI_ERROR_DEVICE_RESET，硬件
             // 错误返回 DEVICE_REMOVED）后所有设备操作失败。用
             // GetDeviceRemovedReason 确认（而非匹配错误文本），避免把 shader
             // 编译等普通渲染错误误判为设备丢失。PresenterRuntime 据此自愈。
             self.device_lost = true;
+            let reason = self
+                .state
+                .as_ref()
+                .and_then(|state| {
+                    unsafe { state.device.GetDeviceRemovedReason() }
+                        .err()
+                        .map(|e| e.code().0)
+                })
+                .unwrap_or(0);
+            self.stats.device_lost_events += 1;
+            self.stats.last_device_lost_reason = reason as u32;
+            if let Err(error) = &result {
+                eprintln!(
+                    "[d3d11] device lost/reset: reason=0x{:08X} at: {error}",
+                    reason,
+                );
+            } else {
+                eprintln!(
+                    "[d3d11] device lost/reset: reason=0x{:08X} (no frame to render)",
+                    reason,
+                );
+            }
             trace("device lost/reset detected; requesting presenter recovery");
+        } else if let Err(error) = &result {
+            // 非设备丢失的渲染失败也要留痕（粉屏/黑屏排查入口）。
+            eprintln!("[d3d11] render failed (no device lost): {error}");
         }
         result
     }
@@ -2265,6 +2368,10 @@ fn create_plane_srv(
     view.ok_or_else(|| PlayerError::Renderer("d3d11: shader resource view was null".to_string()))
 }
 
+/// 跨设备共享纹理导入（解码器设备 → 渲染器设备）。当前渲染器与解码器
+/// 已统一为同一设备（DirectDecoderDevice），此路径保留备用（测试/回退）。
+/// SHARED 纹理跨设备访问无自动 GPU 同步，并发读写会触发 TDR/花屏，勿复用。
+#[allow(dead_code)]
 fn open_shared_texture_on_device(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,

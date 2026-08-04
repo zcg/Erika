@@ -788,6 +788,13 @@ impl PresenterRuntime {
         }
         self.renderer.resize_surface(metrics)?;
         self.current_surface_metrics = Some(metrics);
+        // 同步刷新缓存的 attached_surface 尺寸：设备丢失自愈重建渲染器时
+        // 会用缓存重新 attach，若仍是首次 attach 的初始值（bili-rs 为
+        // 960x540），backbuffer 会卡在初始小尺寸，画面只占面板左上角
+        // （L 型空白），不随面板自适应。
+        if let Some(surface) = self.attached_surface {
+            self.attached_surface = Some(surface.resized(width, height, scale));
+        }
         let next_viewport = surface_metrics_to_viewport(metrics);
         let requires_relayout = self
             .current_danmaku_viewport
@@ -1539,7 +1546,7 @@ impl PresenterRuntime {
     /// 与 GPU 无关，保留复用。TDR 期间音频继续播放，恢复 seek 回跳会产生
     /// 一次可感知的音频跳变，这是固有代价。TDR 是瞬时的（驱动重置，通常
     /// 返回 `DXGI_ERROR_DEVICE_RESET`），重建后的设备有效。
-    fn recover_from_device_lost(&mut self, _trigger: &PlayerError) -> Result<()> {
+    fn recover_from_device_lost(&mut self, trigger: &PlayerError) -> Result<()> {
         let surface = self.attached_surface;
         let media = self.last_media.clone();
         let position = self.player.current_media_time();
@@ -1552,6 +1559,9 @@ impl PresenterRuntime {
             serde_json::json!({
                 "event": "device_lost_recovery",
                 "stage": "begin",
+                // 触发设备丢失的渲染错误原文——定位 TDR vs 驱动/显存错误的关键
+                // 依据，与 d3d11 侧记录的具体 reason HRESULT 互为印证。
+                "trigger": trigger.to_string(),
                 "positionMs": position.as_millis(),
                 "playing": was_playing,
                 "rate": rate,
