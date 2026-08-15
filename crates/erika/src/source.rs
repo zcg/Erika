@@ -6,10 +6,10 @@ use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 #[cfg(target_os = "android")]
 use std::sync::OnceLock;
 use std::sync::mpsc;
-use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -714,10 +714,7 @@ impl HttpRangeSource {
         // 兜底——同步只取当前读取所需（≤1MB），比等 10MB 级慢段快得多。
         // 超时按实测带宽自适应：慢网下段大小已同步缩小，整窗可在超时内
         // 完成，正常情况不触发放弃（避免退化同步 fetch 的"一顿一顿"）。
-        let result = match pending
-            .receiver
-            .recv_timeout(self.prefetch_join_timeout())
-        {
+        let result = match pending.receiver.recv_timeout(self.prefetch_join_timeout()) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 http_trace_log(format!(
@@ -872,9 +869,11 @@ impl HttpRangeSource {
             // 窗口重叠的段都参与（无论其起点在窗口内还是窗外）：`prefetch`
             // 里只可能有两种——顺序预取从 cache_end 起、seek 预取从目标前起，
             // 与当前窗口重叠即视为已覆盖。
-            if let Some(p) = self.prefetch.iter().find(|p| {
-                p.range.start < target_end && next_start < p.range_end()
-            }) {
+            if let Some(p) = self
+                .prefetch
+                .iter()
+                .find(|p| p.range.start < target_end && next_start < p.range_end())
+            {
                 next_start = next_start.max(p.range_end());
                 continue;
             }
@@ -918,8 +917,7 @@ impl HttpRangeSource {
         if target < cache_end.saturating_add(Self::SEEK_PREFETCH_SEGMENT_BYTES) {
             http_trace_log(format!(
                 "{{\"event\":\"http_prefetch_hint\",\"decision\":\"in_cache\",\"target\":{},\"cache_end\":{}}}",
-                target,
-                cache_end,
+                target, cache_end,
             ));
             return;
         }
@@ -928,8 +926,7 @@ impl HttpRangeSource {
             if target < prev.saturating_add(Self::SEEK_PREFETCH_SEGMENT_BYTES) {
                 http_trace_log(format!(
                     "{{\"event\":\"http_prefetch_hint\",\"decision\":\"debounced\",\"target\":{},\"prev\":{}}}",
-                    target,
-                    prev,
+                    target, prev,
                 ));
                 return;
             }
@@ -942,9 +939,7 @@ impl HttpRangeSource {
         let from = target.saturating_sub(self.prefetch_segment_bytes());
         http_trace_log(format!(
             "{{\"event\":\"http_prefetch_hint\",\"decision\":\"spawn\",\"target\":{},\"from\":{},\"discarded_in_flight\":{}}}",
-            target,
-            from,
-            discarded,
+            target, from, discarded,
         ));
         self.spawn_prefetch_window(from, self.prefetch_segment_bytes());
     }
@@ -2234,7 +2229,10 @@ mod tests {
         source.est_bps = 50.0 * 1024.0;
         let widened = source.prefetch_join_timeout();
         assert!(widened > Duration::from_secs(5));
-        assert_eq!(widened.as_secs_f64(), 32.0 * 1024.0 * 8.0 / (50.0 * 1024.0) * 1.5);
+        assert_eq!(
+            widened.as_secs_f64(),
+            32.0 * 1024.0 * 8.0 / (50.0 * 1024.0) * 1.5
+        );
     }
 
     #[test]
@@ -2883,4 +2881,3 @@ mod tests {
         );
     }
 }
-

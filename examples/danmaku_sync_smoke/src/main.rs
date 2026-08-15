@@ -43,7 +43,7 @@ fn run(uri: &str, danmaku_path: &str) -> Result<(), String> {
     let mut layout = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
     let mut generation = 1u64;
 
-    engine.play();
+    let _ = engine.play();
     let first = next_video_plan(&mut engine, &mut layout, generation)?;
     println!(
         "first: media={:?} generation={} items={}",
@@ -85,7 +85,7 @@ fn run(uri: &str, danmaku_path: &str) -> Result<(), String> {
     }
 
     engine.set_playback_rate(1.75);
-    engine.play();
+    let _ = engine.play();
     let after_rate = next_video_plan(&mut engine, &mut layout, generation)?;
     if after_rate.media_time < after_seek.media_time {
         return Err("rate change moved danmaku backward outside media timeline".to_string());

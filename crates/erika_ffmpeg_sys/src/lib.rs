@@ -7,7 +7,11 @@ pub const FREETYPE_VERSION: &str = "2.14.3";
     non_camel_case_types,
     non_snake_case,
     non_upper_case_globals,
-    unnecessary_transmutes
+    unnecessary_transmutes,
+    clippy::missing_safety_doc,
+    clippy::ptr_offset_with_cast,
+    clippy::type_complexity,
+    clippy::useless_transmute
 )]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

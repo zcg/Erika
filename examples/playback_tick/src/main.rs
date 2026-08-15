@@ -35,7 +35,7 @@ fn main() {
     println!("video: {:?}", info.video_params);
     println!("decoder: {:?}", info.video_decode_backend);
 
-    engine.play();
+    let _ = engine.play();
     let started = Instant::now();
     let mut presented = 0usize;
     while presented < frame_limit {

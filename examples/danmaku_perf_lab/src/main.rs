@@ -210,7 +210,7 @@ fn run_video_driven(
         "video: duration={:?} params={:?} decoder={:?}",
         info.duration, info.video_params, info.video_decode_backend
     );
-    playback.play();
+    let _ = playback.play();
     let started = Instant::now();
     let mut empty_ticks = 0u64;
     while samples.len() < options.frames {

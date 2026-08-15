@@ -76,18 +76,13 @@ impl Default for PlayerConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RendererBackendPreference {
     PlatformNative,
     FlutterTexture,
     WgpuFallback,
+    #[default]
     Auto,
-}
-
-impl Default for RendererBackendPreference {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -227,16 +222,11 @@ pub enum TrackKind {
     Subtitle,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackSource {
+    #[default]
     Embedded,
     External,
-}
-
-impl Default for TrackSource {
-    fn default() -> Self {
-        Self::Embedded
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1044,22 +1034,22 @@ impl PlaybackRuntime {
                 .to_string(),
             );
         }
-        if let Some(worker) = self.worker.take() {
-            if let Err(payload) = worker.join() {
-                let reason = payload
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic payload".to_string());
-                trace::diagnostic(
-                    serde_json::json!({
-                        "event": "playback_worker_shutdown",
-                        "stage": "join_panicked",
-                        "reason": reason,
-                    })
-                    .to_string(),
-                );
-            }
+        if let Some(worker) = self.worker.take()
+            && let Err(payload) = worker.join()
+        {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "playback_worker_shutdown",
+                    "stage": "join_panicked",
+                    "reason": reason,
+                })
+                .to_string(),
+            );
         }
     }
 }
@@ -1287,7 +1277,7 @@ impl Player {
         );
         let mut engine = match VideoPlaybackEngine::open_with_decoder_resources(
             &media,
-            self.config.playback.clone(),
+            self.config.playback,
             self.decoder_resources.clone(),
         ) {
             Ok(engine) => engine,
@@ -1406,9 +1396,12 @@ impl Player {
                 PlayerState::Ready | PlayerState::Paused | PlayerState::Stopped => {
                     inner.playback_command_sequence =
                         inner.playback_command_sequence.saturating_add(1).max(1);
+                    let previous_pending_play_sequence = inner.pending_play_sequence;
+                    inner.pending_play_sequence = Some(inner.playback_command_sequence);
                     (
                         inner.playback_command_sequence,
                         inner.playback_generation.max(1),
+                        previous_pending_play_sequence,
                     )
                 }
                 from => {
@@ -1418,15 +1411,6 @@ impl Player {
                     });
                 }
             }
-            inner.playback_command_sequence =
-                inner.playback_command_sequence.saturating_add(1).max(1);
-            let previous_pending_play_sequence = inner.pending_play_sequence;
-            inner.pending_play_sequence = Some(inner.playback_command_sequence);
-            (
-                inner.playback_command_sequence,
-                inner.playback_generation.max(1),
-                previous_pending_play_sequence,
-            )
         };
         let commands = self.playback_commands()?;
         if commands
@@ -1952,14 +1936,6 @@ impl Player {
             .playback
             .as_ref()
             .map(|runtime| runtime.commands.clone())
-    }
-
-    fn superseded_open_error(&self) -> PlayerError {
-        if self.state() == PlayerState::Closed {
-            PlayerError::Closed
-        } else {
-            PlayerError::Playback("media open was superseded by a newer lifecycle operation".into())
-        }
     }
 
     fn transition(&self, next: PlayerState) -> Result<()> {
@@ -4486,6 +4462,7 @@ mod tests {
             uri: path.to_string_lossy().into_owned(),
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
+            audio_uri: None,
         };
         let mut engine = VideoPlaybackEngine::open(
             &request,
@@ -4745,15 +4722,14 @@ mod tests {
         player.play().expect("queue play on old runtime");
         assert_eq!(player.playback_intent_state(), PlayerState::Playing);
 
-        let error = player
+        // open 是异步的：立即接受请求；Opening 发布时旧 worker 的排队 play 意图
+        // 在 transition_to_opening 的临界区内被清空。
+        player
             .open(MediaRequest::new(
                 "/tmp/erika-definitely-missing-reopen.mp4",
             ))
-            .expect_err("replacement media is deliberately missing");
-
-        assert!(matches!(error, PlayerError::Playback(_)));
-        assert_eq!(player.state(), PlayerState::Error);
-        assert_eq!(player.playback_intent_state(), PlayerState::Error);
+            .expect("async open accepts the replacement request");
+        assert_eq!(player.state(), PlayerState::Opening);
         assert_eq!(
             player
                 .inner
@@ -4762,6 +4738,17 @@ mod tests {
                 .pending_play_sequence,
             None,
         );
+
+        // 等待后台 open 失败落地（缺失媒体 → Error 状态）。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while player.state() != PlayerState::Error {
+            assert!(
+                Instant::now() < deadline,
+                "async open failure did not land within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(player.playback_intent_state(), PlayerState::Error);
     }
 
     #[test]
@@ -5197,11 +5184,11 @@ mod tests {
         let player = Player::new(PlayerConfig::default());
         let events = player.subscribe();
 
-        let error = player
+        // open 是异步的：请求立即被接受，打开失败经事件通道发布。
+        player
             .open(MediaRequest::new("/tmp/erika-definitely-missing.mp4"))
-            .unwrap_err();
+            .expect("async open accepts the request");
 
-        assert!(matches!(error, PlayerError::Playback(_)));
         assert_eq!(
             events.recv().unwrap(),
             PlayerEvent::StateChanged(PlayerState::Opening)

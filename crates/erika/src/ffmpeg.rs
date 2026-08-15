@@ -604,11 +604,7 @@ impl Demuxer {
                     let current_ts = self.pending[current]
                         .as_ref()
                         .and_then(Packet::dts)
-                        .or_else(|| {
-                            self.pending[current]
-                                .as_ref()
-                                .and_then(Packet::pts)
-                        })
+                        .or_else(|| self.pending[current].as_ref().and_then(Packet::pts))
                         .map(|ts| ts.seconds())
                         .unwrap_or(f64::MIN);
                     decode_ts < current_ts
@@ -643,10 +639,8 @@ impl Demuxer {
     /// 对单个输入执行 seek：优先选输入内视频流做 backward keyframe 锚点，
     /// 无视频流（如音频输入）则整文件 seek；seek 后清掉该输入的交错缓存。
     fn seek_input(&mut self, index: usize, relative_target: i64) -> Result<()> {
-        let absolute_target = absolute_seek_target_micros(
-            relative_target,
-            self.inputs[index].timeline_origin_micros,
-        );
+        let absolute_target =
+            absolute_seek_target_micros(relative_target, self.inputs[index].timeline_origin_micros);
         let seek_stream = self.selected_video_seek_stream();
         let selected_streams = match &self.selection {
             StreamSelection::All => None,
@@ -667,7 +661,10 @@ impl Demuxer {
             let time_base = self
                 .stream_time_base(stream_index)
                 .expect("selected video stream has a time base");
-            (local, rescale_microseconds_to_time_base(absolute_target, time_base))
+            (
+                local,
+                rescale_microseconds_to_time_base(absolute_target, time_base),
+            )
         });
         crate::trace::diagnostic(
             serde_json::json!({
@@ -1364,6 +1361,7 @@ impl Decoder {
                 }
                 .is_null());
         unsafe { sys::av_dict_free(&mut codec_options) };
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
         let mut open_result = check(open_code, "avcodec_open2");
         #[cfg(target_os = "android")]
         if open_result.is_ok()
@@ -1575,6 +1573,7 @@ impl Decoder {
                 }
             };
         }
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
         let mut frame = Frame::alloc(self.time_base)?;
         let code = unsafe { sys::avcodec_receive_frame(self.context, frame.ptr) };
         if code == av_error(EAGAIN) {
@@ -2002,9 +2001,7 @@ fn d3d11va_pool_size(codec_id: sys::AVCodecID) -> i32 {
     // 帧即复现 get_buffer failed → 解码中断 → 宿主换源重开（进度归零）。
     // D3D11VA 表面在核显（共享系统内存）计入工作集的 ~36MB 差值，不值当
     // 拿播放稳定性换。保持全量缓冲。
-    if codec_id == sys::AVCodecID_AV_CODEC_ID_H264
-        || codec_id == sys::AVCodecID_AV_CODEC_ID_HEVC
-    {
+    if codec_id == sys::AVCodecID_AV_CODEC_ID_H264 || codec_id == sys::AVCodecID_AV_CODEC_ID_HEVC {
         60
     } else if codec_id == sys::AVCodecID_AV_CODEC_ID_VP9
         || codec_id == sys::AVCodecID_AV_CODEC_ID_AV1
@@ -2319,6 +2316,10 @@ impl Frame {
     }
 
     pub fn try_clone_ref(&self) -> Result<Self> {
+        #[cfg_attr(
+            not(any(target_os = "android", target_env = "ohos")),
+            allow(unused_mut)
+        )]
         let mut frame = Frame::alloc(self.time_base)?;
         check(
             unsafe { sys::av_frame_ref(frame.ptr, self.ptr) },
@@ -3710,7 +3711,9 @@ impl CustomAvio {
             // 位进入 live 模式（顺序读、不建索引、不 seek 探测 duration）。
             // 注意 avio_seek 本身不检查 seekable 位，真正的防跳转由 seek()
             // 对不可 seek 源的拒绝 + read_range 的 offset 校验兜底。
-            unsafe { (*context).seekable = 0; }
+            unsafe {
+                (*context).seekable = 0;
+            }
         }
         avio.context = context;
         Ok(avio)

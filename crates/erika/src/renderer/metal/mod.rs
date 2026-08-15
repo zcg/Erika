@@ -236,6 +236,7 @@ impl ImportedVideoFrame {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     fn allocated_bytes(&self) -> u64 {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         {

@@ -1086,6 +1086,16 @@ fn build_zlib(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
             "-DCMAKE_INSTALL_PREFIX={}",
             layout.zlib_prefix.display()
         ));
+    if options.target.is_windows() {
+        // 静态 CRT，避免 __imp_* dllimport 符号与 rustc MSVC 静态 libucrt 冲突
+        // （LNK4217：zutil.c.obj 的 free/malloc 走 dllimport 而 libucrt.lib 是
+        // 本地定义）。仅设 C_FLAGS=/MT 不够：CMake 默认
+        // CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL 会在编译命令末尾追加
+        // /MD（后出现者生效）。必须显式设为 MultiThreaded 抑制该自动追加。
+        configure
+            .arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
+            .arg("-DCMAKE_C_FLAGS=/MT");
+    }
     apply_cmake_target(&mut configure, options.target)?;
     run(&mut configure)?;
     cmake_build_install(&layout.zlib_build_dir, options.jobs, options.target)?;

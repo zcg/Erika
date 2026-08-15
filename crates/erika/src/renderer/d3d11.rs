@@ -23,12 +23,12 @@ use ::windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D, ID3D11VertexShader,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
     DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_COLOR_SPACE_TYPE, DXGI_FORMAT,
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM,
     DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
     DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_R32G32_FLOAT, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC,
 };
 use ::windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_WAS_STILL_DRAWING, DXGI_HDR_METADATA_HDR10, DXGI_HDR_METADATA_TYPE_HDR10,
@@ -2522,6 +2522,19 @@ fn open_shared_texture_on_device(
 
 #[allow(dead_code)]
 fn d3d11_shared_handle(texture: &ID3D11Texture2D) -> Result<HANDLE> {
+    let resource: IDXGIResource = texture
+        .cast()
+        .map_err(|error| d3d_error("ID3D11Texture2D::cast<IDXGIResource>", error))?;
+    let handle = unsafe { resource.GetSharedHandle() }
+        .map_err(|error| d3d_error("IDXGIResource::GetSharedHandle(D3D11VA)", error))?;
+    if handle.is_invalid() {
+        return Err(PlayerError::Renderer(
+            "d3d11: D3D11VA texture did not expose a valid shared handle".to_string(),
+        ));
+    }
+    Ok(handle)
+}
+
 fn create_overlay_texture(
     state: &D3d11DeviceState,
     width: u32,

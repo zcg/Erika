@@ -4169,6 +4169,9 @@ fn event_to_c(event: PlayerEvent) -> ErikaEvent {
             kind: ErikaEventKind::SurfaceDetached,
             ..ErikaEvent::default()
         },
+        // 预载完成是 Rust 宿主/内部提示事件（UI"已就绪"用），未纳入 C ABI
+        // （ErikaEventKind / erika.h / Swift 镜像均无对应值），按无操作事件透传。
+        PlayerEvent::PreloadCompleted => ErikaEvent::default(),
         PlayerEvent::Error(error) => {
             set_last_error(error.to_string());
             ErikaEvent {
@@ -4750,36 +4753,80 @@ mod tests {
         let first = CString::new("/tmp/erika-capi-missing-first.mp4").unwrap();
         let second = CString::new("/tmp/erika-capi-missing-second.mp4").unwrap();
 
+        // open 是异步的：请求立即被接受，打开失败经事件通道落地（Error 事件）。
         assert_eq!(
             unsafe { erika_presenter_open(handle, first.as_ptr()) },
-            ErikaStatus::PlayerError
+            ErikaStatus::Ok
         );
         assert_eq!(
             unsafe { erika_presenter_open(handle, second.as_ptr()) },
-            ErikaStatus::PlayerError
+            ErikaStatus::Ok
         );
 
+        // 等待第二次 open 的异步失败落地（事件在轮询时被消费，先收集）。
         let mut event = ErikaEvent::default();
-        let mut delivered = 0usize;
-        let mut saw_buffering_reset = false;
-        while unsafe { erika_presenter_poll_event(handle, &mut event) } == ErikaStatus::Ok {
-            delivered += 1;
-            saw_buffering_reset |=
-                event.kind == ErikaEventKind::BufferingChanged && !event.buffering;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut queued = Vec::new();
+        let mut saw_error = false;
+        loop {
+            while unsafe { erika_presenter_poll_event(handle, &mut event) } == ErikaStatus::Ok {
+                saw_error |= event.kind == ErikaEventKind::Error;
+                queued.push(event);
+                event = ErikaEvent::default();
+            }
+            if saw_error {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async open failure did not land within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
+        let saw_buffering_reset = queued
+            .iter()
+            .any(|event| event.kind == ErikaEventKind::BufferingChanged && !event.buffering);
+        // 异步模型下失败事件落地的时序与 retain 有竞态（第一次 open 的失败
+        // 可能恰好落在第二次 open 的 retain 之后），故不做精确计数，改为断言
+        // 结构：队列以第二次 open 的 Opening 开头，且包含错误与缓冲重置。
+        assert!(!queued.is_empty(), "second Open events must remain queued");
         assert_eq!(
-            delivered, 4,
-            "only the second failed Open may remain queued"
+            queued.first().map(|event| event.kind),
+            Some(ErikaEventKind::StateChanged),
+            "queue must begin with the second Open's Opening state"
+        );
+        assert!(
+            queued
+                .iter()
+                .any(|event| event.kind == ErikaEventKind::Error),
+            "second failed Open must publish an Error event"
         );
         assert!(
             saw_buffering_reset,
             "Open must reset the previous content's buffering state",
         );
 
+        // 第三次 open（异步接受）；等待其失败落地后再 close，确保 close 的
+        // 事件保留（retain 自 Closed 起）能把所有 Open 残留一并清掉。
         assert_eq!(
             unsafe { erika_presenter_open(handle, first.as_ptr()) },
-            ErikaStatus::PlayerError
+            ErikaStatus::Ok
         );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_error = false;
+        loop {
+            while unsafe { erika_presenter_poll_event(handle, &mut event) } == ErikaStatus::Ok {
+                saw_error |= event.kind == ErikaEventKind::Error;
+            }
+            if saw_error {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "third async open failure did not land within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(unsafe { erika_presenter_close(handle) }, ErikaStatus::Ok);
         let mut closed_events = Vec::new();
         while unsafe { erika_presenter_poll_event(handle, &mut event) } == ErikaStatus::Ok {
@@ -4817,28 +4864,42 @@ mod tests {
                 42, 1920, 1080, 2.0,
             )))
             .unwrap();
-        assert_eq!(
-            unsafe { erika_presenter_open(handle, missing.as_ptr()) },
-            ErikaStatus::PlayerError
-        );
 
+        // attach 事件在 open 之前发布；open 的事件保留只保留最近一次 Opening
+        // 之后的事件（SurfaceAttached 会被丢弃），故先消费它。
         let mut event = ErikaEvent::default();
         assert_eq!(
             unsafe { erika_presenter_poll_event(handle, &mut event) },
             ErikaStatus::Ok
         );
         assert_eq!(event.kind, ErikaEventKind::SurfaceAttached);
-        while unsafe { erika_presenter_poll_event(handle, &mut event) } == ErikaStatus::Ok {}
+
+        // open 是异步的：立即接受请求，打开失败经事件通道落地。
+        assert_eq!(
+            unsafe { erika_presenter_open(handle, missing.as_ptr()) },
+            ErikaStatus::Ok
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_error = false;
+        loop {
+            while unsafe { erika_presenter_poll_event(handle, &mut event) } == ErikaStatus::Ok {
+                saw_error |= event.kind == ErikaEventKind::Error;
+            }
+            if saw_error {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async open failure did not land within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         unsafe { &mut *handle }
             .presenter
             .player()
             .detach_surface()
             .unwrap();
-        assert_eq!(
-            unsafe { erika_presenter_open(handle, missing.as_ptr()) },
-            ErikaStatus::PlayerError
-        );
         assert_eq!(
             unsafe { erika_presenter_poll_event(handle, &mut event) },
             ErikaStatus::Ok
@@ -5008,6 +5069,10 @@ mod tests {
         );
         let expected_backend = if cfg!(all(target_os = "android", feature = "wgpu")) {
             ErikaUpscalerBackendStatus::Scalar
+        } else if cfg!(target_os = "windows") {
+            // Windows D3D11 ArtCNN：已请求上采样模式但设备未 attach 时，
+            // 报告 Building（设备就绪后才会真正构建）。
+            ErikaUpscalerBackendStatus::Building
         } else {
             ErikaUpscalerBackendStatus::Inactive
         };

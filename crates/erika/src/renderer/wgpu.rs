@@ -334,9 +334,10 @@ enum UploadedVideoTextures {
         luma: wgpu::Texture,
         chroma: wgpu::Texture,
     },
-    Rgb {
-        texture: wgpu::Texture,
-    },
+    /// 仅 Android/OHOS 硬件缓冲（AHB/OHOS native buffer）路径构造；
+    /// 其余平台统一走 `Planar`，故匹配分支在通用代码里、构造点被平台 cfg 掉。
+    #[allow(dead_code)]
+    Rgb { texture: wgpu::Texture },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +439,8 @@ impl UploadedVideoFrame {
 struct AttachedSurface {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    /// 仅 Android/OHOS 降级路径读取（恢复 SDR 格式）；其余平台由 config 自带。
+    #[allow(dead_code)]
     sdr_format: wgpu::TextureFormat,
     output: OutputDescription,
     fallback_reason: OutputFallbackReason,
@@ -843,6 +846,9 @@ fn backend_candidate_order(
         .collect()
 }
 
+/// 仅 Android 后端候选回退路径使用（`new_after_runtime_failure`）；
+/// 路由逻辑由任意平台下的单元测试覆盖。
+#[cfg(any(target_os = "android", test))]
 fn attempted_candidate_prefix(
     candidate_order: &[usize],
     selected_candidate: Option<usize>,
@@ -3502,6 +3508,8 @@ impl WgpuRenderer {
                     PlayerError::Renderer("wgpu surface exposes no alpha modes".to_string())
                 })?;
             let (width, height) = handle.metrics().physical_size();
+            // Android 降级分支（cfg(target_os = "android")）会改写 config/fallback_reason。
+            #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
             let mut config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: selection.format,
@@ -3521,6 +3529,7 @@ impl WgpuRenderer {
                     self.output_headroom,
                 ));
             }
+            #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
             let mut fallback_reason = selection.fallback_reason;
             #[cfg(target_os = "android")]
             let mut data_space_verification = None;
@@ -3615,6 +3624,8 @@ impl WgpuRenderer {
     }
 
     fn acquire_surface_frame(&mut self) -> Result<SurfaceFrame> {
+        // recovery_attempt 仅用于 Android 诊断日志；其余平台不引用。
+        #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
         for recovery_attempt in 0..2 {
             let status = self
                 .surface

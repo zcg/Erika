@@ -1301,12 +1301,13 @@ impl SystemFontFallback {
     }
 
     fn loaded_font_by_id(&mut self, font_id: u32) -> Option<DanmakuFontFace> {
-        let cached_id = self.loaded.iter().find_map(|(id, face)| {
-            face.as_ref()
-                .filter(|face| face.id == font_id)
-                .map(|_| *id)
-        });
-        let face = cached_id.and_then(|id| self.loaded.get(&id)).and_then(|f| f.clone());
+        let cached_id = self
+            .loaded
+            .iter()
+            .find_map(|(id, face)| face.as_ref().filter(|face| face.id == font_id).map(|_| *id));
+        let face = cached_id
+            .and_then(|id| self.loaded.get(&id))
+            .and_then(|f| f.clone());
         if face.is_some() {
             if let Some(id) = cached_id {
                 self.touch_loaded(id);
@@ -1341,7 +1342,11 @@ impl SystemFontFallback {
 
     /// Move an already-loaded face to the back of the LRU order.
     fn touch_loaded(&mut self, id: fontdb::ID) {
-        if let Some(pos) = self.loaded_order.iter().position(|candidate| *candidate == id) {
+        if let Some(pos) = self
+            .loaded_order
+            .iter()
+            .position(|candidate| *candidate == id)
+        {
             self.loaded_order.remove(pos);
             self.loaded_order.push_back(id);
         }
@@ -1932,7 +1937,11 @@ impl GlyphCache {
     /// Insert `glyph` for `key`, or return the existing entry if a concurrent
     /// rasterizer already inserted one (never overwrites, matching the old
     /// `entry().or_insert_with` behaviour).
-    fn get_or_insert(&mut self, key: GlyphCacheKey, glyph: Arc<RasterizedGlyph>) -> Arc<RasterizedGlyph> {
+    fn get_or_insert(
+        &mut self,
+        key: GlyphCacheKey,
+        glyph: Arc<RasterizedGlyph>,
+    ) -> Arc<RasterizedGlyph> {
         if let Some(existing) = self.map.get(&key).cloned() {
             self.touch(&key);
             return existing;
@@ -3614,7 +3623,17 @@ mod tests {
             advance: 1.0,
         };
         let packed = atlas.pack(&glyph);
-        assert_eq!(packed, PackedGlyph { x: 0, y: 0, width: 1, height: 1 });
+        // 第 0 行前 SELF_BG_ATLAS_RESERVE 列预留给自发言弹幕背景框（纯白 texel），
+        // 字形打包从 x=reserve 开始。
+        assert_eq!(
+            packed,
+            PackedGlyph {
+                x: SELF_BG_ATLAS_RESERVE as u32,
+                y: 0,
+                width: 1,
+                height: 1
+            }
+        );
 
         atlas.ensure_height(GLYPH_ATLAS_MAX_HEIGHT + 1);
         assert_eq!(atlas.height, GLYPH_ATLAS_INITIAL_HEIGHT);
@@ -3623,7 +3642,15 @@ mod tests {
         assert!(atlas.dirty);
 
         let repacked = atlas.pack(&glyph);
-        assert_eq!(repacked, PackedGlyph { x: 0, y: 0, width: 1, height: 1 });
+        assert_eq!(
+            repacked,
+            PackedGlyph {
+                x: SELF_BG_ATLAS_RESERVE as u32,
+                y: 0,
+                width: 1,
+                height: 1
+            }
+        );
         assert!(atlas.packed.contains_key(&key));
     }
 
@@ -3650,8 +3677,10 @@ mod tests {
             next_font_id: 1,
         };
         for (index, db_id) in db_ids.iter().copied().enumerate() {
-            fb.loaded
-                .insert(db_id, Some(DanmakuFontFace::new(index as u32 + 1, font.clone())));
+            fb.loaded.insert(
+                db_id,
+                Some(DanmakuFontFace::new(index as u32 + 1, font.clone())),
+            );
             fb.loaded_order.push_back(db_id);
         }
         // char_cache pointing at the evicted (oldest) face is dropped; entries

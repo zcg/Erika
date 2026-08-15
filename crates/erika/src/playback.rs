@@ -701,24 +701,20 @@ enum MediaCodecFallbackTarget {
     Software,
 }
 
+// MediaCodec 是 Android 专用后端；测试在任意平台验证其路由逻辑。
+#[cfg(any(target_os = "android", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaCodecSeekRoute {
     Surface,
     ByteBuffer,
 }
 
+#[cfg(any(target_os = "android", test))]
 impl MediaCodecSeekRoute {
     fn decoder_config(self) -> DecoderConfig {
         match self {
             Self::Surface => DecoderConfig::mediacodec(),
             Self::ByteBuffer => DecoderConfig::mediacodec_byte_buffer(),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Surface => "surface_ahardwarebuffer",
-            Self::ByteBuffer => "bytebuffer_cpu_upload",
         }
     }
 }
@@ -1367,6 +1363,7 @@ impl PlaybackSession {
         }
     }
 
+    #[cfg(target_os = "android")]
     fn selected_video_codec(&self) -> Option<String> {
         let selected = self.info.selected_video_track?;
         self.info
@@ -2362,8 +2359,7 @@ impl PlaybackSession {
     fn route_packet(&mut self, packet: ffmpeg::Packet, demand: PlaybackPumpDemand) -> Result<()> {
         // 预载进度：统一时间轴上消费到的最大 pts（视频/音频交错取 max）
         if let Some(pts) = packet.pts().and_then(|pts| pts.as_duration()) {
-            self.preload_last_pts =
-                Some(self.preload_last_pts.map_or(pts, |prev| prev.max(pts)));
+            self.preload_last_pts = Some(self.preload_last_pts.map_or(pts, |prev| prev.max(pts)));
         }
         if self
             .video_decoder
@@ -2774,7 +2770,7 @@ impl PlaybackSession {
                 // 坏包（慢网截断/seek 后损坏）：丢弃 + 等关键帧重同步，不 fatal。
                 // 原实现直接 Err → 播放崩溃循环（见 skip_invalid_video_packet 注释）。
                 let reason = error.to_string();
-                let skipped = self.skip_invalid_video_packet(&packet, reason)?;
+                let skipped = self.skip_invalid_video_packet(&packet, reason, demand)?;
                 Ok(self.video_frames.len() > before_frames || skipped)
             }
             Err(error) => Err(error),
@@ -2787,7 +2783,12 @@ impl PlaybackSession {
     /// data——原实现直接 `Err` → `playback_fatal` → 宿主换源 → 又遇同一段坏
     /// 数据 → 反复崩溃循环（日志实测 156 次连续 video_tick Invalid data）。
     /// 坏包一次性的：跳过它 + 等关键帧即可恢复，不必终止整个播放会话。
-    fn skip_invalid_video_packet(&mut self, packet: &ffmpeg::Packet, reason: String) -> Result<bool> {
+    fn skip_invalid_video_packet(
+        &mut self,
+        packet: &ffmpeg::Packet,
+        reason: String,
+        demand: PlaybackPumpDemand,
+    ) -> Result<bool> {
         if self.video_fallback_waiting_for_keyframe {
             // 已在等关键帧：继续丢非关键帧包
             return Ok(packet.is_key());
@@ -2796,7 +2797,7 @@ impl PlaybackSession {
             // 坏包本身是关键帧：只能重试发送（可能解码器状态已乱，重试失败则
             // 交回上层处理——关键帧都损坏属于数据严重损坏，fatal 合理）。
             return self
-                .route_video_packet_with_active_decoder(packet, self.active_video_frame_queue_limit())
+                .route_video_packet_with_active_decoder(packet, demand)
                 .map(|_| false);
         }
         trace::diagnostic(
@@ -4918,7 +4919,11 @@ impl VideoPlaybackEngine {
         let started = Instant::now();
         let mut pumped = 0usize;
         loop {
-            if self.session.preload_last_pts.is_some_and(|pts| pts >= target) {
+            if self
+                .session
+                .preload_last_pts
+                .is_some_and(|pts| pts >= target)
+            {
                 return Ok(true);
             }
             // 丢弃现有队列，让 pump 持续拉取新数据（demux 消费驱动
@@ -4943,7 +4948,8 @@ impl VideoPlaybackEngine {
     /// 不设 paused_seek_frame_pending（避免 worker 进入 2ms 快轮询空转）。
     fn reset_demux_for_preload(&mut self) -> Result<()> {
         self.discard_pending_frames_for_seek();
-        self.session.seek_with_decoder_flush(Duration::ZERO, true, true)?;
+        self.session
+            .seek_with_decoder_flush(Duration::ZERO, true, true)?;
         let now = Instant::now();
         self.clock.reset(Duration::ZERO, false, now);
         self.last_presented_pts = None;
@@ -5341,8 +5347,7 @@ impl VideoPlaybackEngine {
                     self.preload_completed = true;
                     self.reset_demux_for_preload()?;
                     trace::log(
-                        "[erika-playback-trace] stage=preload_completed target_reached"
-                            .to_string(),
+                        "[erika-playback-trace] stage=preload_completed target_reached".to_string(),
                     );
                 }
                 Ok(false) => {} // 时间片未够，下一轮继续
@@ -5859,11 +5864,7 @@ fn request_uses_http_source(request: &MediaRequest) -> bool {
         MediaSourceHint::Http => true,
         MediaSourceHint::HttpStream => true,
         MediaSourceHint::Auto => {
-            is_http_uri(&request.uri)
-                || request
-                    .audio_uri
-                    .as_deref()
-                    .is_some_and(is_http_uri)
+            is_http_uri(&request.uri) || request.audio_uri.as_deref().is_some_and(is_http_uri)
         }
         MediaSourceHint::LocalFile => false,
     }
@@ -6147,6 +6148,7 @@ fn mediacodec_fallback_target(
     }
 }
 
+#[cfg(any(target_os = "android", test))]
 fn mediacodec_seek_route(
     active_backend: Option<DecoderBackend>,
     uses_surface: bool,
@@ -7734,6 +7736,7 @@ mod tests {
             uri: path.to_string_lossy().into_owned(),
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
+            audio_uri: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,

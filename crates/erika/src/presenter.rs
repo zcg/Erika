@@ -1621,7 +1621,10 @@ impl PresenterRuntime {
 
         // 轨道选择：reopen 会重置为默认，按设备丢失前的选择恢复。轨道 id
         // 对同一媒体稳定；id 变化（媒体已变）时失败可忽略，沿用默认轨。
-        if let Err(error) = self.player.select_audio_track(restore.track_selection.audio) {
+        if let Err(error) = self
+            .player
+            .select_audio_track(restore.track_selection.audio)
+        {
             trace::diagnostic(
                 serde_json::json!({
                     "event": "device_lost_recovery",
@@ -1632,7 +1635,10 @@ impl PresenterRuntime {
                 .to_string(),
             );
         }
-        if let Err(error) = self.player.select_subtitle_track(restore.track_selection.subtitle) {
+        if let Err(error) = self
+            .player
+            .select_subtitle_track(restore.track_selection.subtitle)
+        {
             trace::diagnostic(
                 serde_json::json!({
                     "event": "device_lost_recovery",
@@ -3967,6 +3973,7 @@ fn append_text_subtitles_debug(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "wgpu")]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CapturedComposition {
         has_overlay: bool,
@@ -3975,10 +3982,12 @@ mod tests {
         height: u32,
     }
 
+    #[cfg(feature = "wgpu")]
     struct CaptureCompositionProbe {
         captured: Arc<Mutex<Option<CapturedComposition>>>,
     }
 
+    #[cfg(feature = "wgpu")]
     impl RendererBackend for CaptureCompositionProbe {
         fn attach_surface(&mut self, _surface: PlatformSurface) -> Result<()> {
             Ok(())

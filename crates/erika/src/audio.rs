@@ -8,6 +8,8 @@ use thiserror::Error;
 use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
 use crate::trace;
 
+/// Android AAudio / OHOS OHAudio 专用 SPSC 环形缓冲（仅这些平台使用）。
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) mod spsc;
 
 const RATE_CHANGE_AUDIO_BRIDGE: Duration = Duration::from_millis(80);

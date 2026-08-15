@@ -19,3 +19,11 @@ CFLAGS_i686_linux_android = "-fPIC"
 CXXFLAGS_i686_linux_android = "-fPIC"
 CFLAGS_aarch64_unknown_linux_ohos = "-fPIC"
 CXXFLAGS_aarch64_unknown_linux_ohos = "-fPIC"
+
+[target.x86_64-pc-windows-msvc]
+# Windows 统一静态 CRT：third_party 原生依赖（ffmpeg/freetype/harfbuzz/fribidi/
+# libass）由 xtask 以静态 CRT（/MT）构建。开启 crt-static 使 cc-rs（soundtouch-ffi、
+# libass_log_bridge 等）默认以 /MT 编译、rustc 链接静态 CRT，与 /MD 混链会触发
+# /FAILIFMISMATCH RuntimeLibrary 链接错误；用 target feature 而非 CFLAGS=/MT 可避免
+# cl 的 D9025“/MD 被 /MT 重写”警告。
+rustflags = ["-C", "target-feature=+crt-static"]
