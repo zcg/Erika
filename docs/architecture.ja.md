@@ -19,7 +19,7 @@ Rust Player Core
   D3D11 renderer ─────── zero-copy D3D11VA, HDR10, subtitle/danmaku pass (Windows)
   wgpu renderer ──────── cross-platform video, overlays, capture, Android scRGB, OHOS Vulkan
   presenter runtime ──── ties player + renderer + audio + overlays
-  C ABI ──────────────── 79 exported functions, two handle families
+  C ABI ──────────────── versioned public header、2 つの handle ファミリー
   Flutter plugin ─────── macOS + iOS + tvOS + Windows + Android + OpenHarmony embedding
 ```
 
@@ -98,7 +98,7 @@ Apple platform の主 renderer です。
 - YCbCr sampling、transfer decode、gamut mapping（BT.2020→BT.709、Display P3→BT.709）。
 - Tone mapping: Mobius、Reinhard、clip with absolute nits。
 - SDR output（`BGRA8Unorm`）と Apple EDR output（`RGBA16Float` + EDR headroom）。
-- Neural luma upscaler（`LumaUpscalerMode`）: ArtCNN C4F16/C4F32 2x doubler を Metal compute pass として decoded Y plane に適用し、render pass と同じ command buffer で実行します（`renderer/metal/upscaler.rs`）。Chroma は source resolution のままです。動画が source resolution より大きく表示される場合のみ動作し、network output は decoded frame ごとに cache されるため、同じ frame の繰り返し vsync tick では compute を再実行しません。weights は upstream ONNX release（`assets/artcnn/`）から変換し、`tests/artcnn_upscaler.rs` の onnxruntime reference で検証しています。backend は `simdgroup_matrix` matmul（Apple Silicon default）と scalar texture fallback の 2 つで、どちらも background thread で compile され、準備完了までは未拡大で再生を続けます。blob validation、model layout、execution policy、frame-token cache は platform-neutral な `renderer/artcnn.rs` にあり、wgpu backend も共有します。
+- Neural luma upscaler（`LumaUpscalerMode`）: ArtCNN C4F16/C4F16 DS/C4F32 2x doubler を Metal compute pass として decoded Y plane に適用し、render pass と同じ command buffer で実行します（`renderer/metal/upscaler.rs`）。Chroma は source resolution のままです。動画が source resolution より大きく表示される場合のみ動作し、network output は decoded frame ごとに cache されるため、同じ frame の繰り返し vsync tick では compute を再実行しません。weights は upstream ONNX release（`assets/artcnn/`）から変換し、`tests/artcnn_upscaler.rs` の onnxruntime reference で検証しています。backend は `simdgroup_matrix` matmul（Apple Silicon default）と scalar texture fallback の 2 つで、どちらも background thread で compile され、準備完了までは未拡大で再生を続けます。blob validation、model layout、execution policy、frame-token cache は platform-neutral な `renderer/artcnn.rs` にあり、wgpu backend も共有します。
 - Subtitle overlay: RGBA plane upload と alpha blending。
 - Danmaku: atlas からの instanced glyph quad drawing（shadow → outline → fill）。
 - Presentation layout は source aspect ratio を保ちます。
@@ -109,6 +109,7 @@ Windows のネイティブ renderer（`renderer/d3d11.rs`）：
 
 - ゼロコピー D3D11VA デコードテクスチャ相互運用：デコードされた `ID3D11Texture2D` surface を render device に共有し、CPU を経由しません。
 - YCbCr サンプリングと色空間変換（HLSL shader）、Metal と同じ pipeline model。
+- ゼロコピー D3D11VA luma plane 上で ArtCNN C4F16/C4F16 DS/C4F32 を tiled compute。bounded RGBA16F feature array、source-sized packed DepthToSpace output、decoded-frame cache を使います。動画の表示サイズが source より大きい場合だけ実行し、feature level 11.0 未満または optional compute failure 時は `Inactive` fallback を明示します。
 - HDR10 出力：`R10G10B10A2_UNORM` swapchain + `DXGI_HDR_METADATA_HDR10`、SDR（`BGRA8`）fallback あり。
 - 字幕 overlay の alpha-atlas upload と blending、atlas からの instanced danmaku glyph quad 描画。
 - `render_tick` で駆動される window-hosted swapchain。
@@ -122,7 +123,7 @@ Windows のネイティブ renderer（`renderer/d3d11.rs`）：
 - Android MediaCodec Surface を AHardwareBuffer/Vulkan で import。native interop が使えない場合は ByteBuffer/CPU upload に明示的に fallback します。
 - 共通の `renderer/frame.rs` boundary は geometry/color metadata と、FFmpeg decoded frame または独立した prepared AHardwareBuffer を保持します。MediaCodec Surface の AVFrame は decoder callback context が有効な playback worker 上で解放され、presenter と GPU recovery は decoder-owned AVFrame を保持しません。
 - 色空間変換と tone mapping（Metal と同じ pipeline model）。
-- bounded feature texture と source-sized packed DepthToSpace output を使う tiled ArtCNN C4F16/C4F32 compute（`renderer/wgpu_artcnn.rs`）。native luma と Android の converted nonlinear RGB の両方を扱い、`rgb + (Y_sr - Y)` で chroma を保持します。GLES 3.0 は compute を試さず、`Inactive` と `native_luma_sampling` fallback を明示します。
+- bounded feature texture と source-sized packed DepthToSpace output を使う tiled ArtCNN C4F16/C4F16 DS/C4F32 compute（`renderer/wgpu_artcnn.rs`）。native luma と Android の converted nonlinear RGB の両方を扱い、`rgb + (Y_sr - Y)` で chroma を保持します。GLES 3.0 は compute を試さず、`Inactive` と `native_luma_sampling` fallback を明示します。
 - subtitle/danmaku composite、frame capture、headless testing 用 offscreen target。display surface が extended-linear の場合も screenshot は常に SDR RGBA8 target へ offscreen render し、未マップの scRGB 値を SDR pixel として返しません。
 - surface handle model は macOS NSView、iOS UIView、Windows HWND、X11/Wayland、Android native window、OpenHarmony `OHNativeWindow` をカバーします。
 - OpenHarmony では AVCodec の Surface 出力を `OHNativeBuffer` 由来の Vulkan external image として import し、Vulkan YCbCr sampler で YUV 変換を GPU 上で行うため、decode したフレームは CPU コピーなしで wgpu compositor に到達します。必要な Vulkan extension がない端末では software decode と CPU upload に fallback し、その経緯は diagnostics event から確認できます。

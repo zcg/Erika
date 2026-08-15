@@ -237,6 +237,7 @@ pub struct PresenterStats {
 pub struct PresenterRuntimeSnapshot {
     pub stats: PresenterStats,
     pub renderer: RendererRuntimeStats,
+    pub resources: crate::core::RendererResourceStats,
     pub output: crate::renderer::output::OutputRuntimeStatus,
     pub audio_output_queued_duration: Option<Duration>,
     pub audio_output_queued_frames: usize,
@@ -289,6 +290,7 @@ pub struct PresenterRuntime {
     last_audio_clock_report: Option<AudioClockReportState>,
     last_audio_runtime_stats: AudioOutputRuntimeStats,
     playback_rate: f64,
+    audio_only_tick_active: bool,
     latest_video_decoder: Option<VideoDecoderEvent>,
     current_overlay: Option<OverlayFrame>,
     debug_hud: DebugHud,
@@ -705,6 +707,7 @@ impl PresenterRuntime {
             last_audio_clock_report: None,
             last_audio_runtime_stats: AudioOutputRuntimeStats::default(),
             playback_rate: 1.0,
+            audio_only_tick_active: false,
             latest_video_decoder: None,
             current_overlay: None,
             debug_hud: DebugHud::new(),
@@ -1319,6 +1322,11 @@ impl PresenterRuntime {
     }
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
+        if self.audio_only_tick_active {
+            self.discard_pending_video_frames();
+            self.player.set_video_decode_suspended(false)?;
+            self.audio_only_tick_active = false;
+        }
         let tick_started = Instant::now();
         // 设备丢失自愈后，若 reopen 已完成（player 进入 Ready），在此恢复
         // 速率/位置/播放意图/轨道选择。必须在任何 pump 之前：seek 会重置
@@ -1686,6 +1694,37 @@ impl PresenterRuntime {
         );
     }
 
+    pub fn audio_only_tick(&mut self) -> Result<PresenterStats> {
+        let tick_started = Instant::now();
+        if !self.audio_only_tick_active {
+            self.player.set_video_decode_suspended(true)?;
+            self.discard_pending_video_frames();
+            self.audio_only_tick_active = true;
+        }
+        let pump_started = Instant::now();
+        self.last_subtitle_pump_duration = Duration::ZERO;
+        self.last_video_pump_duration = Duration::ZERO;
+        self.report_audio_output_runtime_stats();
+        let audio_started = Instant::now();
+        self.pump_audio();
+        self.report_audio_output_runtime_stats();
+        self.last_audio_pump_duration = audio_started.elapsed();
+        let sync_started = Instant::now();
+        self.sync_media_time_from_player();
+        self.last_clock_sync_duration = sync_started.elapsed();
+        self.last_danmaku_plan_duration = Duration::ZERO;
+        self.last_render_duration = Duration::ZERO;
+        self.last_render_current_duration = Duration::ZERO;
+        self.last_render_test_duration = Duration::ZERO;
+        self.last_pump_duration = pump_started.elapsed();
+        self.last_tick_duration = tick_started.elapsed();
+        Ok(self.stats)
+    }
+
+    fn discard_pending_video_frames(&self) {
+        while self.video_frames.try_recv().is_ok() {}
+    }
+
     fn debug_hud_snapshot(&self) -> DebugHudSnapshot {
         let selection = self.player.track_selection();
         let tracks = self.player.tracks();
@@ -1823,6 +1862,7 @@ impl PresenterRuntime {
 
     pub fn runtime_snapshot(&self) -> PresenterRuntimeSnapshot {
         let renderer = self.renderer.runtime_stats();
+        let resources = self.renderer.resource_stats();
         let output = self.renderer.output_status();
         let (current_danmaku_items, current_danmaku_atlas_version, current_danmaku_atlas_bytes) =
             self.current_danmaku.as_ref().map_or((0, 0, 0), |plan| {
@@ -1841,6 +1881,7 @@ impl PresenterRuntime {
         PresenterRuntimeSnapshot {
             stats: self.stats,
             renderer,
+            resources,
             output,
             audio_output_queued_duration: audio_snapshot
                 .and_then(|snapshot| snapshot.queued_duration),
@@ -4497,6 +4538,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         );
     }
 
+    #[cfg(feature = "wgpu")]
     #[test]
     fn registering_an_unselected_memory_font_does_not_invalidate_renderers() {
         let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();

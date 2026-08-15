@@ -60,6 +60,26 @@ void main() {
     await player.dispose();
   });
 
+  test('automatic output mode keeps the C ABI value 3', () {
+    expect(ErikaOutputMode.auto.nativeValue, 3);
+    expect(ErikaOutputMode.fromNativeValue(3), ErikaOutputMode.auto);
+  });
+
+  test('background playback is opt-in at player creation', () async {
+    final player = ErikaPlayer(allowBackgroundPlayback: true);
+
+    expect(await player.ensureCreated(), 7);
+
+    final createCall = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'create',
+    );
+    expect(createCall.arguments, <String, Object?>{
+      'allowBackgroundPlayback': true,
+    });
+
+    await player.dispose();
+  });
+
   test('open forwards HTTP headers without exposing them elsewhere', () async {
     final player = ErikaPlayer();
 
@@ -73,6 +93,7 @@ void main() {
       'playerId': 7,
       'uri': 'https://example.test/video.mkv',
       'httpHeaders': <String, String>{'Authorization': 'Bearer secret'},
+      'metadata': null,
     });
     await player.dispose();
   });
@@ -149,10 +170,12 @@ void main() {
     expect(openCalls[0].arguments, <String, Object?>{
       'playerId': 7,
       'uri': 'https://example.test/null.mkv',
+      'metadata': null,
     });
     expect(openCalls[1].arguments, <String, Object?>{
       'playerId': 7,
       'uri': 'https://example.test/empty.mkv',
+      'metadata': null,
     });
 
     await player.dispose();
@@ -181,6 +204,69 @@ void main() {
         'X-Empty': '',
         'X-Request-ID': 'request-123',
       },
+      'metadata': null,
+    });
+
+    await player.dispose();
+  });
+
+  test('media metadata is forwarded for system now playing info', () async {
+    final player = ErikaPlayer();
+    final artwork = Uint8List.fromList(<int>[1, 2, 3, 4]);
+    final metadata = ErikaMediaMetadata(
+      title: 'Episode 1',
+      artist: 'Erika',
+      album: 'Season 1',
+      artwork: artwork,
+    );
+
+    await player.open('https://example.test/video.mkv', metadata: metadata);
+    await player.setMediaMetadata(metadata);
+
+    final openCall = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'open',
+    );
+    expect(openCall.arguments, <String, Object?>{
+      'playerId': 7,
+      'uri': 'https://example.test/video.mkv',
+      'metadata': <String, Object>{
+        'title': 'Episode 1',
+        'artist': 'Erika',
+        'album': 'Season 1',
+        'artwork': artwork,
+      },
+    });
+    final metadataCall = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'setMediaMetadata',
+    );
+    expect(metadataCall.arguments, <String, Object?>{
+      'playerId': 7,
+      'metadata': <String, Object>{
+        'title': 'Episode 1',
+        'artist': 'Erika',
+        'album': 'Season 1',
+        'artwork': artwork,
+      },
+    });
+
+    await player.dispose();
+  });
+
+  test('system media navigation capabilities are forwarded', () async {
+    final player = ErikaPlayer();
+
+    await player.setSystemMediaNavigation(
+      previousEnabled: true,
+      nextEnabled: false,
+    );
+
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'setSystemMediaNavigation',
+    );
+    expect(call.arguments, <String, Object?>{
+      'playerId': 7,
+      'previousEnabled': true,
+      'nextEnabled': false,
     });
 
     await player.dispose();
@@ -255,7 +341,7 @@ void main() {
   });
 
   test('initial upscaler mode is passed to native create', () async {
-    final player = ErikaPlayer(upscaler: ErikaUpscalerMode.artCnnC4F32);
+    final player = ErikaPlayer(upscaler: ErikaUpscalerMode.artCnnC4F16Ds);
 
     expect(await player.ensureCreated(), 7);
 
@@ -263,7 +349,7 @@ void main() {
       (MethodCall call) => call.method == 'create',
     );
     final arguments = createCall.arguments as Map<Object?, Object?>;
-    expect(arguments['upscaler'], ErikaUpscalerMode.artCnnC4F32.nativeValue);
+    expect(arguments['upscaler'], ErikaUpscalerMode.artCnnC4F16Ds.nativeValue);
 
     await player.dispose();
   });
@@ -955,6 +1041,13 @@ void main() {
     await player.dispose();
   });
 
+  test('DS upscaler status mode is decoded from native presenter', () {
+    expect(
+      ErikaUpscalerMode.fromNativeValue(3),
+      ErikaUpscalerMode.artCnnC4F16Ds,
+    );
+  });
+
   test('upscaler status is decoded from native presenter', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
@@ -1047,6 +1140,49 @@ void main() {
       await player.dispose();
     },
   );
+
+  test('renderer resource status is decoded from native presenter', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      return switch (call.method) {
+        'create' => 7,
+        'getResourceStatus' => <String, Object?>{
+            'deviceCurrentAllocatedBytes': 1000000000,
+            'deviceRecommendedWorkingSetBytes': 8000000000,
+            'drawableEstimatedBytes': 99532800,
+            'videoFrameBytes': 24883200,
+            'overlayAtlasBytes': 2097152,
+            'danmakuAtlasBytes': 4194304,
+            'danmakuVertexBufferBytes': 65536,
+            'upscalerBytes': 0,
+            'rendererTrackedBytes': 130772992,
+            'presenterCpuDanmakuAtlasBytes': 4194304,
+            'drawableCount': 3,
+            'outputModeSwitches': 1,
+          },
+        'dispose' => null,
+        _ => null,
+      };
+    });
+
+    final player = ErikaPlayer();
+    final status = await player.getResourceStatus();
+
+    expect(status.deviceCurrentAllocatedBytes, 1000000000);
+    expect(status.drawableEstimatedBytes, 99532800);
+    expect(status.videoFrameBytes, 24883200);
+    expect(status.rendererTrackedBytes, 130772992);
+    expect(status.drawableCount, 3);
+    expect(status.outputModeSwitches, 1);
+
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'getResourceStatus',
+    );
+    expect(call.arguments, <String, Object?>{'playerId': 7});
+
+    await player.dispose();
+  });
 
   test('subtitle style forwards font and colors with defaults', () async {
     final player = ErikaPlayer();
@@ -1540,4 +1676,30 @@ void main() {
       expect(event.message, contains('audio_output_changed'));
     },
   );
+
+  test('player event parses kind 13 system media navigation request', () {
+    expect(ErikaEventKind.systemMediaNavigationRequested.index, 13);
+    final nextEvent = ErikaPlayerEvent.fromMap(<String, Object?>{
+      'playerId': 7,
+      'kind': 13,
+      'navigation': 'next',
+    });
+    final previousEvent = ErikaPlayerEvent.fromMap(<String, Object?>{
+      'playerId': 7,
+      'kind': 13.0,
+      'navigation': 'previous',
+    });
+    final unknownEvent = ErikaPlayerEvent.fromMap(<String, Object?>{
+      'playerId': 7,
+      'kind': 13,
+      'navigation': 'later',
+    });
+
+    expect(nextEvent.kind, ErikaEventKind.systemMediaNavigationRequested);
+    expect(nextEvent.systemMediaCommand, ErikaSystemMediaCommand.next);
+    expect(previousEvent.kind, ErikaEventKind.systemMediaNavigationRequested);
+    expect(previousEvent.systemMediaCommand, ErikaSystemMediaCommand.previous);
+    expect(unknownEvent.kind, ErikaEventKind.systemMediaNavigationRequested);
+    expect(unknownEvent.systemMediaCommand, isNull);
+  });
 }

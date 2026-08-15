@@ -2,7 +2,40 @@
 
 ## Unreleased
 
+## 0.1.6 - 2026-08-14
+
+### Rendering and playback
+
+- Added the ArtCNN C4F16 DS denoising/sharpening luma upscaler for degraded
+  anime sources across the Rust, C, Flutter, Metal, and wgpu interfaces.
+- Moved Android and macOS presenter rendering off the application UI/main
+  thread, reduced Android AHardwareBuffer conversion bandwidth, and prevented
+  D3D11 frame reuse across devices.
+- Added source-aware SDR/EDR output selection on Apple platforms and exposed
+  resource status through the Android, Windows, and OpenHarmony integrations.
+
+### Integration and behavior
+
+- Disabled danmaku scroll overwrite by default, preserving already-stable
+  comments during dense playback.
+- Restored the Windows system-media-controls build and made the OpenHarmony
+  Flutter plugin's ArkTS declarations explicit.
+
 ## 0.1.5 - 2026-08-03
+
+### System media controls and background audio
+
+- Added Now Playing metadata, playback state, timeline, play/pause/seek, and
+  previous/next navigation controls across iOS, tvOS, macOS, Android, Windows,
+  and OpenHarmony.
+- Added opt-in background audio playback for iOS and Android while suspending
+  video decoding, with bounded playback-worker barriers so lifecycle callbacks
+  cannot block an application thread indefinitely.
+- Cleared stale metadata when opening media without `ErikaMediaMetadata`, made
+  pause/play sequencing deterministic, and isolated Android media callbacks
+  across multiple Flutter engines.
+- Cached Android artwork and avoided rebuilding media notifications when native
+  playback state has not changed.
 
 ### Platform support and release artifacts
 

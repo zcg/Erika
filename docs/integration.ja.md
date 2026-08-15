@@ -23,7 +23,9 @@ Rust の `PresenterRuntime` を直接駆動します。以下の C ABI 呼び出
 `ErikaHandle` は、独自コンポジタを持ち Erika の decode/timing/state だけが欲しいホスト
 向けです。本ガイドの残りは presenter ベースです。
 
-presenter ファミリーは **macOS / iOS / tvOS / Windows / Android** でコンパイルされます。
+presenter ファミリーは **macOS / iOS / tvOS / Windows / Android / HarmonyOS** でコンパイルされます。
+native host API は platform ごとに異なります。HarmonyOS Flutter host は desktop sample を
+そのまま再現するのではなく、通常 plugin の ArkTS JSON bridge を使います。
 
 ## 2. ライフサイクル
 
@@ -45,7 +47,7 @@ create ──▶ attach surface ──▶ open ──▶ play ──▶ (render_
 ErikaPresenterConfig cfg = {
     .output_mode  = ErikaPresenterOutputMode_Sdr,   // AppleEdr / Android ExtendedLinear
     .edr_headroom = 1.0f,                            // requested content-headroom ceiling
-    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // または ArtCnnC4F16 / C4F32
+    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // または ArtCnnC4F16 / C4F16Ds / C4F32
 };
 ErikaPresenterHandle *p = erika_presenter_create_with_config(cfg);
 if (!p) { /* erika_last_error_message() を読む */ }

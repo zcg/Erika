@@ -4759,6 +4759,7 @@ fn rescale_microseconds_to_time_base(microseconds: i64, time_base: TimeBase) -> 
     }
 }
 
+#[cfg(target_env = "ohos")]
 fn timestamp_to_microseconds(timestamp: PacketTimestamp) -> i64 {
     unsafe {
         sys::av_rescale_q(
@@ -4874,8 +4875,11 @@ mod tests {
 
     #[test]
     fn playback_fixture_exposes_video_technical_metadata() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/playback/playback-fixture.mkv");
+        let path = std::env::var_os("ERIKA_PLAYBACK_FIXTURE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/playback/playback-fixture.mkv")
+            });
         let probe = probe_path(path).unwrap();
         let video = probe
             .tracks

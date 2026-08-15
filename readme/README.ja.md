@@ -20,12 +20,12 @@
 - **HDR/EDR 出力** -- Apple EDR、Windows HDR10、Android FP16 extended-linear scRGB negotiation と明示的な SDR fallback
 - **Metal ネイティブレンダラー** -- YCbCr サンプリング、色空間変換、トーンマッピング、字幕/弾幕合成を単一レンダーパスで実行 (macOS/iOS/tvOS)
 - **Direct3D 11 ネイティブレンダラー** -- Windows: D3D11VA ゼロコピーテクスチャ相互運用、YCbCr サンプリング、HDR10 出力、字幕/弾幕 overlay 合成
-- **ニューラル超解像** -- ArtCNN によるアニメ輝度 2x 超解像。Metal と wgpu/Vulkan compute で render pipeline に統合
+- **ニューラル超解像** -- ArtCNN によるアニメ輝度 2x 超解像。Metal、D3D11、wgpu/Vulkan compute で render pipeline に統合
 - **音声出力** -- CoreAudio (macOS) / AudioQueue (iOS/tvOS) / WASAPI (Windows) / AAudio (Android) / OHAudio (HarmonyOS)、f32 PCM リングバッファ、音声クロック同期
 - **字幕** -- SRT / WebVTT / ASS パーサー、libass レンダリング（静的リンク）、埋め込みおよび外部字幕トラック
 - **弾幕** -- Bilibili XML / JSON パーサー、DFM+ 衝突回避レーン配置エンジン、グリフアトラスによるネイティブ GPU レンダリング
 - **再生エンジン** -- play / pause / stop / seek / 再生速度制御、音声マスタークロック同期、vsync 量子化フレームスケジューリング
-- **C ABI** -- 79 のエクスポート関数、不透明ハンドル設計、C / C++ / Swift / Dart FFI / 任意の FFI 対応言語から呼び出し可能
+- **C ABI** -- 不透明ハンドル設計で、C / C++ / Swift / Dart FFI / 任意の FFI 対応言語から呼び出し可能。正確なエクスポート集合は `erika.h` を参照
 - **Flutter プラグイン** -- macOS + iOS + tvOS + Windows + Android + HarmonyOS の native view / Texture embedding と platform-native high-dynamic-range surface path
 - **wgpu バックエンド** -- Android の playback、overlay、capture、bounded Vulkan/GLES recovery は利用可能。HarmonyOS は Vulkan で動作し、OHNativeWindow で present して OHNativeBuffer を zero-copy import します。Linux は引き続き計画中
 

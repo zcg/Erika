@@ -28,7 +28,6 @@ const AUDIO_PREFILL_TIME_BUDGET: Duration = Duration::from_millis(5);
 const AUDIO_PREFILL_LOW_WATER: Duration = Duration::from_millis(350);
 const AUDIO_CLOCK_SNAPSHOT_STALE_AFTER: Duration = Duration::from_millis(500);
 const PLAYBACK_STARVATION_GRACE: Duration = Duration::from_millis(500);
-const PLAYBACK_BUFFER_RECOVERY_AUDIO: Duration = Duration::from_millis(250);
 const AUDIO_OUTPUT_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(10);
 const POSITION_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 const FRAME_OUTPUT_BARRIER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -828,6 +827,10 @@ pub trait RendererBackend: Send {
         RendererRuntimeStats::default()
     }
 
+    fn resource_stats(&self) -> RendererResourceStats {
+        RendererResourceStats::default()
+    }
+
     fn output_status(&self) -> crate::renderer::output::OutputRuntimeStatus {
         crate::renderer::output::OutputRuntimeStatus::default()
     }
@@ -914,6 +917,25 @@ pub struct RendererRuntimeStats {
     pub hdr10_output_active: bool,
 }
 
+/// Snapshot of memory visible from the renderer. Individual fields describe
+/// resources tracked by Erika; `device_current_allocated_bytes` is Metal's
+/// process-wide device counter and can therefore include driver allocations
+/// that do not belong to a single presenter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RendererResourceStats {
+    pub device_current_allocated_bytes: u64,
+    pub device_recommended_working_set_bytes: u64,
+    pub drawable_estimated_bytes: u64,
+    pub video_frame_bytes: u64,
+    pub overlay_atlas_bytes: u64,
+    pub danmaku_atlas_bytes: u64,
+    pub danmaku_vertex_buffer_bytes: u64,
+    pub upscaler_bytes: u64,
+    pub renderer_tracked_bytes: u64,
+    pub drawable_count: u32,
+    pub output_mode_switches: u64,
+}
+
 struct PlayerInner {
     state: PlayerState,
     ended: bool,
@@ -922,6 +944,7 @@ struct PlayerInner {
     playback_clock: PlaybackClock,
     playback_generation: u64,
     playback_command_sequence: u64,
+    pending_play_sequence: Option<u64>,
     surface: Option<PlatformSurface>,
     tracks: Vec<TrackInfo>,
     track_selection: TrackSelection,
@@ -948,6 +971,7 @@ enum PlaybackCommand {
     },
     Pause {
         sequence: u64,
+        activate_before_pause: bool,
     },
     Preload {
         sequence: u64,
@@ -978,6 +1002,10 @@ enum PlaybackCommand {
     SetFrameOutputQuiesced {
         quiesced: bool,
         reply: Sender<()>,
+    },
+    SetVideoDecodeSuspended {
+        suspended: bool,
+        reply: Sender<std::result::Result<(), String>>,
     },
     Shutdown,
 }
@@ -1065,6 +1093,7 @@ impl Player {
                 playback_clock: PlaybackClock::paused_at(Duration::ZERO),
                 playback_generation: 1,
                 playback_command_sequence: 0,
+                pending_play_sequence: None,
                 surface: None,
                 tracks: Vec::new(),
                 track_selection: TrackSelection::default(),
@@ -1151,6 +1180,21 @@ impl Player {
             .max(1)
     }
 
+    /// State intended by the latest accepted playback command, including a
+    /// Play command that has been queued but not yet committed by the worker.
+    pub fn playback_intent_state(&self) -> PlayerState {
+        let inner = self.inner.lock().expect("player mutex poisoned");
+        if matches!(
+            inner.state,
+            PlayerState::Ready | PlayerState::Paused | PlayerState::Stopped
+        ) && inner.pending_play_sequence == Some(inner.playback_command_sequence)
+        {
+            PlayerState::Playing
+        } else {
+            inner.state
+        }
+    }
+
     pub fn subscribe(&self) -> Receiver<PlayerEvent> {
         let (sender, receiver) = unbounded();
         self.inner
@@ -1217,7 +1261,10 @@ impl Player {
             // lock serializes open/close while the worker is retired, and the
             // worker never needs this lock to finish.
             drop(previous);
-            self.transition(PlayerState::Opening)?;
+            self.transition_to_opening();
+            // Content boundaries publish an authoritative buffering reset so
+            // consumers never retain the previous media's incremental state.
+            self.emit(PlayerEvent::BufferingChanged(false));
             epoch
         };
         let player = self.clone();
@@ -1286,6 +1333,7 @@ impl Player {
             inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
             inner.playback_generation = generation;
             inner.playback_command_sequence = 0;
+            inner.pending_play_sequence = None;
             inner.ended = false;
             inner.pending_preload = None;
             inner.tracks = info.tracks.clone();
@@ -1345,7 +1393,7 @@ impl Player {
         // （open 异步、open() 已 take 旧 playback），若先取 commands 会返回 Err
         // 提前 return，pending_play 排队分支永远到不了——首次 play() 被静默丢弃
         // （黑屏根因：worker 停在 Paused，直到第二次 play 才真正播放）。
-        let (sequence, generation) = {
+        let (sequence, generation, previous_pending_play_sequence) = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             match inner.state {
                 // 异步 open 进行中：排队，Ready 后自动播放（宿主无需轮询状态）
@@ -1370,22 +1418,43 @@ impl Player {
                     });
                 }
             }
+            inner.playback_command_sequence =
+                inner.playback_command_sequence.saturating_add(1).max(1);
+            let previous_pending_play_sequence = inner.pending_play_sequence;
+            inner.pending_play_sequence = Some(inner.playback_command_sequence);
+            (
+                inner.playback_command_sequence,
+                inner.playback_generation.max(1),
+                previous_pending_play_sequence,
+            )
         };
         let commands = self.playback_commands()?;
-        commands
+        if commands
             .send(PlaybackCommand::Play {
                 sequence,
                 generation,
             })
-            .map_err(|_| PlayerError::Playback("playback worker is not running".to_string()))
+            .is_err()
+        {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            if inner.playback_command_sequence == sequence {
+                inner.pending_play_sequence = previous_pending_play_sequence;
+            }
+            return Err(PlayerError::Playback(
+                "playback worker is not running".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn pause(&self) -> Result<()> {
         self.ensure_not_closed()?;
         let commands = self.playback_commands()?;
-        let sequence = {
+        let (sequence, activate_before_pause) = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
-            if inner.state != PlayerState::Playing {
+            let pending_play_is_current =
+                inner.pending_play_sequence == Some(inner.playback_command_sequence);
+            if inner.state != PlayerState::Playing && !pending_play_is_current {
                 return Err(PlayerError::InvalidStateTransition {
                     from: inner.state,
                     to: PlayerState::Paused,
@@ -1393,11 +1462,18 @@ impl Player {
             }
             inner.playback_command_sequence =
                 inner.playback_command_sequence.saturating_add(1).max(1);
-            inner.playback_command_sequence
+            inner.pending_play_sequence = None;
+            (inner.playback_command_sequence, pending_play_is_current)
         };
         commands
-            .send(PlaybackCommand::Pause { sequence })
+            .send(PlaybackCommand::Pause {
+                sequence,
+                activate_before_pause,
+            })
             .map_err(|_| PlayerError::Playback("playback worker is not running".to_string()))?;
+        // Publish the paused intent immediately so a sequential pause/play pair
+        // cannot race the worker and observe a stale Playing state. The worker
+        // still replaces the parked clock with its authoritative media time.
         let _ = commit_playback_command_intent(
             &self.inner,
             sequence,
@@ -1456,6 +1532,7 @@ impl Player {
             previous_clock,
             previous_generation,
             previous_ended,
+            previous_pending_play_sequence,
             sequence,
             generation,
             resume_after_seek,
@@ -1464,9 +1541,16 @@ impl Player {
             let previous_clock = inner.playback_clock.clone();
             let previous_generation = inner.playback_generation;
             let previous_ended = inner.ended;
-            let resume_after_seek = inner.state == PlayerState::Playing;
+            let previous_pending_play_sequence = inner.pending_play_sequence;
+            let resume_after_seek = inner.state == PlayerState::Playing
+                || inner.pending_play_sequence == Some(inner.playback_command_sequence);
             inner.playback_command_sequence =
                 inner.playback_command_sequence.saturating_add(1).max(1);
+            // A Seek supersedes the queued Play command, but it also carries
+            // that command's resume intent. Keep the new Seek sequence visible
+            // as Playing until the worker either commits or fails it.
+            inner.pending_play_sequence =
+                resume_after_seek.then_some(inner.playback_command_sequence);
             inner.playback_clock = PlaybackClock::paused_at(position);
             inner.playback_generation = inner.playback_generation.saturating_add(1).max(1);
             inner.ended = false;
@@ -1474,6 +1558,7 @@ impl Player {
                 previous_clock,
                 previous_generation,
                 previous_ended,
+                previous_pending_play_sequence,
                 inner.playback_command_sequence,
                 inner.playback_generation,
                 resume_after_seek,
@@ -1493,6 +1578,7 @@ impl Player {
                 inner.playback_clock = previous_clock;
                 inner.playback_generation = previous_generation;
                 inner.ended = previous_ended;
+                inner.pending_play_sequence = previous_pending_play_sequence;
             }
             return Err(PlayerError::Playback(
                 "playback worker is not running".to_string(),
@@ -1557,13 +1643,22 @@ impl Player {
     pub fn stop(&self) -> Result<()> {
         self.ensure_not_closed()?;
         let commands = self.playback_commands()?;
-        let (previous_clock, previous_generation, previous_ended, sequence, generation) = {
+        let (
+            previous_clock,
+            previous_generation,
+            previous_ended,
+            previous_pending_play_sequence,
+            sequence,
+            generation,
+        ) = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             let previous_clock = inner.playback_clock.clone();
             let previous_generation = inner.playback_generation;
             let previous_ended = inner.ended;
+            let previous_pending_play_sequence = inner.pending_play_sequence;
             inner.playback_command_sequence =
                 inner.playback_command_sequence.saturating_add(1).max(1);
+            inner.pending_play_sequence = None;
             inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
             inner.playback_generation = inner.playback_generation.saturating_add(1).max(1);
             inner.ended = false;
@@ -1571,6 +1666,7 @@ impl Player {
                 previous_clock,
                 previous_generation,
                 previous_ended,
+                previous_pending_play_sequence,
                 inner.playback_command_sequence,
                 inner.playback_generation,
             )
@@ -1587,6 +1683,7 @@ impl Player {
                 inner.playback_clock = previous_clock;
                 inner.playback_generation = previous_generation;
                 inner.ended = previous_ended;
+                inner.pending_play_sequence = previous_pending_play_sequence;
             }
             return Err(PlayerError::Playback(
                 "playback worker is not running".to_string(),
@@ -1623,6 +1720,58 @@ impl Player {
 
     pub(crate) fn set_frame_output_quiesced(&self, quiesced: bool) -> Result<bool> {
         self.set_frame_output_quiesced_with_timeout(quiesced, FRAME_OUTPUT_BARRIER_TIMEOUT)
+    }
+
+    pub(crate) fn set_video_decode_suspended(&self, suspended: bool) -> Result<bool> {
+        self.set_video_decode_suspended_with_timeout(suspended, FRAME_OUTPUT_BARRIER_TIMEOUT)
+    }
+
+    fn set_video_decode_suspended_with_timeout(
+        &self,
+        suspended: bool,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let Some(commands) = self.optional_playback_commands() else {
+            return Ok(false);
+        };
+        let (reply, response) = bounded(1);
+        let requested_at = Instant::now();
+        match commands.send_timeout(
+            PlaybackCommand::SetVideoDecodeSuspended { suspended, reply },
+            timeout,
+        ) {
+            Ok(()) => {}
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                return Err(PlayerError::Playback(format!(
+                    "timed out after {} ms while sending video decode mode to the playback worker",
+                    timeout.as_millis(),
+                )));
+            }
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                return Err(PlayerError::Playback(
+                    "playback worker is not running".to_string(),
+                ));
+            }
+        }
+        let remaining = timeout.saturating_sub(requested_at.elapsed());
+        match response.recv_timeout(remaining) {
+            Ok(result) => result.map_err(PlayerError::Playback)?,
+            Err(RecvTimeoutError::Timeout) => {
+                if suspended {
+                    enqueue_video_decode_resume_after_timeout(&commands);
+                }
+                return Err(PlayerError::Playback(format!(
+                    "playback worker did not acknowledge video decode mode within {} ms",
+                    timeout.as_millis(),
+                )));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(PlayerError::Playback(
+                    "playback worker stopped before acknowledging video decode mode".to_string(),
+                ));
+            }
+        }
+        Ok(true)
     }
 
     fn set_frame_output_quiesced_with_timeout(
@@ -1742,8 +1891,11 @@ impl Player {
             inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
             inner.playback_generation = inner.playback_generation.saturating_add(1).max(1);
             inner.ended = false;
+            inner.pending_play_sequence = None;
         }
-        self.transition(PlayerState::Closed)
+        self.transition(PlayerState::Closed)?;
+        self.emit(PlayerEvent::BufferingChanged(false));
+        Ok(())
     }
 
     pub fn attach_surface(&self, surface: PlatformSurface) -> Result<()> {
@@ -1757,7 +1909,6 @@ impl Player {
     }
 
     pub fn detach_surface(&self) -> Result<()> {
-        self.ensure_not_closed()?;
         {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             inner.surface = None;
@@ -1822,6 +1973,23 @@ impl Player {
             self.emit(PlayerEvent::StateChanged(next));
         }
         Ok(())
+    }
+
+    fn transition_to_opening(&self) {
+        let previous = {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            // A racing Play may have cloned the old worker sender before this
+            // Open took the lifecycle lock, then queued behind Shutdown. The
+            // old worker is joined above, so invalidate that orphaned intent
+            // in the same critical section that publishes Opening.
+            inner.pending_play_sequence = None;
+            let previous = inner.state;
+            inner.state = PlayerState::Opening;
+            previous
+        };
+        if previous != PlayerState::Opening {
+            self.emit(PlayerEvent::StateChanged(PlayerState::Opening));
+        }
     }
 
     fn emit(&self, event: PlayerEvent) {
@@ -2120,9 +2288,12 @@ fn audio_snapshot_is_starved(
     snapshot.queued_frames == 0 && (underflow_advanced || starvation_pending)
 }
 
-fn audio_snapshot_recovery_reference(snapshot: AudioClockSnapshot) -> Option<Duration> {
+fn audio_snapshot_recovery_reference(
+    snapshot: AudioClockSnapshot,
+    recovery_audio: Duration,
+) -> Option<Duration> {
     let queued = snapshot.queued_duration?;
-    (queued >= PLAYBACK_BUFFER_RECOVERY_AUDIO)
+    (queued >= recovery_audio)
         .then_some(snapshot.media_time)
         .flatten()
 }
@@ -2162,8 +2333,17 @@ fn update_buffering_from_worker(
 
     if engine.is_buffering() {
         let video_ready = !engine.has_video_output() || engine.buffering_video_pts().is_some();
-        let audio_reference = fresh_audio.and_then(audio_snapshot_recovery_reference);
-        let audio_ready = !engine.has_audio_output() || audio_reference.is_some();
+        let recovery_audio = engine.buffer_recovery_audio();
+        let audio_reference = fresh_audio
+            .and_then(|snapshot| audio_snapshot_recovery_reference(snapshot, recovery_audio));
+        // A stream may legitimately end its audio track before the final
+        // video frames. Once the decoder reaches EOF or the bounded recovery
+        // scan establishes that audio is unavailable for now, resume from the
+        // parked video timestamp instead of waiting forever for an audio queue
+        // threshold that can no longer be reached.
+        let audio_ready = !engine.has_audio_output()
+            || audio_reference.is_some()
+            || engine.buffering_audio_is_exhausted();
         if video_ready && audio_ready {
             let reference = audio_reference
                 .or_else(|| engine.buffering_video_pts())
@@ -2461,6 +2641,7 @@ fn handle_playback_command(
             generation,
         } => {
             if !begin_playback_command_execution(sequence, last_executed_playback_command_sequence)
+                || !playback_command_sequence_is_current(inner, sequence)
             {
                 return true;
             }
@@ -2495,26 +2676,57 @@ fn handle_playback_command(
                     } else {
                         format!("failed to start playback from {state_before:?}: {error}")
                     };
-                    fail_playback_from_worker(
+                    fail_playback_command_from_worker(
                         engine,
                         inner,
+                        sequence,
                         if restarting { "play_restart" } else { "play" },
                         message,
                     );
                 }
             }
         }
-        PlaybackCommand::Pause { sequence } => {
+        PlaybackCommand::Pause {
+            sequence,
+            activate_before_pause,
+        } => {
             if !begin_playback_command_execution(sequence, last_executed_playback_command_sequence)
+                || !playback_command_sequence_is_current(inner, sequence)
             {
                 return true;
             }
+            let mut restarted = false;
+            if activate_before_pause && engine.state() != PlaybackRunState::Playing {
+                match engine.play_checked() {
+                    Ok(did_restart) => {
+                        restarted = did_restart;
+                        if did_restart {
+                            *playback_generation = playback_generation.saturating_add(1).max(1);
+                        }
+                    }
+                    Err(error) => {
+                        fail_playback_command_from_worker(
+                            engine,
+                            inner,
+                            sequence,
+                            "pause_after_queued_play",
+                            format!("failed to activate engine before pause: {error}"),
+                        );
+                        return true;
+                    }
+                }
+            }
             engine.pause();
+            let position = if restarted {
+                Duration::ZERO
+            } else {
+                engine.media_time()
+            };
             let _ = commit_playback_command_intent(
                 inner,
                 sequence,
-                None,
-                None,
+                restarted.then_some(*playback_generation),
+                Some(position),
                 Some(PlayerState::Paused),
             );
         }
@@ -2576,7 +2788,13 @@ fn handle_playback_command(
                 return true;
             }
             match result {
-                Err(error) => fail_playback_from_worker(engine, inner, "seek", error.to_string()),
+                Err(error) => fail_playback_command_from_worker(
+                    engine,
+                    inner,
+                    sequence,
+                    "seek",
+                    error.to_string(),
+                ),
                 Ok(()) => {
                     let _ = commit_playback_command_intent(
                         inner,
@@ -2794,6 +3012,20 @@ fn handle_playback_command(
             );
             let _ = reply.send(());
         }
+        PlaybackCommand::SetVideoDecodeSuspended { suspended, reply } => {
+            let result = engine
+                .set_video_decode_suspended(suspended)
+                .map_err(|error| error.to_string());
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "player_video_decode",
+                    "stage": if suspended { "suspended" } else { "resumed_at_keyframe" },
+                    "generation": *playback_generation,
+                })
+                .to_string(),
+            );
+            let _ = reply.send(result);
+        }
         PlaybackCommand::Shutdown => return false,
     }
     true
@@ -2820,6 +3052,53 @@ fn fail_playback_from_worker(
     );
     emit_from_worker(inner, PlayerEvent::Error(PlayerError::Playback(message)));
     set_state_from_worker(inner, PlayerState::Error);
+}
+
+fn fail_playback_command_from_worker(
+    engine: &mut VideoPlaybackEngine,
+    inner: &Arc<Mutex<PlayerInner>>,
+    sequence: u64,
+    stage: &'static str,
+    message: String,
+) {
+    engine.pause();
+    trace::diagnostic(
+        serde_json::json!({
+            "event": "playback_fatal",
+            "stage": stage,
+            "reason": message.as_str(),
+            "commandSequence": sequence,
+        })
+        .to_string(),
+    );
+    let _ = commit_playback_command_failure(inner, sequence, message);
+}
+
+fn commit_playback_command_failure(
+    inner: &Arc<Mutex<PlayerInner>>,
+    sequence: u64,
+    message: String,
+) -> bool {
+    let mut inner = inner.lock().expect("player mutex poisoned");
+    if inner.playback_command_sequence != sequence {
+        return false;
+    }
+    inner.pending_play_sequence = None;
+    inner.subscribers.retain(|sender| {
+        sender
+            .send(PlayerEvent::Error(PlayerError::Playback(message.clone())))
+            .is_ok()
+    });
+    let previous = inner.state;
+    inner.state = PlayerState::Error;
+    if previous != PlayerState::Error {
+        inner.subscribers.retain(|sender| {
+            sender
+                .send(PlayerEvent::StateChanged(PlayerState::Error))
+                .is_ok()
+        });
+    }
+    true
 }
 
 fn fail_video_import_from_worker(
@@ -3014,6 +3293,11 @@ fn commit_playback_command_intent(
     if inner.playback_command_sequence != sequence {
         return false;
     }
+    // Position-only commits are published synchronously when Seek is queued.
+    // They must not clear a resume intent that is still owned by the worker.
+    if state.is_some() {
+        inner.pending_play_sequence = None;
+    }
     if let Some(playback_generation) = playback_generation {
         inner.playback_generation = inner.playback_generation.max(playback_generation.max(1));
     }
@@ -3125,6 +3409,15 @@ fn enqueue_frame_output_resume_after_timeout(commands: &Sender<PlaybackCommand>)
             .to_string(),
         ),
     }
+}
+
+fn enqueue_video_decode_resume_after_timeout(commands: &Sender<PlaybackCommand>) {
+    let (reply, response) = bounded(1);
+    drop(response);
+    let _ = commands.try_send(PlaybackCommand::SetVideoDecodeSuspended {
+        suspended: false,
+        reply,
+    });
 }
 
 fn set_state_from_worker(inner: &Arc<Mutex<PlayerInner>>, next: PlayerState) {
@@ -3472,6 +3765,61 @@ mod tests {
     }
 
     #[test]
+    fn video_decode_mode_is_a_noop_without_open_media() {
+        let player = Player::new(PlayerConfig::default());
+        assert!(!player.set_video_decode_suspended(true).unwrap());
+    }
+
+    #[test]
+    fn video_decode_mode_uses_an_acknowledged_worker_command() {
+        let player = Player::new(PlayerConfig::default());
+        let receiver = install_test_runtime(&player, 2);
+        let worker = thread::spawn(move || match receiver.recv().unwrap() {
+            PlaybackCommand::SetVideoDecodeSuspended {
+                suspended: true,
+                reply,
+            } => reply.send(Ok(())).unwrap(),
+            _ => panic!("unexpected playback command"),
+        });
+
+        assert!(player.set_video_decode_suspended(true).unwrap());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn video_decode_mode_reports_an_unresponsive_worker() {
+        let player = Player::new(PlayerConfig::default());
+        let receiver = install_test_runtime(&player, 2);
+        let started = Instant::now();
+
+        let error = player
+            .set_video_decode_suspended_with_timeout(true, Duration::from_millis(25))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not acknowledge video decode mode")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            PlaybackCommand::SetVideoDecodeSuspended {
+                suspended: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            PlaybackCommand::SetVideoDecodeSuspended {
+                suspended: false,
+                ..
+            }
+        ));
+        drop(receiver);
+    }
+
+    #[test]
     fn frame_output_barrier_reports_an_unresponsive_worker() {
         let player = Player::new(PlayerConfig::default());
         let receiver = install_test_runtime(&player, 2);
@@ -3748,8 +4096,9 @@ mod tests {
     }
 
     #[test]
-    fn pause_publishes_a_parked_clock_with_the_paused_state() {
+    fn pause_publishes_intent_before_worker_position() {
         let player = Player::new(PlayerConfig::default());
+        let events = player.subscribe();
         let commands = install_test_runtime(&player, 1);
         let anchor = Instant::now();
         {
@@ -3760,10 +4109,31 @@ mod tests {
 
         player.pause().unwrap();
 
-        assert!(matches!(
-            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
-            PlaybackCommand::Pause { .. }
+        let sequence = match commands.recv_timeout(Duration::from_secs(1)).unwrap() {
+            PlaybackCommand::Pause { sequence, .. } => sequence,
+            _ => panic!("expected pause command"),
+        };
+        assert_eq!(player.state(), PlayerState::Paused);
+        assert_eq!(
+            events.recv().unwrap(),
+            PlayerEvent::StateChanged(PlayerState::Paused)
+        );
+
+        let position = Duration::from_millis(9_250);
+        assert!(commit_playback_command_intent(
+            &player.inner,
+            sequence,
+            None,
+            Some(position),
+            Some(PlayerState::Paused),
         ));
+        assert_eq!(
+            events.recv().unwrap(),
+            PlayerEvent::PositionChanged(position)
+        );
+        assert!(events.try_recv().is_err());
+        assert_eq!(player.current_media_time(), position);
+        assert_eq!(player.state(), PlayerState::Paused);
         let snapshot = player.playback_snapshot();
         assert_eq!(snapshot.state, PlayerState::Paused);
         assert!(!snapshot.clock.is_running());
@@ -3797,6 +4167,30 @@ mod tests {
         let player = Player::new(PlayerConfig::default());
         player.close().unwrap();
         assert_eq!(player.play().unwrap_err(), PlayerError::Closed);
+    }
+
+    #[test]
+    fn closed_player_allows_idempotent_surface_detach() {
+        let player = Player::new(PlayerConfig::default());
+        player
+            .attach_surface(PlatformSurface::Metal(MetalSurfaceHandle::new(
+                42, 1920, 1080, 2.0,
+            )))
+            .unwrap();
+        player.close().unwrap();
+
+        player.detach_surface().unwrap();
+        player.detach_surface().unwrap();
+
+        assert_eq!(player.state(), PlayerState::Closed);
+        assert!(
+            player
+                .inner
+                .lock()
+                .expect("player mutex poisoned")
+                .surface
+                .is_none()
+        );
     }
 
     #[test]
@@ -4040,6 +4434,334 @@ mod tests {
 
         assert!(player.tracks().is_empty());
         assert_eq!(player.track_selection(), TrackSelection::default());
+    }
+
+    #[test]
+    fn queued_play_intent_is_visible_and_can_be_superseded_by_pause() {
+        for initial_state in [
+            PlayerState::Ready,
+            PlayerState::Stopped,
+            PlayerState::Paused,
+        ] {
+            let player = Player::new(PlayerConfig::default());
+            let commands = install_fake_playback(
+                &player,
+                initial_state,
+                Duration::ZERO,
+                7,
+                initial_state == PlayerState::Stopped,
+            );
+
+            player.play().unwrap();
+            assert_eq!(player.state(), initial_state);
+            assert_eq!(player.playback_intent_state(), PlayerState::Playing);
+
+            player.pause().unwrap();
+            assert_eq!(player.state(), PlayerState::Paused);
+            assert_eq!(player.playback_intent_state(), PlayerState::Paused);
+
+            let play_sequence = match commands.try_recv().expect("play command") {
+                PlaybackCommand::Play { sequence, .. } => sequence,
+                _ => panic!("expected play command"),
+            };
+            let pause_sequence = match commands.try_recv().expect("pause command") {
+                PlaybackCommand::Pause {
+                    sequence,
+                    activate_before_pause,
+                } => {
+                    assert!(activate_before_pause);
+                    sequence
+                }
+                _ => panic!("expected pause command"),
+            };
+            assert!(pause_sequence > play_sequence);
+        }
+    }
+
+    fn ended_playback_fixture_engine() -> Option<VideoPlaybackEngine> {
+        let Some(path) = std::env::var_os("ERIKA_PLAYBACK_FIXTURE") else {
+            return None;
+        };
+        let request = MediaRequest {
+            uri: path.to_string_lossy().into_owned(),
+            source_hint: MediaSourceHint::LocalFile,
+            http_headers: Vec::new(),
+        };
+        let mut engine = VideoPlaybackEngine::open(
+            &request,
+            PlaybackSessionConfig {
+                video_decode: crate::playback::VideoDecodePreference::Software,
+                ..PlaybackSessionConfig::default()
+            },
+        )
+        .expect("open playback fixture");
+        engine
+            .seek(Duration::from_secs(9))
+            .expect("seek fixture past EOF");
+        engine.play().expect("play fixture at EOF");
+        let eof_deadline = Instant::now() + Duration::from_secs(2);
+        while engine.state() != PlaybackRunState::Ended && Instant::now() < eof_deadline {
+            let _ = engine.tick().expect("pump EOF video");
+            let _ = engine.tick_audio().expect("pump EOF audio");
+            thread::yield_now();
+        }
+        assert_eq!(engine.state(), PlaybackRunState::Ended);
+        Some(engine)
+    }
+
+    #[test]
+    fn superseded_play_restart_publishes_generation_before_pause() {
+        let Some(mut engine) = ended_playback_fixture_engine() else {
+            return;
+        };
+
+        let player = Player::new(PlayerConfig::default());
+        {
+            let mut inner = player.inner.lock().expect("player mutex poisoned");
+            inner.state = PlayerState::Paused;
+            inner.ended = true;
+            inner.playback_generation = 7;
+            inner.playback_command_sequence = 2;
+            inner.playback_clock = PlaybackClock::paused_at(Duration::from_secs(8));
+        }
+        let mut worker_generation = 7;
+        let mut last_sequence = 0;
+        let mut frame_output_quiesced = false;
+
+        assert!(handle_playback_command(
+            &mut engine,
+            &player.inner,
+            PlaybackCommand::Pause {
+                sequence: 2,
+                activate_before_pause: true,
+            },
+            &mut worker_generation,
+            &mut last_sequence,
+            &mut frame_output_quiesced,
+        ));
+
+        assert_eq!(worker_generation, 8);
+        assert_eq!(player.playback_generation(), 8);
+        assert_eq!(player.state(), PlayerState::Paused);
+        assert_eq!(player.current_media_time(), Duration::ZERO);
+    }
+
+    #[test]
+    fn stale_pause_cannot_consume_the_latest_eof_play_restart() {
+        let Some(mut engine) = ended_playback_fixture_engine() else {
+            return;
+        };
+        let player = Player::new(PlayerConfig::default());
+        let events = player.subscribe();
+        {
+            let mut inner = player.inner.lock().expect("player mutex poisoned");
+            inner.state = PlayerState::Paused;
+            inner.ended = true;
+            inner.playback_generation = 7;
+            inner.playback_command_sequence = 3;
+            inner.pending_play_sequence = Some(3);
+            inner.playback_clock = PlaybackClock::paused_at(Duration::from_secs(8));
+        }
+        let mut worker_generation = 7;
+        let mut last_sequence = 0;
+        let mut frame_output_quiesced = false;
+
+        assert!(handle_playback_command(
+            &mut engine,
+            &player.inner,
+            PlaybackCommand::Pause {
+                sequence: 2,
+                activate_before_pause: true,
+            },
+            &mut worker_generation,
+            &mut last_sequence,
+            &mut frame_output_quiesced,
+        ));
+        assert_eq!(engine.state(), PlaybackRunState::Ended);
+        assert_eq!(worker_generation, 7);
+        assert!(events.try_recv().is_err());
+
+        assert!(handle_playback_command(
+            &mut engine,
+            &player.inner,
+            PlaybackCommand::Play {
+                sequence: 3,
+                generation: 7,
+            },
+            &mut worker_generation,
+            &mut last_sequence,
+            &mut frame_output_quiesced,
+        ));
+
+        assert_eq!(worker_generation, 8);
+        assert_eq!(player.playback_generation(), 8);
+        assert_eq!(player.state(), PlayerState::Playing);
+        assert_eq!(player.current_media_time(), Duration::ZERO);
+        assert_eq!(
+            events.try_iter().collect::<Vec<_>>(),
+            vec![
+                PlayerEvent::PositionChanged(Duration::ZERO),
+                PlayerEvent::StateChanged(PlayerState::Playing),
+            ],
+        );
+    }
+
+    #[test]
+    fn queued_play_followed_by_seek_keeps_playing_intent_until_seek_commits() {
+        for initial_state in [PlayerState::Paused, PlayerState::Stopped] {
+            let player = Player::new(PlayerConfig::default());
+            let commands = install_fake_playback(
+                &player,
+                initial_state,
+                Duration::from_secs(8),
+                7,
+                initial_state == PlayerState::Stopped,
+            );
+
+            player.play().unwrap();
+            let play_sequence = match commands.try_recv().expect("play command") {
+                PlaybackCommand::Play { sequence, .. } => sequence,
+                _ => panic!("expected play command"),
+            };
+
+            let target = Duration::from_secs(3);
+            player.seek(target).unwrap();
+            let (seek_sequence, generation) = match commands.try_recv().expect("seek command") {
+                PlaybackCommand::Seek {
+                    position,
+                    sequence,
+                    generation,
+                    resume_after_seek,
+                } => {
+                    assert_eq!(position, target);
+                    assert!(resume_after_seek);
+                    (sequence, generation)
+                }
+                _ => panic!("expected seek command"),
+            };
+
+            assert!(seek_sequence > play_sequence);
+            assert_eq!(player.state(), initial_state);
+            assert_eq!(player.current_media_time(), target);
+            assert_eq!(player.playback_intent_state(), PlayerState::Playing);
+            assert!(commit_playback_command_intent(
+                &player.inner,
+                seek_sequence,
+                Some(generation),
+                None,
+                Some(PlayerState::Playing),
+            ));
+            assert_eq!(player.state(), PlayerState::Playing);
+            assert_eq!(player.playback_intent_state(), PlayerState::Playing);
+        }
+    }
+
+    #[test]
+    fn failed_resume_seek_clears_pending_playing_intent() {
+        let player = Player::new(PlayerConfig::default());
+        let commands = install_fake_playback(
+            &player,
+            PlayerState::Paused,
+            Duration::from_secs(8),
+            7,
+            false,
+        );
+
+        player.play().unwrap();
+        let _ = commands.try_recv().expect("play command");
+        player.seek(Duration::from_secs(3)).unwrap();
+        let sequence = match commands.try_recv().expect("seek command") {
+            PlaybackCommand::Seek { sequence, .. } => sequence,
+            _ => panic!("expected seek command"),
+        };
+        assert_eq!(player.playback_intent_state(), PlayerState::Playing);
+
+        assert!(commit_playback_command_failure(
+            &player.inner,
+            sequence,
+            "synthetic seek failure".to_string(),
+        ));
+        assert_eq!(player.state(), PlayerState::Error);
+        assert_eq!(player.playback_intent_state(), PlayerState::Error);
+    }
+
+    #[test]
+    fn current_play_failure_clears_pending_intent_and_publishes_error() {
+        let player = Player::new(PlayerConfig::default());
+        let commands = install_fake_playback(&player, PlayerState::Ready, Duration::ZERO, 7, false);
+        let events = player.subscribe();
+
+        player.play().unwrap();
+        let sequence = match commands.try_recv().expect("play command") {
+            PlaybackCommand::Play { sequence, .. } => sequence,
+            _ => panic!("expected play command"),
+        };
+        assert!(commit_playback_command_failure(
+            &player.inner,
+            sequence,
+            "synthetic play failure".to_string(),
+        ));
+
+        assert_eq!(player.state(), PlayerState::Error);
+        assert_eq!(player.playback_intent_state(), PlayerState::Error);
+        assert!(matches!(
+            events.try_recv().expect("error event"),
+            PlayerEvent::Error(_)
+        ));
+        assert_eq!(
+            events.try_recv().expect("state event"),
+            PlayerEvent::StateChanged(PlayerState::Error),
+        );
+    }
+
+    #[test]
+    fn terminal_and_opening_states_override_a_stale_pending_play_intent() {
+        let player = Player::new(PlayerConfig::default());
+        for state in [
+            PlayerState::Opening,
+            PlayerState::Error,
+            PlayerState::Closed,
+        ] {
+            {
+                let mut inner = player.inner.lock().expect("player mutex poisoned");
+                inner.state = state;
+                inner.playback_command_sequence = 9;
+                inner.pending_play_sequence = Some(9);
+            }
+            assert_eq!(player.playback_intent_state(), state);
+        }
+    }
+
+    #[test]
+    fn failed_reopen_clears_the_previous_workers_pending_play_intent() {
+        let player = Player::new(PlayerConfig::default());
+        let _commands = install_fake_playback(
+            &player,
+            PlayerState::Ready,
+            Duration::from_secs(3),
+            7,
+            false,
+        );
+        player.play().expect("queue play on old runtime");
+        assert_eq!(player.playback_intent_state(), PlayerState::Playing);
+
+        let error = player
+            .open(MediaRequest::new(
+                "/tmp/erika-definitely-missing-reopen.mp4",
+            ))
+            .expect_err("replacement media is deliberately missing");
+
+        assert!(matches!(error, PlayerError::Playback(_)));
+        assert_eq!(player.state(), PlayerState::Error);
+        assert_eq!(player.playback_intent_state(), PlayerState::Error);
+        assert_eq!(
+            player
+                .inner
+                .lock()
+                .expect("player mutex poisoned")
+                .pending_play_sequence,
+            None,
+        );
     }
 
     #[test]
@@ -4319,11 +5041,31 @@ mod tests {
         };
 
         assert_eq!(
-            audio_snapshot_recovery_reference(snapshot(Duration::from_millis(249), 11_952)),
+            audio_snapshot_recovery_reference(
+                snapshot(Duration::from_millis(99), 4_752),
+                Duration::from_millis(100),
+            ),
             None
         );
         assert_eq!(
-            audio_snapshot_recovery_reference(snapshot(Duration::from_millis(250), 12_000)),
+            audio_snapshot_recovery_reference(
+                snapshot(Duration::from_millis(100), 4_800),
+                Duration::from_millis(100),
+            ),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            audio_snapshot_recovery_reference(
+                snapshot(Duration::from_millis(249), 11_952),
+                Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(
+            audio_snapshot_recovery_reference(
+                snapshot(Duration::from_millis(250), 12_000),
+                Duration::from_millis(250),
+            ),
             Some(Duration::from_secs(7))
         );
     }
@@ -4464,6 +5206,7 @@ mod tests {
             events.recv().unwrap(),
             PlayerEvent::StateChanged(PlayerState::Opening)
         );
+        assert_eq!(events.recv().unwrap(), PlayerEvent::BufferingChanged(false));
         assert_eq!(
             events.recv().unwrap(),
             PlayerEvent::StateChanged(PlayerState::Error)
@@ -4488,6 +5231,7 @@ mod tests {
             events.recv().unwrap(),
             PlayerEvent::StateChanged(PlayerState::Opening)
         );
+        assert_eq!(events.recv().unwrap(), PlayerEvent::BufferingChanged(false));
         assert!(matches!(
             events.recv().unwrap(),
             PlayerEvent::DurationChanged(Some(_))
@@ -4586,9 +5330,10 @@ mod tests {
 
         player.play().unwrap();
 
-        assert_eq!(player.state(), PlayerState::Playing);
-        assert!(player.playback_generation() > generation_at_eof);
-        assert!(player.current_media_time() < Duration::from_secs(1));
+        // Play is intentionally asynchronous: the accepted intent is visible
+        // immediately, while state/generation move only after the worker has
+        // completed the EOF rewind.
+        assert_eq!(player.playback_intent_state(), PlayerState::Playing);
         assert_eq!(
             events.recv_timeout(Duration::from_secs(1)).unwrap(),
             PlayerEvent::PositionChanged(Duration::ZERO)
@@ -4597,6 +5342,9 @@ mod tests {
             events.recv_timeout(Duration::from_secs(1)).unwrap(),
             PlayerEvent::StateChanged(PlayerState::Playing)
         );
+        assert_eq!(player.state(), PlayerState::Playing);
+        assert!(player.playback_generation() > generation_at_eof);
+        assert!(player.current_media_time() < Duration::from_secs(1));
 
         let frame_deadline = Instant::now() + Duration::from_secs(3);
         loop {

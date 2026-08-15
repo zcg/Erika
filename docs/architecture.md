@@ -22,7 +22,7 @@ Rust Player Core
   D3D11 renderer ─────── zero-copy D3D11VA, HDR10, subtitle/danmaku pass (Windows)
   wgpu renderer ──────── cross-platform video, overlays, capture, Android scRGB, OHOS Vulkan
   presenter runtime ──── ties player + renderer + audio + overlays
-  C ABI ──────────────── 79 exported functions, two handle families
+  C ABI ──────────────── versioned public header, two handle families
   Flutter plugin ─────── macOS + iOS + tvOS + Windows + Android + OpenHarmony embedding
 ```
 
@@ -144,7 +144,7 @@ The primary renderer for Apple platforms:
 - Tone mapping: Mobius, Reinhard, clip operators with absolute nits.
 - SDR output (`BGRA8Unorm`) and Apple EDR output (`RGBA16Float` with EDR
   headroom).
-- Neural luma upscaler (`LumaUpscalerMode`): ArtCNN C4F16/C4F32 2x doublers
+- Neural luma upscaler (`LumaUpscalerMode`): ArtCNN C4F16/C4F16 DS/C4F32 2x doublers
   as Metal compute passes on the decoded Y plane, encoded on the same command
   buffer ahead of the render pass (`renderer/metal/upscaler.rs`). Chroma keeps
   its source resolution. Engages only when the video is displayed above source
@@ -170,6 +170,11 @@ The native renderer for Windows (`renderer/d3d11.rs`):
   are shared into the render device, no CPU round-trip.
 - YCbCr sampling and color space conversion (HLSL shaders), same pipeline model
   as Metal.
+- Tiled ArtCNN C4F16/C4F16 DS/C4F32 compute on the zero-copy D3D11VA luma plane, using
+  bounded RGBA16F feature arrays, a source-sized packed DepthToSpace output,
+  and decoded-frame caching. It runs only when the presented video is larger
+  than its source and reports an explicit `Inactive` fallback below feature
+  level 11.0 or after an optional compute failure.
 - HDR10 output via an `R10G10B10A2_UNORM` swapchain with `DXGI_HDR_METADATA_HDR10`,
   with SDR (`BGRA8`) fallback.
 - Subtitle overlay alpha-atlas upload and blending; instanced danmaku glyph
@@ -190,7 +195,7 @@ Second renderer backend for portability:
   decoder callback context is still alive; presenter and GPU recovery never
   retain the decoder-owned AVFrame.
 - Color space conversion, tone mapping (same pipeline model as Metal).
-- Tiled ArtCNN C4F16/C4F32 compute (`renderer/wgpu_artcnn.rs`) with bounded
+- Tiled ArtCNN C4F16/C4F16 DS/C4F32 compute (`renderer/wgpu_artcnn.rs`) with bounded
   feature textures and a source-sized packed DepthToSpace output. It accepts
   both native luma planes and Android's converted nonlinear RGB texture while
   preserving chroma as `rgb + (Y_sr - Y)`. GLES 3.0 reports `Inactive` with a

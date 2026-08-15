@@ -6,6 +6,28 @@ import 'package:flutter/services.dart';
 
 import 'erika_event.dart';
 
+@immutable
+class ErikaMediaMetadata {
+  const ErikaMediaMetadata({
+    required this.title,
+    this.artist,
+    this.album,
+    this.artwork,
+  });
+
+  final String title;
+  final String? artist;
+  final String? album;
+  final Uint8List? artwork;
+
+  Map<String, Object> toMap() => <String, Object>{
+        'title': title,
+        if (artist != null) 'artist': artist!,
+        if (album != null) 'album': album!,
+        if (artwork != null) 'artwork': artwork!,
+      };
+}
+
 /// Subtitle text colour Erika falls back to, as `0xRRGGBBAA`: opaque white.
 const int kErikaDefaultSubtitlePrimaryColorRgba = 0xFFFFFFFF;
 
@@ -26,8 +48,7 @@ const int kErikaSubtitleOverrideBorder = 1 << 6;
 const int kErikaSubtitleOverrideAlignment = 1 << 7;
 const int kErikaSubtitleOverrideMargins = 1 << 8;
 const int kErikaSubtitleOverrideBlur = 1 << 11;
-const int kErikaSubtitleOverrideAll =
-    kErikaSubtitleOverrideFontSizeFields |
+const int kErikaSubtitleOverrideAll = kErikaSubtitleOverrideFontSizeFields |
     kErikaSubtitleOverrideFontName |
     kErikaSubtitleOverrideColors |
     kErikaSubtitleOverrideAttributes |
@@ -39,7 +60,8 @@ const int kErikaSubtitleOverrideAll =
 enum ErikaOutputMode {
   sdr(0),
   appleEdr(1),
-  extendedLinear(2);
+  extendedLinear(2),
+  auto(3);
 
   const ErikaOutputMode(this.nativeValue);
 
@@ -49,6 +71,7 @@ enum ErikaOutputMode {
     return switch (value) {
       1 => ErikaOutputMode.appleEdr,
       2 => ErikaOutputMode.extendedLinear,
+      3 => ErikaOutputMode.auto,
       _ => ErikaOutputMode.sdr,
     };
   }
@@ -189,6 +212,61 @@ class ErikaOutputStatus {
   }
 }
 
+class ErikaPresenterResourceStatus {
+  const ErikaPresenterResourceStatus({
+    required this.deviceCurrentAllocatedBytes,
+    required this.deviceRecommendedWorkingSetBytes,
+    required this.drawableEstimatedBytes,
+    required this.videoFrameBytes,
+    required this.overlayAtlasBytes,
+    required this.danmakuAtlasBytes,
+    required this.danmakuVertexBufferBytes,
+    required this.upscalerBytes,
+    required this.rendererTrackedBytes,
+    required this.presenterCpuDanmakuAtlasBytes,
+    required this.drawableCount,
+    required this.outputModeSwitches,
+  });
+
+  /// Metal's process-wide counter for the current device. This can include
+  /// allocations from other Erika presenters and other Metal users.
+  final int deviceCurrentAllocatedBytes;
+  final int deviceRecommendedWorkingSetBytes;
+  final int drawableEstimatedBytes;
+  final int videoFrameBytes;
+  final int overlayAtlasBytes;
+  final int danmakuAtlasBytes;
+  final int danmakuVertexBufferBytes;
+  final int upscalerBytes;
+  final int rendererTrackedBytes;
+  final int presenterCpuDanmakuAtlasBytes;
+  final int drawableCount;
+  final int outputModeSwitches;
+
+  factory ErikaPresenterResourceStatus.fromMap(Map<dynamic, dynamic> map) {
+    int value(String key) => (map[key] as num?)?.toInt() ?? 0;
+
+    return ErikaPresenterResourceStatus(
+      deviceCurrentAllocatedBytes: value('deviceCurrentAllocatedBytes'),
+      deviceRecommendedWorkingSetBytes: value(
+        'deviceRecommendedWorkingSetBytes',
+      ),
+      drawableEstimatedBytes: value('drawableEstimatedBytes'),
+      videoFrameBytes: value('videoFrameBytes'),
+      overlayAtlasBytes: value('overlayAtlasBytes'),
+      danmakuAtlasBytes: value('danmakuAtlasBytes'),
+      danmakuVertexBufferBytes: value('danmakuVertexBufferBytes'),
+      upscalerBytes: value('upscalerBytes'),
+      rendererTrackedBytes: value('rendererTrackedBytes'),
+      presenterCpuDanmakuAtlasBytes: value(
+        'presenterCpuDanmakuAtlasBytes',
+      ),
+      drawableCount: value('drawableCount'),
+      outputModeSwitches: value('outputModeSwitches'),
+    );
+  }
+}
+
 class ErikaSubtitleMemoryFontStatus {
   const ErikaSubtitleMemoryFontStatus({
     required this.registeredCount,
@@ -222,7 +300,8 @@ class ErikaSubtitleMemoryFontStatus {
 enum ErikaUpscalerMode {
   off(0),
   artCnnC4F16(1),
-  artCnnC4F32(2);
+  artCnnC4F32(2),
+  artCnnC4F16Ds(3);
 
   const ErikaUpscalerMode(this.nativeValue);
 
@@ -232,6 +311,7 @@ enum ErikaUpscalerMode {
     return switch (value) {
       1 => ErikaUpscalerMode.artCnnC4F16,
       2 => ErikaUpscalerMode.artCnnC4F32,
+      3 => ErikaUpscalerMode.artCnnC4F16Ds,
       _ => ErikaUpscalerMode.off,
     };
   }
@@ -519,9 +599,8 @@ class _ErikaDanmakuConfigPatch {
     this.blockBottom,
     this.blockScroll,
     List<String>? blockWords,
-  }) : blockWords = blockWords == null
-           ? null
-           : List<String>.unmodifiable(blockWords);
+  }) : blockWords =
+            blockWords == null ? null : List<String>.unmodifiable(blockWords);
 
   final bool? enabled;
   final double? fontSize;
@@ -603,39 +682,36 @@ class _ErikaDanmakuConfigPatch {
       enabled: _changed(enabled, previous?.enabled) ? enabled : null,
       fontSize: _changed(fontSize, previous?.fontSize) ? fontSize : null,
       opacity: _changed(opacity, previous?.opacity) ? opacity : null,
-      displayArea: _changed(displayArea, previous?.displayArea)
-          ? displayArea
-          : null,
+      displayArea:
+          _changed(displayArea, previous?.displayArea) ? displayArea : null,
       scrollDurationSeconds:
           _changed(scrollDurationSeconds, previous?.scrollDurationSeconds)
-          ? scrollDurationSeconds
-          : null,
+              ? scrollDurationSeconds
+              : null,
       scrollSpeedFactor:
           _changed(scrollSpeedFactor, previous?.scrollSpeedFactor)
-          ? scrollSpeedFactor
-          : null,
+              ? scrollSpeedFactor
+              : null,
       trackGapRatio: _changed(trackGapRatio, previous?.trackGapRatio)
           ? trackGapRatio
           : null,
-      outlineWidth: _changed(outlineWidth, previous?.outlineWidth)
-          ? outlineWidth
-          : null,
+      outlineWidth:
+          _changed(outlineWidth, previous?.outlineWidth) ? outlineWidth : null,
       shadowOffsetX: _changed(shadowOffsetX, previous?.shadowOffsetX)
           ? shadowOffsetX
           : null,
       shadowOffsetY: _changed(shadowOffsetY, previous?.shadowOffsetY)
           ? shadowOffsetY
           : null,
-      shadowStyle: _changed(shadowStyle, previous?.shadowStyle)
-          ? shadowStyle
-          : null,
+      shadowStyle:
+          _changed(shadowStyle, previous?.shadowStyle) ? shadowStyle : null,
       customFontFamily: _changed(customFontFamily, previous?.customFontFamily)
           ? customFontFamily
           : null,
       customFontFilePath:
           _changed(customFontFilePath, previous?.customFontFilePath)
-          ? customFontFilePath
-          : null,
+              ? customFontFilePath
+              : null,
       mergeDuplicates: _changed(mergeDuplicates, previous?.mergeDuplicates)
           ? mergeDuplicates
           : null,
@@ -644,24 +720,20 @@ class _ErikaDanmakuConfigPatch {
           : null,
       allowScrollOverwrite:
           _changed(allowScrollOverwrite, previous?.allowScrollOverwrite)
-          ? allowScrollOverwrite
-          : null,
-      maxQuantity: _changed(maxQuantity, previous?.maxQuantity)
-          ? maxQuantity
-          : null,
+              ? allowScrollOverwrite
+              : null,
+      maxQuantity:
+          _changed(maxQuantity, previous?.maxQuantity) ? maxQuantity : null,
       maxLinesPerMode: _changed(maxLinesPerMode, previous?.maxLinesPerMode)
           ? maxLinesPerMode
           : null,
       blockTop: _changed(blockTop, previous?.blockTop) ? blockTop : null,
-      blockBottom: _changed(blockBottom, previous?.blockBottom)
-          ? blockBottom
-          : null,
-      blockScroll: _changed(blockScroll, previous?.blockScroll)
-          ? blockScroll
-          : null,
-      blockWords: _changedList(blockWords, previous?.blockWords)
-          ? blockWords
-          : null,
+      blockBottom:
+          _changed(blockBottom, previous?.blockBottom) ? blockBottom : null,
+      blockScroll:
+          _changed(blockScroll, previous?.blockScroll) ? blockScroll : null,
+      blockWords:
+          _changedList(blockWords, previous?.blockWords) ? blockWords : null,
     );
   }
 
@@ -708,6 +780,7 @@ class ErikaPlayer {
     this.edrHeadroom,
     this.upscaler,
     this.hdrDebug = false,
+    this.allowBackgroundPlayback = false,
   }) {
     final headroom = edrHeadroom;
     if (headroom != null &&
@@ -772,6 +845,7 @@ class ErikaPlayer {
   final double? edrHeadroom;
   final ErikaUpscalerMode? upscaler;
   final bool hdrDebug;
+  final bool allowBackgroundPlayback;
 
   int? get id => _id;
 
@@ -791,13 +865,38 @@ class ErikaPlayer {
     return _requireActiveAfter(player);
   }
 
-  Future<void> open(String uri, {Map<String, String>? httpHeaders}) async {
+  Future<void> open(
+    String uri, {
+    Map<String, String>? httpHeaders,
+    ErikaMediaMetadata? metadata,
+  }) async {
     final playerId = await ensureCreated();
     await _invoke('open', <String, Object?>{
       'playerId': playerId,
       'uri': uri,
       if (httpHeaders != null && httpHeaders.isNotEmpty)
         'httpHeaders': httpHeaders,
+      'metadata': metadata?.toMap(),
+    });
+  }
+
+  Future<void> setMediaMetadata(ErikaMediaMetadata metadata) async {
+    final playerId = await ensureCreated();
+    await _invoke('setMediaMetadata', <String, Object?>{
+      'playerId': playerId,
+      'metadata': metadata.toMap(),
+    });
+  }
+
+  Future<void> setSystemMediaNavigation({
+    required bool previousEnabled,
+    required bool nextEnabled,
+  }) async {
+    final playerId = await ensureCreated();
+    await _invoke('setSystemMediaNavigation', <String, Object?>{
+      'playerId': playerId,
+      'previousEnabled': previousEnabled,
+      'nextEnabled': nextEnabled,
     });
   }
 
@@ -1046,6 +1145,18 @@ class ErikaPlayer {
     return ErikaOutputStatus.fromMap(status);
   }
 
+  Future<ErikaPresenterResourceStatus> getResourceStatus() async {
+    final playerId = await ensureCreated();
+    final status = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getResourceStatus',
+      <String, Object?>{'playerId': playerId},
+    );
+    if (status == null) {
+      throw StateError('Erika resource status returned null.');
+    }
+    return ErikaPresenterResourceStatus.fromMap(status);
+  }
+
   Future<ErikaPresenterStats> getPresenterStats() async {
     final playerId = await ensureCreated();
     final stats = await _channel.invokeMethod<Map<dynamic, dynamic>>(
@@ -1120,11 +1231,11 @@ class ErikaPlayer {
     final playerId = await ensureCreated();
     final trackId = await _channel
         .invokeMethod<int>('addDanmakuTrackFile', <String, Object?>{
-          'playerId': playerId,
-          'uri': uri,
-          if (name != null) 'name': name,
-          'offsetMicros': offset.inMicroseconds,
-        });
+      'playerId': playerId,
+      'uri': uri,
+      if (name != null) 'name': name,
+      'offsetMicros': offset.inMicroseconds,
+    });
     if (trackId == null || trackId <= 0) {
       throw StateError('Erika danmaku track add returned no track id.');
     }
@@ -1139,11 +1250,11 @@ class ErikaPlayer {
     final playerId = await ensureCreated();
     final trackId = await _channel
         .invokeMethod<int>('addDanmakuTrackJson', <String, Object?>{
-          'playerId': playerId,
-          'json': json,
-          if (name != null) 'name': name,
-          'offsetMicros': offset.inMicroseconds,
-        });
+      'playerId': playerId,
+      'json': json,
+      if (name != null) 'name': name,
+      'offsetMicros': offset.inMicroseconds,
+    });
     if (trackId == null || trackId <= 0) {
       throw StateError('Erika danmaku track add returned no track id.');
     }
@@ -1541,14 +1652,14 @@ class ErikaPlayer {
   }
 
   Future<int> _create() async {
-    final requestedHeadroom =
-        edrHeadroom ??
+    final requestedHeadroom = edrHeadroom ??
         (outputMode == ErikaOutputMode.extendedLinear ? 4.0 : null);
     final arguments = <String, Object?>{
       if (outputMode case final mode?) 'outputMode': mode.nativeValue,
       if (requestedHeadroom case final headroom?) 'edrHeadroom': headroom,
       if (upscaler case final mode?) 'upscaler': mode.nativeValue,
       if (hdrDebug) 'hdrDebug': true,
+      if (allowBackgroundPlayback) 'allowBackgroundPlayback': true,
     };
     if (hdrDebug) {
       debugPrint('ErikaHDR[Dart]: create arguments=$arguments');

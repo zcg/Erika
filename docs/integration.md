@@ -24,7 +24,10 @@ Use `ErikaPresenterHandle` unless you have a reason to render yourself. The
 pull-model `ErikaHandle` is for hosts that own their compositor and only want
 Erika's decode/timing/state. The rest of this guide is presenter-based.
 
-The presenter family is compiled on **macOS, iOS, tvOS, Windows, and Android**.
+The presenter family is compiled on **macOS, iOS, tvOS, Windows, Android, and
+HarmonyOS**. The native host API is platform-specific; HarmonyOS Flutter hosts
+normally use the plugin's ArkTS JSON bridge rather than reproducing the desktop
+sample code.
 
 ## 2. The lifecycle
 
@@ -48,7 +51,7 @@ frame appear immediately.
 ErikaPresenterConfig cfg = {
     .output_mode  = ErikaPresenterOutputMode_Sdr,   // AppleEdr or Android ExtendedLinear
     .edr_headroom = 1.0f,                            // requested content-headroom ceiling
-    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // or ArtCnnC4F16 / C4F32
+    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // or ArtCnnC4F16 / C4F16Ds / C4F32
 };
 ErikaPresenterHandle *p = erika_presenter_create_with_config(cfg);
 if (!p) { /* read erika_last_error_message() */ }
