@@ -9,7 +9,7 @@ pub mod dfm_core;
 mod outline;
 mod typography;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,10 @@ const DEFAULT_STATIC_DURATION: Duration = Duration::from_millis(3800);
 const DEFAULT_GENERATION: u64 = 1;
 const GLYPH_ATLAS_WIDTH: u32 = 2048;
 const GLYPH_ATLAS_INITIAL_HEIGHT: u32 = 256;
+/// 自发言弹幕背景框专用：atlas 第 0 行前 N 列预留为纯白像素（fill=255，
+/// outline=0）。渲染自发言弹幕时用这块 1×N 区域作 fill 纹理源，拉伸成一条
+/// 深色半透明背景框（三个渲染后端无需改动——填色 pass 采样该 texel 即可）。
+const SELF_BG_ATLAS_RESERVE: u32 = 4;
 const SCROLL_DURATION_REFERENCE_LOGICAL_WIDTH: f32 = 1280.0;
 const SCROLL_DURATION_MIN_WIDTH_SCALE: f32 = 0.9;
 const SCROLL_DURATION_MAX_WIDTH_SCALE: f32 = 1.3;
@@ -45,6 +49,23 @@ const TRACK_ID_SHIFT: u64 = 48;
 const ITEM_ID_MASK: u64 = (1u64 << TRACK_ID_SHIFT) - 1;
 const MAX_CUSTOM_DANMAKU_FONT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DANMAKU_DEBUG_BUCKETS: usize = 16;
+
+// Memory bounds for the danmaku caches. Each is a hard cap with LRU-style
+// eviction: a cache hit is moved to the back of the order queue, and when the
+// cap is exceeded the front (least-recently-used) entry is dropped. Eviction
+// only forces a re-rasterize / re-layout on the next hit, never changes what
+// is drawn — so it trades CPU for memory without affecting functionality.
+// A live danmaku stream produces unbounded unique text lines, and the system
+// font fallback keeps a full copy of every font face it loads; without caps
+// both grow without limit for the lifetime of the session.
+const MAX_LOADED_SYSTEM_FACES: usize = 24; // faces, not bytes: budget on count
+const TEXT_LAYOUT_CACHE_CAPACITY: usize = 4096; // distinct danmaku line layouts
+const GLYPH_CACHE_CAPACITY: usize = 8192; // (font × char × size) bitmaps
+// Atlas alpha buffers are width × height × 2 channels and only ever grow via
+// ensure_height. Cap the height; when exceeded the atlas resets (packed
+// coordinates are re-derived on demand, so a reset is a re-pack, not a
+// functional change).
+const GLYPH_ATLAS_MAX_HEIGHT: u32 = 4096;
 
 #[derive(Debug, Error)]
 pub enum DanmakuError {
@@ -762,6 +783,8 @@ pub struct PreparedDanmakuItem {
     pub scroll_speed: f32,
     pub duration: Duration,
     pub duplicate_count: u32,
+    /// 用户自己发送的弹幕（渲染时加背景框标识）
+    pub is_self: bool,
     text_layout: Arc<PreparedTextLayout>,
 }
 
@@ -826,6 +849,7 @@ impl DfmPreparedLayout {
                 shadow_offset: scale_offset(self.config.shadow_offset, self.viewport.scale_factor),
                 shadow_alpha: shadow_style_alpha(self.config.shadow_style),
                 duplicate_count: item.duplicate_count,
+                is_self: item.is_self,
                 text_layout: Arc::clone(&item.text_layout),
             });
         });
@@ -877,6 +901,8 @@ pub struct DanmakuPlacedItem {
     pub shadow_offset: [f32; 2],
     pub shadow_alpha: f32,
     pub duplicate_count: u32,
+    /// 用户自己发送的弹幕（渲染时在文字后垫一条背景框）
+    pub is_self: bool,
     text_layout: Arc<PreparedTextLayout>,
 }
 
@@ -1180,6 +1206,8 @@ struct SystemFontFallback {
     db: fontdb::Database,
     faces: Vec<fontdb::ID>,
     loaded: HashMap<fontdb::ID, Option<DanmakuFontFace>>,
+    /// LRU order of `loaded` keys; front is the least-recently-used face.
+    loaded_order: VecDeque<fontdb::ID>,
     char_cache: HashMap<char, Option<u32>>,
     next_font_id: u32,
 }
@@ -1237,6 +1265,7 @@ impl SystemFontFallback {
             db,
             faces,
             loaded: HashMap::new(),
+            loaded_order: VecDeque::new(),
             char_cache: HashMap::new(),
             next_font_id,
         }
@@ -1244,7 +1273,18 @@ impl SystemFontFallback {
 
     fn resolve(&mut self, ch: char) -> Option<DanmakuFontFace> {
         if let Some(font_id) = self.char_cache.get(&ch).copied() {
-            return font_id.and_then(|font_id| self.loaded_font_by_id(font_id));
+            if let Some(face) = font_id.and_then(|font_id| self.loaded_font_by_id(font_id)) {
+                return Some(face);
+            }
+            // char_cache hit but the face it pointed at was evicted by the
+            // face-count budget. Drop the stale entry and fall through to the
+            // full scan so the character re-resolves. A `None` hit means the
+            // char was already determined to have no font — keep that result.
+            if font_id.is_some() {
+                self.char_cache.remove(&ch);
+            } else {
+                return None;
+            }
         }
         let faces = self.faces.clone();
         for face_id in faces {
@@ -1260,17 +1300,25 @@ impl SystemFontFallback {
         None
     }
 
-    fn loaded_font_by_id(&self, font_id: u32) -> Option<DanmakuFontFace> {
-        self.loaded
-            .values()
-            .filter_map(|face| face.as_ref())
-            .find(|face| face.id == font_id)
-            .cloned()
+    fn loaded_font_by_id(&mut self, font_id: u32) -> Option<DanmakuFontFace> {
+        let cached_id = self.loaded.iter().find_map(|(id, face)| {
+            face.as_ref()
+                .filter(|face| face.id == font_id)
+                .map(|_| *id)
+        });
+        let face = cached_id.and_then(|id| self.loaded.get(&id)).and_then(|f| f.clone());
+        if face.is_some() {
+            if let Some(id) = cached_id {
+                self.touch_loaded(id);
+            }
+        }
+        face
     }
 
     fn load_face(&mut self, id: fontdb::ID) -> Option<DanmakuFontFace> {
-        if let Some(face) = self.loaded.get(&id) {
-            return face.clone();
+        if let Some(face) = self.loaded.get(&id).cloned() {
+            self.touch_loaded(id);
+            return face;
         }
         let font = self
             .db
@@ -1286,7 +1334,37 @@ impl SystemFontFallback {
             DanmakuFontFace::new(id, font)
         });
         self.loaded.insert(id, face.clone());
+        self.loaded_order.push_back(id);
+        self.enforce_loaded_budget();
         face
+    }
+
+    /// Move an already-loaded face to the back of the LRU order.
+    fn touch_loaded(&mut self, id: fontdb::ID) {
+        if let Some(pos) = self.loaded_order.iter().position(|candidate| *candidate == id) {
+            self.loaded_order.remove(pos);
+            self.loaded_order.push_back(id);
+        }
+    }
+
+    /// Cap the number of retained font faces. Eviction releases the face's
+    /// full font bytes (unless a rasterized glyph elsewhere still holds an
+    /// Arc to it). Any char_cache entry that pointed at an evicted face is
+    /// dropped so the next lookup re-resolves through the full scan.
+    fn enforce_loaded_budget(&mut self) {
+        while self.loaded_order.len() > MAX_LOADED_SYSTEM_FACES {
+            let Some(old_id) = self.loaded_order.pop_front() else {
+                break;
+            };
+            let internal_id = self
+                .loaded
+                .remove(&old_id)
+                .and_then(|face| face.map(|face| face.id));
+            if let Some(internal_id) = internal_id {
+                self.char_cache
+                    .retain(|_, cached| *cached != Some(internal_id));
+            }
+        }
     }
 }
 
@@ -1322,6 +1400,56 @@ impl TextLayoutCacheKey {
     }
 }
 
+/// Bounded text-layout cache. A live danmaku stream generates unbounded
+/// unique line texts; without a cap every distinct line would stay resident
+/// for the whole session. Evicted entries are simply re-laid-out on the next
+/// hit (CPU cost only — the rendered result is identical).
+#[derive(Debug)]
+struct TextLayoutCache {
+    map: HashMap<TextLayoutCacheKey, Arc<PreparedTextLayout>>,
+    order: VecDeque<TextLayoutCacheKey>,
+    capacity: usize,
+}
+
+impl TextLayoutCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: &TextLayoutCacheKey) -> Option<Arc<PreparedTextLayout>> {
+        let hit = self.map.get(key).cloned();
+        if hit.is_some() {
+            self.touch(key);
+        }
+        hit
+    }
+
+    fn insert(&mut self, key: TextLayoutCacheKey, layout: Arc<PreparedTextLayout>) {
+        if let Some(pos) = self.order.iter().position(|candidate| candidate == &key) {
+            self.order.remove(pos);
+        }
+        self.map.insert(key.clone(), layout);
+        self.order.push_back(key);
+        while self.map.len() > self.capacity {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&old);
+        }
+    }
+
+    fn touch(&mut self, key: &TextLayoutCacheKey) {
+        if let Some(pos) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.clone());
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DanmakuTextRasterizer {
     shaper: TextShaper,
@@ -1329,8 +1457,8 @@ pub struct DanmakuTextRasterizer {
     selected_fonts: Arc<[DanmakuFontFace]>,
     selected_before_primary: bool,
     fallback_fonts: Arc<Mutex<SystemFontFallback>>,
-    glyph_cache: Arc<Mutex<HashMap<GlyphCacheKey, Arc<RasterizedGlyph>>>>,
-    text_layout_cache: Arc<Mutex<HashMap<TextLayoutCacheKey, Arc<PreparedTextLayout>>>>,
+    glyph_cache: Arc<Mutex<GlyphCache>>,
+    text_layout_cache: Arc<Mutex<TextLayoutCache>>,
     glyph_atlas: Arc<Mutex<PersistentGlyphAtlas>>,
 }
 
@@ -1348,8 +1476,10 @@ impl DanmakuTextRasterizer {
             selected_fonts: Arc::from([]),
             selected_before_primary: false,
             fallback_fonts: Arc::new(Mutex::new(SystemFontFallback::new(1))),
-            glyph_cache: Arc::new(Mutex::new(HashMap::new())),
-            text_layout_cache: Arc::new(Mutex::new(HashMap::new())),
+            glyph_cache: Arc::new(Mutex::new(GlyphCache::with_capacity(GLYPH_CACHE_CAPACITY))),
+            text_layout_cache: Arc::new(Mutex::new(TextLayoutCache::with_capacity(
+                TEXT_LAYOUT_CACHE_CAPACITY,
+            ))),
             glyph_atlas: Arc::new(Mutex::new(PersistentGlyphAtlas::new())),
         }
     }
@@ -1379,8 +1509,10 @@ impl DanmakuTextRasterizer {
             selected_before_primary: config.custom_font_family.is_empty()
                 && config.custom_font_file_path.is_empty(),
             fallback_fonts: Arc::new(Mutex::new(SystemFontFallback::new(next_font_id))),
-            glyph_cache: Arc::new(Mutex::new(HashMap::new())),
-            text_layout_cache: Arc::new(Mutex::new(HashMap::new())),
+            glyph_cache: Arc::new(Mutex::new(GlyphCache::with_capacity(GLYPH_CACHE_CAPACITY))),
+            text_layout_cache: Arc::new(Mutex::new(TextLayoutCache::with_capacity(
+                TEXT_LAYOUT_CACHE_CAPACITY,
+            ))),
             glyph_atlas: Arc::new(Mutex::new(PersistentGlyphAtlas::new())),
         }
     }
@@ -1446,14 +1578,14 @@ impl DanmakuTextRasterizer {
         metrics: TextMeasure,
     ) -> Arc<PreparedTextLayout> {
         let key = TextLayoutCacheKey::new(text, font_size, outline_width);
-        if let Some(layout) = self
-            .text_layout_cache
-            .lock()
-            .expect("danmaku text layout cache lock")
-            .get(&key)
-            .cloned()
         {
-            return layout;
+            let mut cache = self
+                .text_layout_cache
+                .lock()
+                .expect("danmaku text layout cache lock");
+            if let Some(layout) = cache.get(&key) {
+                return layout;
+            }
         }
         let layout = Arc::new(self.build_text_layout(&key, metrics));
         self.text_layout_cache
@@ -1587,6 +1719,11 @@ impl DanmakuTextRasterizer {
         atlas_h: f32,
         items: &mut Vec<DanmakuGlyphInstance>,
     ) {
+        if item.is_self {
+            // 自发言弹幕：先垫背景框，再画文字。同一 item_id 的字形保持连续
+            //（metal 按 item_id 分组 layering 的假设不变）。
+            self.append_self_background(item, color, atlas_w, atlas_h, items);
+        }
         let baseline = item.y + item.text_layout.metrics.ascent;
         for placement in &item.text_layout.glyphs {
             let glyph = &placement.glyph;
@@ -1617,6 +1754,76 @@ impl DanmakuTextRasterizer {
         }
     }
 
+    /// 自发言弹幕背景框：把整条文字的所有字形包围盒向外扩一点，用 atlas 预留的
+    /// 纯白像素作 fill 纹理源，垫一层深色半透明底（B站自发言弹幕样式）。只走
+    /// fill pass（outline/shadow alpha=0，各后端自动跳过），无需改渲染后端。
+    fn append_self_background(
+        &self,
+        item: &DanmakuPlacedItem,
+        color: [f32; 4],
+        atlas_w: f32,
+        atlas_h: f32,
+        items: &mut Vec<DanmakuGlyphInstance>,
+    ) {
+        let baseline = item.y + item.text_layout.metrics.ascent;
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for placement in &item.text_layout.glyphs {
+            let glyph = &placement.glyph;
+            if !glyph.has_bitmap() {
+                continue;
+            }
+            let x0 = item.x + placement.pen_x + glyph.offset_x;
+            let y0 = baseline + glyph.offset_y;
+            min_x = min_x.min(x0);
+            min_y = min_y.min(y0);
+            max_x = max_x.max(x0 + glyph.width as f32);
+            max_y = max_y.max(y0 + glyph.height as f32);
+        }
+        if min_x > max_x || min_y > max_y {
+            return; // 无有效字形（纯空白等）
+        }
+        let pad = (item.font_size * 0.14).max(2.0);
+        // 白色边界框：比深色底向外扩 border_w。同一 item_id 连续 push → 分组
+        // layering 保持 push 顺序（白框最底、深底中间、字形最上），视觉即
+        // "深色底 + 白色描边框住"（用户要求自发言弹幕白框突出）。只走 fill
+        // pass（outline/shadow alpha=0，各后端自动跳过）。
+        let border_w = (item.font_size * 0.07).max(1.5);
+        let reserve = SELF_BG_ATLAS_RESERVE as f32;
+        let white_alpha = (color[3] * 0.85).clamp(0.5, 0.95);
+        items.push(DanmakuGlyphInstance {
+            item_id: item.item_id,
+            rect: [
+                min_x - pad - border_w,
+                min_y - pad - border_w,
+                (max_x - min_x) + pad * 2.0 + border_w * 2.0,
+                (max_y - min_y) + pad * 2.0 + border_w * 2.0,
+            ],
+            tex_rect: [0.0, 0.0, reserve / atlas_w, 1.0 / atlas_h],
+            color_rgba: [1.0, 1.0, 1.0, white_alpha],
+            outline_rgba: [0.0, 0.0, 0.0, 0.0],
+            shadow_rgba: [0.0, 0.0, 0.0, 0.0],
+            shadow_offset: [0.0, 0.0],
+        });
+        items.push(DanmakuGlyphInstance {
+            item_id: item.item_id,
+            rect: [
+                min_x - pad,
+                min_y - pad,
+                (max_x - min_x) + pad * 2.0,
+                (max_y - min_y) + pad * 2.0,
+            ],
+            tex_rect: [0.0, 0.0, reserve / atlas_w, 1.0 / atlas_h],
+            // 深色半透明底：透明度跟随文字整体透明度，但不随文字颜色变化
+            color_rgba: [0.06, 0.07, 0.09, (color[3] * 0.5).clamp(0.15, 0.6)],
+            outline_rgba: [0.0, 0.0, 0.0, 0.0],
+            shadow_rgba: [0.0, 0.0, 0.0, 0.0],
+            shadow_offset: [0.0, 0.0],
+        });
+    }
+
     fn cached_glyphs<I>(&self, keys: I) -> Vec<Arc<RasterizedGlyph>>
     where
         I: IntoIterator<Item = GlyphCacheKey>,
@@ -1628,9 +1835,9 @@ impl DanmakuTextRasterizer {
         let mut results = Vec::with_capacity(keys.len());
         let mut missing = Vec::new();
         {
-            let cache = self.glyph_cache.lock().expect("danmaku glyph cache lock");
+            let mut cache = self.glyph_cache.lock().expect("danmaku glyph cache lock");
             for key in keys {
-                if let Some(glyph) = cache.get(&key).cloned() {
+                if let Some(glyph) = cache.get(&key) {
                     results.push(glyph);
                 } else {
                     results.push(Arc::new(RasterizedGlyph::placeholder(key)));
@@ -1647,9 +1854,7 @@ impl DanmakuTextRasterizer {
                 .glyph_cache
                 .lock()
                 .expect("danmaku glyph cache lock")
-                .entry(key)
-                .or_insert_with(|| Arc::clone(&glyph))
-                .clone();
+                .get_or_insert(key, glyph);
             results[index] = cached;
         }
         results
@@ -1693,6 +1898,61 @@ impl GlyphCacheKey {
 
     fn font_size(self) -> f32 {
         self.font_size_milli as f32 / 1000.0
+    }
+}
+
+/// Bounded glyph-bitmap cache. Under a fixed danmaku font size this is
+/// naturally bounded by the charset, but dynamic font sizes / atlas resets can
+/// multiply distinct (font × char × size) keys without limit. The cap keeps
+/// it flat; an evicted glyph is re-rasterized on the next hit.
+#[derive(Debug)]
+struct GlyphCache {
+    map: HashMap<GlyphCacheKey, Arc<RasterizedGlyph>>,
+    order: VecDeque<GlyphCacheKey>,
+    capacity: usize,
+}
+
+impl GlyphCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: &GlyphCacheKey) -> Option<Arc<RasterizedGlyph>> {
+        let hit = self.map.get(key).cloned();
+        if hit.is_some() {
+            self.touch(key);
+        }
+        hit
+    }
+
+    /// Insert `glyph` for `key`, or return the existing entry if a concurrent
+    /// rasterizer already inserted one (never overwrites, matching the old
+    /// `entry().or_insert_with` behaviour).
+    fn get_or_insert(&mut self, key: GlyphCacheKey, glyph: Arc<RasterizedGlyph>) -> Arc<RasterizedGlyph> {
+        if let Some(existing) = self.map.get(&key).cloned() {
+            self.touch(&key);
+            return existing;
+        }
+        self.map.insert(key.clone(), glyph.clone());
+        self.order.push_back(key.clone());
+        while self.map.len() > self.capacity {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&old);
+        }
+        glyph
+    }
+
+    fn touch(&mut self, key: &GlyphCacheKey) {
+        if let Some(pos) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.clone());
+        }
     }
 }
 
@@ -1771,11 +2031,12 @@ impl PersistentGlyphAtlas {
         let width = GLYPH_ATLAS_WIDTH;
         let height = GLYPH_ATLAS_INITIAL_HEIGHT;
         let stride = width as usize;
-        Self {
+        let mut atlas = Self {
             width,
             height,
             stride,
-            cursor_x: 0,
+            // 从预留区之后开始排字，纯白像素区永远不被字形覆盖
+            cursor_x: SELF_BG_ATLAS_RESERVE,
             cursor_y: 0,
             row_height: 0,
             fill_alpha: vec![0; stride * height as usize],
@@ -1785,7 +2046,9 @@ impl PersistentGlyphAtlas {
             dirty: true,
             dirty_bounds: None,
             snapshot: None,
-        }
+        };
+        atlas.reserve_self_bg_pixel();
+        atlas
     }
 
     fn pack(&mut self, glyph: &RasterizedGlyph) -> PackedGlyph {
@@ -1836,6 +2099,15 @@ impl PersistentGlyphAtlas {
     }
 
     fn ensure_height(&mut self, required: u32) {
+        if required > GLYPH_ATLAS_MAX_HEIGHT {
+            // A single glyph taller than the cap (extreme font sizes). Restart
+            // the atlas rather than grow past the limit; the glyph is
+            // re-packed on the next call. Consumers always read the current
+            // buffers through the latest snapshot, so this is a re-pack, not a
+            // rendering change.
+            self.reset_atlas();
+            return;
+        }
         if required <= self.height {
             return;
         }
@@ -1846,6 +2118,42 @@ impl PersistentGlyphAtlas {
         self.fill_alpha.resize(new_len, 0);
         self.outline_alpha.resize(new_len, 0);
         self.dirty = true;
+    }
+
+    /// 把 atlas 第 0 行前 `SELF_BG_ATLAS_RESERVE` 列写成纯白（fill=255）并
+    /// 记录进 dirty_bounds，确保增量上传/全量重建都能把这块区域送进 GPU。
+    /// 必须在字形开始排入之前调用（`new` 与 `reset_atlas`）。
+    fn reserve_self_bg_pixel(&mut self) {
+        let n = (SELF_BG_ATLAS_RESERVE as usize).min(self.stride);
+        self.fill_alpha[..n].fill(255);
+        self.outline_alpha[..n].fill(0);
+        self.dirty_bounds = Some(match self.dirty_bounds {
+            Some([l, t, r, b]) => [l.min(0), t.min(0), r.max(SELF_BG_ATLAS_RESERVE), b.max(1)],
+            None => [0, 0, SELF_BG_ATLAS_RESERVE, 1],
+        });
+        self.dirty = true;
+    }
+
+    /// Drop all packed glyphs and reset the buffers to the initial height.
+    /// Called when the atlas would otherwise grow past `GLYPH_ATLAS_MAX_HEIGHT`
+    /// and whenever a fresh rasterizer generation starts, so the atlas memory
+    /// stays bounded for the session.
+    fn reset_atlas(&mut self) {
+        self.height = GLYPH_ATLAS_INITIAL_HEIGHT;
+        let new_len = self.stride * self.height as usize;
+        self.fill_alpha.clear();
+        self.fill_alpha.resize(new_len, 0);
+        self.outline_alpha.clear();
+        self.outline_alpha.resize(new_len, 0);
+        self.cursor_x = SELF_BG_ATLAS_RESERVE;
+        self.cursor_y = 0;
+        self.row_height = 0;
+        self.packed.clear();
+        self.version = self.version.saturating_add(1).max(1);
+        self.dirty = true;
+        self.dirty_bounds = None;
+        self.snapshot = None;
+        self.reserve_self_bg_pixel();
     }
 
     fn snapshot(&mut self) -> Option<Arc<DanmakuGlyphAtlas>> {
@@ -2186,6 +2494,7 @@ fn prepare_layout(
                 scroll_speed: item.scroll_speed as f32,
                 duration: Duration::from_secs_f64(item.duration_seconds.max(0.0)),
                 duplicate_count: item.duplicate_count,
+                is_self: item.is_me,
                 text_layout,
             }
         })
@@ -3200,6 +3509,126 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn text_layout_cache_evicts_least_recently_used() {
+        let mut cache = TextLayoutCache::with_capacity(2);
+        let layout = || {
+            Arc::new(PreparedTextLayout {
+                metrics: TextMeasure {
+                    width: 1.0,
+                    height: 1.0,
+                    ascent: 1.0,
+                    descent: 1.0,
+                },
+                glyphs: Vec::new(),
+            })
+        };
+        let key = |text: &str| TextLayoutCacheKey::new(Arc::<str>::from(text), 24.0, 1.0);
+        cache.insert(key("a"), layout());
+        cache.insert(key("b"), layout());
+        cache.insert(key("c"), layout());
+        // Over capacity: the least-recently-used ("a") is evicted.
+        assert!(cache.get(&key("a")).is_none());
+        assert!(cache.get(&key("b")).is_some());
+        assert!(cache.get(&key("c")).is_some());
+
+        // Touching "b" makes it most-recent; the next insert evicts "c".
+        assert!(cache.get(&key("b")).is_some());
+        cache.insert(key("d"), layout());
+        assert!(cache.get(&key("b")).is_some());
+        assert!(cache.get(&key("c")).is_none());
+        assert!(cache.get(&key("d")).is_some());
+    }
+
+    #[test]
+    fn glyph_cache_evicts_lru_and_get_or_insert_preserves_existing() {
+        let mut cache = GlyphCache::with_capacity(2);
+        let key = |id: u32, ch: char| GlyphCacheKey::new(id, ch, 24.0, 1.0);
+        let glyph = |k: GlyphCacheKey| Arc::new(RasterizedGlyph::empty(k, 1.0));
+        cache.get_or_insert(key(0, 'a'), glyph(key(0, 'a')));
+        cache.get_or_insert(key(0, 'b'), glyph(key(0, 'b')));
+        cache.get_or_insert(key(0, 'c'), glyph(key(0, 'c')));
+        assert!(cache.get(&key(0, 'a')).is_none());
+        assert!(cache.get(&key(0, 'b')).is_some());
+        assert!(cache.get(&key(0, 'c')).is_some());
+
+        // A duplicate insert must keep the existing entry, never overwrite.
+        let replacement = Arc::new(RasterizedGlyph::empty(key(0, 'c'), 99.0));
+        let got = cache.get_or_insert(key(0, 'c'), replacement);
+        assert_eq!(got.advance, 1.0);
+    }
+
+    #[test]
+    fn glyph_atlas_resets_instead_of_growing_past_max_height() {
+        let mut atlas = PersistentGlyphAtlas::new();
+        let key = GlyphCacheKey::new(0, 'a', 24.0, 1.0);
+        let glyph = RasterizedGlyph {
+            key,
+            width: 1,
+            height: 1,
+            stride: 1,
+            fill_alpha: vec![255],
+            outline_alpha: vec![255],
+            offset_x: 0.0,
+            offset_y: 0.0,
+            advance: 1.0,
+        };
+        let packed = atlas.pack(&glyph);
+        assert_eq!(packed, PackedGlyph { x: 0, y: 0, width: 1, height: 1 });
+
+        atlas.ensure_height(GLYPH_ATLAS_MAX_HEIGHT + 1);
+        assert_eq!(atlas.height, GLYPH_ATLAS_INITIAL_HEIGHT);
+        assert!(atlas.packed.is_empty());
+        assert!(atlas.snapshot.is_none());
+        assert!(atlas.dirty);
+
+        let repacked = atlas.pack(&glyph);
+        assert_eq!(repacked, PackedGlyph { x: 0, y: 0, width: 1, height: 1 });
+        assert!(atlas.packed.contains_key(&key));
+    }
+
+    #[test]
+    fn system_font_fallback_evicts_oldest_faces_over_budget() {
+        let font = FontArc::new(
+            FontVec::try_from_vec(NIPAPLAY_FALLBACK_FONT.to_vec()).expect("fallback font parses"),
+        );
+        let mut db = fontdb::Database::new();
+        let ttc = test_ttc();
+        for _ in 0..20 {
+            db.load_font_data(ttc.clone());
+        }
+        let mut db_ids: Vec<fontdb::ID> = db.faces().map(|face| face.id).collect();
+        assert!(db_ids.len() > MAX_LOADED_SYSTEM_FACES);
+        db_ids.truncate(MAX_LOADED_SYSTEM_FACES + 1);
+
+        let mut fb = SystemFontFallback {
+            db,
+            faces: Vec::new(),
+            loaded: HashMap::new(),
+            loaded_order: VecDeque::new(),
+            char_cache: HashMap::new(),
+            next_font_id: 1,
+        };
+        for (index, db_id) in db_ids.iter().copied().enumerate() {
+            fb.loaded
+                .insert(db_id, Some(DanmakuFontFace::new(index as u32 + 1, font.clone())));
+            fb.loaded_order.push_back(db_id);
+        }
+        // char_cache pointing at the evicted (oldest) face is dropped; entries
+        // for surviving faces are kept.
+        fb.char_cache.insert('x', Some(1));
+        fb.char_cache.insert('y', Some(2));
+
+        fb.enforce_loaded_budget();
+
+        assert_eq!(fb.loaded_order.len(), MAX_LOADED_SYSTEM_FACES);
+        assert_eq!(fb.loaded.len(), MAX_LOADED_SYSTEM_FACES);
+        assert!(!fb.loaded.contains_key(&db_ids[0]));
+        assert!(fb.loaded.contains_key(&db_ids[1]));
+        assert!(!fb.char_cache.contains_key(&'x'));
+        assert!(fb.char_cache.contains_key(&'y'));
     }
 
     #[test]
