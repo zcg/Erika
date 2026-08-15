@@ -1301,17 +1301,13 @@ impl PresenterRuntime {
     }
 
     pub fn select_subtitle_track(&mut self, track_id: Option<i64>) -> Result<()> {
-        let quiesced = self.quiesce_frame_output("select_subtitle_track")?;
+        // 字幕轨切换与音视频渲染管线无关：字幕是独立 demuxer + 独立渲染帧
+        // （pump_subtitles 从 worker channel 收帧显示）。切字幕只改轨道选择，
+        // 不走音轨切换那套重型过渡（quiesce 帧输出 + 重启音频设备 + transition
+        // 屏障）——那会让视频停顿一下、音频设备重启，表现"切字幕时卡一下"。
         let result = self.player.select_subtitle_track(track_id);
-        self.reset_audio_output();
         self.bump_danmaku_generation();
-        self.clear_playback_visual_state(
-            self.current_media_time,
-            TransitionFramePolicy::PreserveTrackSwitchFrame,
-        );
-        let transition =
-            self.finish_frame_output_transition("select_subtitle_track", quiesced, true);
-        result.and(transition)
+        result
     }
 
     pub fn tracks(&self) -> Vec<TrackInfo> {

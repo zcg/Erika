@@ -67,17 +67,43 @@ pub struct SourceDiagSnapshot {
     pub downloaded_bytes: u64,
 }
 
-static SOURCE_DIAG: Mutex<SourceDiagSnapshot> = Mutex::new(SourceDiagSnapshot {
-    content_length: None,
-    cache_start: 0,
-    cache_end: 0,
-    prefetch_in_flight: 0,
-    downloaded_bytes: 0,
-});
+/// 诊断槽数。DASH 双流（video + audio）各占一槽独立发布/清空，互不覆盖；
+/// 单流/直播只用槽 0。见 `HttpRangeSource::with_http_headers_and_diag_slot`。
+const SOURCE_DIAG_SLOTS: usize = 2;
 
-/// 读取当前 `HttpRangeSource` 诊断快照（宿主轮询用；无播放时为零值/上次残留）。
+static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new([
+    SourceDiagSnapshot {
+        content_length: None,
+        cache_start: 0,
+        cache_end: 0,
+        prefetch_in_flight: 0,
+        downloaded_bytes: 0,
+    },
+    SourceDiagSnapshot {
+        content_length: None,
+        cache_start: 0,
+        cache_end: 0,
+        prefetch_in_flight: 0,
+        downloaded_bytes: 0,
+    },
+]);
+
+/// 读取当前 `HttpRangeSource` 诊断快照（宿主轮询用；无播放时返回零值/上次刷新）。
+/// 兼容旧单槽语义：返回槽 0（主流/单流/直播）。
 pub fn source_diag_snapshot() -> SourceDiagSnapshot {
-    SOURCE_DIAG.lock().unwrap().clone()
+    source_diag_snapshot_slot(0)
+}
+
+/// 读取指定槽位的诊断快照。DASH 双流约定 video=0、audio=1，
+/// 各源独立发布/清空，宿主据此分别显示两条流的缓冲状态。
+/// 槽位越界或无对应源时返回零值。
+pub fn source_diag_snapshot_slot(slot: usize) -> SourceDiagSnapshot {
+    SOURCE_DIAG
+        .lock()
+        .unwrap()
+        .get(slot)
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub trait MediaSource: Send {
@@ -386,9 +412,31 @@ pub struct HttpRangeSource {
     agent: ureq::Agent,
     http_headers: Vec<(String, String)>,
     content_length: Option<u64>,
+    /// 诊断槽位：DASH 双流时 video=0 / audio=1，各源独立发布/清空诊断
+    /// 快照互不覆盖（单流/直播默认 0）。
+    diag_slot: usize,
+    /// 缓存窗口起点（cache_bytes[0] 对应的字节 offset）。顺序播放推进时
+    /// 保留已读数据末尾 back_bytes 作为后向缓冲，起点随之后移——因此这个
+    /// 起点可能小于"当前播放位置"。
     cache_start: u64,
     cache_bytes: Vec<u8>,
+    /// 后向缓冲上限（mpv `--demuxer-max-back-bytes` 等价）：窗口重设时保留
+    /// 已读数据末尾这一段，seek 回退到该范围命中缓存不重新下载。默认 4MB
+    /// （对齐 PiliPlus/mpv 默认）。seek 回退超过该范围仍重新拉流。
+    back_bytes: u64,
     read_ahead_bytes: u64,
+    /// 本源的并行预取上限。DASH 音频流（码率 ~40KB/s）由宿主传 2，
+    /// 避免与视频流抢带宽；视频/单流默认 8（`MAX_PREFETCH_IN_FLIGHT`）。
+    max_prefetch_in_flight: usize,
+    /// 实测下载带宽估算（EMA，字节/秒）。所有同步 fetch 完成与预取段被
+    /// 消费时累加字节，按 2s 窗口差分更新。驱动段大小/join 超时/read_ahead
+    /// 自适应——固定参数在总带宽 <~400KB/s 时预取段必超时（一顿一顿），
+    /// 自适应后任何带宽下预取机制都成立。0 表示冷启动（未测得数据）。
+    est_bps: f64,
+    /// 带宽估算窗口起点。跨窗口差分：窗口内所有完成段（含并行段）的字节
+    /// 都累计进 `est_window_bytes`，因此并行下载的叠加吞吐被正确计入。
+    last_est_at: Instant,
+    est_window_bytes: u64,
     /// 多段并行预取队列。窗口重设（cache_start/cache_bytes 变更）时清空，
     /// `maybe_start_prefetch` 按需从 cache_end 向后填充多段 in-flight 下载。
     prefetch: Vec<PendingHttpFetch>,
@@ -417,38 +465,136 @@ struct HttpRangeResponse {
 
 impl HttpRangeSource {
     const DEFAULT_READ_AHEAD_BYTES: u64 = 2 * 1024 * 1024;
+    /// 后向缓冲默认大小（对齐 mpv `--demuxer-max-back-bytes` 默认 4MB，
+    /// 与 PiliPlus `Pref.bufferSize` 默认一致）。可用环境变量
+    /// `ERIKA_HTTP_BACK_BYTES` 覆盖。
+    const DEFAULT_BACK_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
     /// 并行预取的最大 in-flight 段数。多连接叠加带宽：单连接（B站 CDN）
     /// 吞吐约 1-3MB/s 且波动，read_range 在 demux 线程同步阻塞——缓存耗尽
     /// 即冻结播放（一顿一顿）。多段并行让总吞吐翻数倍，缓存窗口内永远有数据。
-    const MAX_PREFETCH_IN_FLIGHT: usize = 3;
-    /// 窗口外 seek 的目标预取用 2MB 小段：seek 后 demux 从目标前关键帧起读，
-    /// `read_range` 会 join 覆盖该次读取的段。小段 join 快（2MB/单连接约 1 秒），
-    /// 大段（read_ahead/MAX，约 10.6MB）要等 10 秒级——seek 是一次性动作，
-    /// 不需要大缓冲，后续顺序读取由 `maybe_start_prefetch` 用大段接管。
-    const SEEK_PREFETCH_SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
+    /// 5 段 → 8 段：慢网（总带宽 ~1MB/s，均摊每段 ~125KB/s）时 256KB 小段约
+    /// 2s 完成，显著小于 join 超时（5s），预取段不再被超时放弃——慢网下
+    /// 预取机制依然成立，窗口持续大步扩张（对齐 PiliPlus 激进预缓冲）。
+    const MAX_PREFETCH_IN_FLIGHT: usize = 8;
+    /// 顺序预取/窗口外 seek 的目标预取统一用小段 256KB：慢网络（实测
+    /// ~1MB/s 级，均摊到 N 段后单段吞吐更低）下大段（2MB+）join 必超时 →
+    /// read 放弃预取段走同步 fetch → 缓存窗口退化成同步小步拉取（一顿一顿
+    /// 的根因）。256KB 段在总带宽 ≥0.5MB/s 时单段完成时间显著小于 join
+    /// 超时（5s），多段滚动叠加带宽后总吞吐远超播放消费，窗口持续向前大步
+    /// 缓冲（对齐 PiliPlus：看一点、缓冲一大截）。段小也让 seek 后目标段
+    /// 更快就绪（256KB ≈ 慢网 1-2s）。
+    const SEEK_PREFETCH_SEGMENT_BYTES: u64 = 256 * 1024;
     /// 预取段 join 上限。超过即放弃该段（read_range 走同步小范围 fetch 兜底），
     /// 防止慢段无限阻塞 demux 线程（日志实测 seek 后 join 11MB 段卡 28.9s）。
-    /// 同步兜底只取当前读取所需（≤1MB），比等 10MB 级慢段快得多。
-    const PREFETCH_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+    /// 同步兜底只取当前读取所需（≤256KB），比等 10MB 级慢段快得多。
+    /// 5s：256KB 段在 ≥0.5MB/s 的总带宽下均可在超时内完成，慢网不被误杀。
+    const PREFETCH_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+    /// 自适应段大小下限：带宽极低（<~100KB/s）时 32KB 段（8 段整窗 256KB）
+    /// 约 2.5s 完成，仍在 join 超时内；再小 HTTP 请求开销占比失控。
+    const MIN_PREFETCH_SEGMENT_BYTES: u64 = 32 * 1024;
+    /// 带宽估算差分窗口：每 2s 用窗口内累计下载字节更新一次 EMA。
+    /// 太短（<1s）会被单次请求的突发抖动带偏；太长响应迟缓。
+    const BANDWIDTH_ESTIMATE_WINDOW: Duration = Duration::from_secs(2);
 
     pub fn new(uri: impl Into<String>) -> Self {
         Self::with_http_headers(uri, Vec::new())
     }
 
     pub fn with_http_headers(uri: impl Into<String>, http_headers: Vec<(String, String)>) -> Self {
+        Self::with_http_headers_and_diag_slot(uri, http_headers, 0)
+    }
+
+    /// 指定诊断槽位构造（视频 0 / 音频 1）。单流/直播默认槽 0；
+    /// 双流宿主要通过 `source_from_uri_with_hint_and_headers_slot` 创建。
+    pub fn with_http_headers_and_diag_slot(
+        uri: impl Into<String>,
+        http_headers: Vec<(String, String)>,
+        diag_slot: usize,
+    ) -> Self {
+        Self::with_http_headers_and_diag_slot_limits(
+            uri,
+            http_headers,
+            diag_slot,
+            Self::MAX_PREFETCH_IN_FLIGHT,
+        )
+    }
+
+    /// 同 `with_http_headers_and_diag_slot`，但可指定并行预取上限
+    /// （DASH 音频源传小值避免与视频抢带宽）。
+    pub fn with_http_headers_and_diag_slot_limits(
+        uri: impl Into<String>,
+        http_headers: Vec<(String, String)>,
+        diag_slot: usize,
+        max_prefetch_in_flight: usize,
+    ) -> Self {
         let agent = http_agent();
         Self {
             uri: uri.into(),
             agent,
             http_headers,
             content_length: None,
+            diag_slot,
             cache_start: 0,
             cache_bytes: Vec::new(),
+            back_bytes: http_back_bytes(),
             read_ahead_bytes: http_read_ahead_bytes(),
+            max_prefetch_in_flight: max_prefetch_in_flight.max(1),
+            est_bps: 0.0,
+            last_est_at: Instant::now(),
+            est_window_bytes: 0,
             prefetch: Vec::new(),
             prefetch_target: None,
             downloaded_bytes: 0,
         }
+    }
+
+    /// 累计已下载字节进带宽估算窗口；跨 2s 差分做 EMA 更新。
+    /// 同步 fetch 与预取段消费两处都调用——窗口内并行段全部计入，
+    /// 估算反映多连接叠加后的真实总吞吐。
+    fn record_downloaded(&mut self, bytes: u64) {
+        self.est_window_bytes = self.est_window_bytes.saturating_add(bytes);
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_est_at);
+        if elapsed >= Self::BANDWIDTH_ESTIMATE_WINDOW {
+            let inst_bps = self.est_window_bytes as f64 / elapsed.as_secs_f64();
+            self.est_bps = if self.est_bps <= 0.0 {
+                inst_bps
+            } else {
+                self.est_bps * 0.7 + inst_bps * 0.3
+            };
+            self.est_window_bytes = 0;
+            self.last_est_at = now;
+        }
+    }
+
+    /// 自适应预取段大小：目标整窗（段数 × 段大小）约 3s 完成（join 超时
+    /// 5s 内留余量）。带宽低自动缩段——固定 256KB 在总带宽 <~400KB/s 时
+    /// 8 段均摊单段完成 >5s，预取段被 join 超时放弃、退化为同步 fetch
+    /// （一顿一顿的根因）。下限 32KB 防 HTTP 开销占比失控；冷启动
+    /// （带宽未知）保持 256KB 原行为。
+    fn prefetch_segment_bytes(&self) -> u64 {
+        if self.est_bps <= 0.0 {
+            return Self::SEEK_PREFETCH_SEGMENT_BYTES;
+        }
+        let n = self.max_prefetch_in_flight.max(1) as f64;
+        let seg = self.est_bps * 3.0 / n;
+        seg.clamp(
+            Self::MIN_PREFETCH_SEGMENT_BYTES as f64,
+            Self::SEEK_PREFETCH_SEGMENT_BYTES as f64,
+        ) as u64
+    }
+
+    /// 自适应 join 超时：`max(5s, 整窗完成时间 × 1.5)`。段大小已按带宽
+    /// 缩放，此值只在带宽估算低于实际（段比预期慢）时兜底放宽，避免
+    /// 慢段被误杀后同步 fetch 反而更卡。
+    fn prefetch_join_timeout(&self) -> Duration {
+        if self.est_bps <= 0.0 {
+            return Self::PREFETCH_JOIN_TIMEOUT;
+        }
+        let n = self.max_prefetch_in_flight.max(1) as f64;
+        let seg = self.prefetch_segment_bytes() as f64;
+        let needed = seg * n / self.est_bps * 1.5;
+        Self::PREFETCH_JOIN_TIMEOUT.max(Duration::from_secs_f64(needed))
     }
 
     fn cache_end(&self) -> u64 {
@@ -456,15 +602,20 @@ impl HttpRangeSource {
             .saturating_add(self.cache_bytes.len() as u64)
     }
 
-    /// 把当前网络/缓冲状态发布到全局诊断槽（宿主 UI 轮询读取）。
+    /// 把当前网络/缓冲状态发布到自己的诊断槽（宿主 UI 轮询读取）。
+    /// DASH 双流（video=0/audio=1）各发布各的，互不覆盖。
     fn publish_diag(&self) {
-        *SOURCE_DIAG.lock().unwrap() = SourceDiagSnapshot {
-            content_length: self.content_length,
-            cache_start: self.cache_start,
-            cache_end: self.cache_end(),
-            prefetch_in_flight: self.prefetch.len(),
-            downloaded_bytes: self.downloaded_bytes,
-        };
+        if let Ok(mut slots) = SOURCE_DIAG.lock() {
+            if let Some(slot) = slots.get_mut(self.diag_slot) {
+                *slot = SourceDiagSnapshot {
+                    content_length: self.content_length,
+                    cache_start: self.cache_start,
+                    cache_end: self.cache_end(),
+                    prefetch_in_flight: self.prefetch.len(),
+                    downloaded_bytes: self.downloaded_bytes,
+                };
+            }
+        }
     }
 
     fn cached_slice(&self, range: ByteRange) -> Option<Vec<u8>> {
@@ -502,7 +653,9 @@ impl HttpRangeSource {
         if self.content_length.is_none() {
             self.content_length = response.total_length;
         }
-        self.downloaded_bytes = self.downloaded_bytes.saturating_add(response.bytes.len() as u64);
+        let n = response.bytes.len() as u64;
+        self.downloaded_bytes = self.downloaded_bytes.saturating_add(n);
+        self.record_downloaded(n);
         self.publish_diag();
         Ok(response.bytes)
     }
@@ -511,11 +664,12 @@ impl HttpRangeSource {
         let requested_length = range.length.unwrap_or(0);
         Ok(match range.length {
             Some(length) => {
-                // 同步请求（demux 正在等数据）用 1MB 小段：读多段（64KB 的
-                // demux 粒度）会让网络往返频繁拖慢；直接用 read_ahead 全量
-                // （如 32MB）会让 open 等首次大段下载完（实测 24 秒）。
-                // 持续预取由 maybe_start_prefetch 用 read_ahead 全量负责。
-                let mut length = length.max(1024 * 1024);
+                // 同步请求（demux 正在等数据）用小段：读多段（64KB 的
+                // demux 粒度）会让网络往返频繁拖慢；更大的段（如 1MB）在慢网
+                // （实测 ~1MB/s 及以下）下同步阻塞达到 1s+，播放冻结时间过长。
+                // 段大小按实测带宽自适应（慢网自动缩段），配合常驻并行预取
+                // 窗口平滑覆盖。持续大步预取由 maybe_start_prefetch 的常驻段负责。
+                let mut length = length.max(self.prefetch_segment_bytes());
                 if let Some(total) = self.content_length.or_else(|| self.len().ok().flatten()) {
                     if range.start >= total {
                         return Ok(Some(0));
@@ -558,9 +712,11 @@ impl HttpRangeSource {
         // 带超时 join：慢段会卡死 demux 线程。超过上限放弃该段（后台线程
         // 继续下载、结果丢弃），返回 None 让 read_range 走同步小范围 fetch
         // 兜底——同步只取当前读取所需（≤1MB），比等 10MB 级慢段快得多。
+        // 超时按实测带宽自适应：慢网下段大小已同步缩小，整窗可在超时内
+        // 完成，正常情况不触发放弃（避免退化同步 fetch 的"一顿一顿"）。
         let result = match pending
             .receiver
-            .recv_timeout(Self::PREFETCH_JOIN_TIMEOUT)
+            .recv_timeout(self.prefetch_join_timeout())
         {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -594,8 +750,9 @@ impl HttpRangeSource {
             if self.content_length.is_none() {
                 self.content_length = response.total_length;
             }
-            self.downloaded_bytes =
-                self.downloaded_bytes.saturating_add(response.bytes.len() as u64);
+            let n = response.bytes.len() as u64;
+            self.downloaded_bytes = self.downloaded_bytes.saturating_add(n);
+            self.record_downloaded(n);
             self.publish_diag();
             (start, response.bytes)
         }))
@@ -604,11 +761,53 @@ impl HttpRangeSource {
     /// 重设缓存窗口。保留窗口末尾之后仍在下载的预取段（顺序读取时它们是
     /// 未来数据——无脑清空会浪费在飞下载，每次消费一段就丢两段进度）；
     /// 清掉与新窗口重叠的作废段（seek 跳走后旧位置段无用了）。
+    ///
+    /// **后向缓冲**（mpv `--demuxer-max-back-bytes` 等价）：新数据起点严格落在
+    /// 旧窗口内（`start > cache_start`，即顺序续读或窗口内回退读）时，保留旧
+    /// 窗口紧邻 `start` 的已读数据（至多 `back_bytes`）拼到新数据前 → 窗口
+    /// 起点 `cache_start` 回退到 `start - back_bytes`，seek 回退到该范围命中
+    /// 缓存不重新下载。`start == cache_start`（同区域重读，如 prefetch 短读
+    /// 后同步补拉同一段）不保留——旧数据与新数据同起点，保留会数据重复。
+    /// 回退超过该范围（或向前跳到窗口外）则丢弃旧数据、从 `start` 全新建窗。
     fn reset_cache(&mut self, start: u64, bytes: Vec<u8>) {
         let new_end = start.saturating_add(bytes.len() as u64);
+        let old_start = self.cache_start;
+        let old_bytes = self.cache_bytes.len() as u64;
         self.prefetch.retain(|p| p.range.start >= new_end);
+        if self.back_bytes > 0 && start > self.cache_start && start <= self.cache_end() {
+            let old_len = self.cache_bytes.len();
+            if old_len > 0 {
+                let keep_from = start.saturating_sub(self.back_bytes).max(old_start);
+                let keep_begin = usize::try_from(keep_from - old_start).unwrap_or(0);
+                if keep_begin < old_len {
+                    let mut merged = self.cache_bytes[keep_begin..].to_vec();
+                    merged.extend_from_slice(&bytes);
+                    self.cache_start = keep_from;
+                    self.cache_bytes = merged;
+                    http_trace_log(format!(
+                        "{{\"event\":\"http_cache_reset\",\"mode\":\"keep_back\",\"req_start\":{},\"new_start\":{},\"new_end\":{},\"old_start\":{},\"old_bytes\":{},\"keep_from\":{}}}",
+                        start,
+                        self.cache_start,
+                        self.cache_end(),
+                        old_start,
+                        old_bytes,
+                        keep_from,
+                    ));
+                    self.publish_diag();
+                    return;
+                }
+            }
+        }
         self.cache_start = start;
         self.cache_bytes = bytes;
+        http_trace_log(format!(
+            "{{\"event\":\"http_cache_reset\",\"mode\":\"fresh\",\"req_start\":{},\"new_start\":{},\"new_end\":{},\"old_start\":{},\"old_bytes\":{}}}",
+            start,
+            self.cache_start,
+            self.cache_end(),
+            old_start,
+            old_bytes,
+        ));
         self.publish_diag();
     }
 
@@ -630,14 +829,29 @@ impl HttpRangeSource {
             return;
         }
         let remaining = cache_end.saturating_sub(end);
-        if remaining > self.read_ahead_bytes / 2 {
-            return;
-        }
-        // 多连接并行：把 cache_end 后方 read_ahead 窗口拆成多段同时下载。
+        // 激进预缓冲：只要还有存量数据即在飞满额并行预取，始终把 cache_end
+        // 后方的 read_ahead 窗口铺满 parallel 段（对齐 PiliPlus：播放中持续
+        // 大步向前缓冲）。不设"剩余 > 半窗才停"的门限——那会导致慢网下
+        // 半窗未到预取团无法启动，且窗口被消费后才补段，预取永远落后。
+        // spawn_prefetch_window 内部以 MAX_PREFETCH_IN_FLIGHT 为限自然停滞
+        // （段已铺满时不重复发起），这里每次缓存命中后检查即可。
+        // 多连接并行：把 cache_end 后方 read_ahead 窗口拆成小段同时下载。
         // 单连接吞吐（B站 CDN 约 1-3MB/s）波动时，一段跟不上就缓存耗尽 →
         // demux 线程同步阻塞 → 一顿一顿。N 段并行让总吞吐翻数倍。
-        let seg_len =
-            (self.read_ahead_bytes / Self::MAX_PREFETCH_IN_FLIGHT as u64).max(256 * 1024);
+        // **段大小固定 256KB**（与 seek 预取同款）：慢网络（总带宽 ~1MB/s、
+        // 均摊每段 ~125KB/s）下 2MB 大段 3s+ 必超时、预取段被放弃 → read
+        // 退化同步 fetch、窗口卡 1MB。256KB 段均摊下约 2s 完成（<5s join
+        // 超时），多段滚动叠加带宽，总吞吐持续远超播放消费。
+        let seg_len = self.prefetch_segment_bytes();
+        if self.prefetch.len() < self.max_prefetch_in_flight {
+            http_trace_log(format!(
+                "{{\"event\":\"http_prefetch_fill\",\"cause\":\"remaining_low\",\"cache_end\":{},\"remaining\":{},\"read_ahead\":{},\"in_flight\":{}}}",
+                cache_end,
+                remaining,
+                self.read_ahead_bytes,
+                self.prefetch.len(),
+            ));
+        }
         self.spawn_prefetch_window(cache_end, seg_len);
     }
 
@@ -653,7 +867,7 @@ impl HttpRangeSource {
         }
         let target_end = from.saturating_add(self.read_ahead_bytes).min(total);
         let mut next_start = from;
-        while next_start < target_end && self.prefetch.len() < Self::MAX_PREFETCH_IN_FLIGHT {
+        while next_start < target_end && self.prefetch.len() < self.max_prefetch_in_flight {
             // 跳过已被 in-flight 段覆盖的区间，避免重复下载同一段。任何与
             // 窗口重叠的段都参与（无论其起点在窗口内还是窗外）：`prefetch`
             // 里只可能有两种——顺序预取从 cache_end 起、seek 预取从目标前起，
@@ -702,20 +916,37 @@ impl HttpRangeSource {
         let cache_end = self.cache_end();
         // 目标仍在已缓存窗口内（含向前留一个小段给 BACKWARD 关键帧），无需预取。
         if target < cache_end.saturating_add(Self::SEEK_PREFETCH_SEGMENT_BYTES) {
+            http_trace_log(format!(
+                "{{\"event\":\"http_prefetch_hint\",\"decision\":\"in_cache\",\"target\":{},\"cache_end\":{}}}",
+                target,
+                cache_end,
+            ));
             return;
         }
         // 防抖：`av_seek_frame` 内部可能对相近位置多次 seek，同一窗口不重复预取。
         if let Some(prev) = self.prefetch_target {
             if target < prev.saturating_add(Self::SEEK_PREFETCH_SEGMENT_BYTES) {
+                http_trace_log(format!(
+                    "{{\"event\":\"http_prefetch_hint\",\"decision\":\"debounced\",\"target\":{},\"prev\":{}}}",
+                    target,
+                    prev,
+                ));
                 return;
             }
         }
         self.prefetch_target = Some(target);
         // seek 跳走：旧窗口的顺序预取段作废。in-flight 线程独立运行，drop
         // 只丢弃结果（避免无谓的 join 等待），带宽浪费可接受。
+        let discarded = self.prefetch.len();
         self.prefetch.clear();
-        let from = target.saturating_sub(Self::SEEK_PREFETCH_SEGMENT_BYTES);
-        self.spawn_prefetch_window(from, Self::SEEK_PREFETCH_SEGMENT_BYTES);
+        let from = target.saturating_sub(self.prefetch_segment_bytes());
+        http_trace_log(format!(
+            "{{\"event\":\"http_prefetch_hint\",\"decision\":\"spawn\",\"target\":{},\"from\":{},\"discarded_in_flight\":{}}}",
+            target,
+            from,
+            discarded,
+        ));
+        self.spawn_prefetch_window(from, self.prefetch_segment_bytes());
     }
 }
 
@@ -757,8 +988,13 @@ impl PendingHttpFetch {
 
 impl Drop for HttpRangeSource {
     fn drop(&mut self) {
-        // source 销毁（播放停止/换源）→ 清空诊断，宿主读到零值即"无播放"。
-        *SOURCE_DIAG.lock().unwrap() = SourceDiagSnapshot::default();
+        // source 销毁（播放停止/换源）→ 清空**自己的**诊断槽，宿主读到
+        // 零值即"该流无播放"。只清本槽：DASH 双流另一条流的诊断不受影响。
+        if let Ok(mut slots) = SOURCE_DIAG.lock() {
+            if let Some(slot) = slots.get_mut(self.diag_slot) {
+                *slot = SourceDiagSnapshot::default();
+            }
+        }
     }
 }
 
@@ -791,7 +1027,8 @@ impl HttpLiveStreamSource {
     const MAX_READ_BYTES: usize = 256 * 1024;
 
     pub fn open(uri: &str, http_headers: Vec<(String, String)>) -> Result<Self> {
-        let agent = http_agent();
+        // 直播专用 agent（无 recv_response/recv_body 总时长超时，见 http_live_agent）
+        let agent = http_live_agent();
         let mut request = agent.get(uri);
         for (name, value) in &http_headers {
             request = request.header(name, value);
@@ -833,13 +1070,17 @@ impl HttpLiveStreamSource {
     }
 
     fn publish_diag(&self) {
-        *SOURCE_DIAG.lock().unwrap() = SourceDiagSnapshot {
-            content_length: None,
-            cache_start: 0,
-            cache_end: self.offset,
-            prefetch_in_flight: 0,
-            downloaded_bytes: self.downloaded_bytes,
-        };
+        if let Ok(mut slots) = SOURCE_DIAG.lock() {
+            if let Some(slot) = slots.get_mut(0) {
+                *slot = SourceDiagSnapshot {
+                    content_length: None,
+                    cache_start: 0,
+                    cache_end: self.offset,
+                    prefetch_in_flight: 0,
+                    downloaded_bytes: self.downloaded_bytes,
+                };
+            }
+        }
     }
 }
 
@@ -907,8 +1148,12 @@ impl MediaSource for HttpLiveStreamSource {
 
 impl Drop for HttpLiveStreamSource {
     fn drop(&mut self) {
-        // source 销毁（播放停止/换源）→ 清空诊断。
-        *SOURCE_DIAG.lock().unwrap() = SourceDiagSnapshot::default();
+        // 直播流用槽 0；销毁时清空自己的诊断槽。
+        if let Ok(mut slots) = SOURCE_DIAG.lock() {
+            if let Some(slot) = slots.get_mut(0) {
+                *slot = SourceDiagSnapshot::default();
+            }
+        }
     }
 }
 
@@ -924,6 +1169,25 @@ fn http_agent() -> ureq::Agent {
         .timeout_connect(Some(Duration::from_secs(4)))
         .timeout_recv_response(Some(Duration::from_secs(15)))
         .timeout_recv_body(Some(Duration::from_secs(60)))
+        .tls_config(tls)
+        .build()
+        .into()
+}
+
+/// 直播流专用 HTTP agent。**不能复用 `http_agent()`**：ureq 3.x 的
+/// `timeout_recv_response`/`timeout_recv_body` 是**自响应头起算的总时长**
+/// deadline（`next_timeout(RecvBody)` 同时检查 RecvResponse 的剩余时间并取
+/// 更早者），直播流是无限长 body，读取超过 15s 后每次读都立即超时 →
+/// 直播必在播放约 15s 后断流（"播着播着就自动重连"的根因，与网络无关）。
+/// 直播源只保留连接超时（慢源快速失败）；body 读取无总时长限制，交由
+/// demuxer/播放层消费。CDN 主动断开（FIN/RST）时读返回 EOF/错误 → 宿主
+/// 断流检测触发自动重连（新 URL 换源）。
+fn http_live_agent() -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .disable_verification(true)
+        .build();
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(4)))
         .tls_config(tls)
         .build()
         .into()
@@ -1534,15 +1798,48 @@ pub fn source_from_uri_with_hint_and_headers(
     source_hint: MediaSourceHint,
     http_headers: Vec<(String, String)>,
 ) -> Result<Box<dyn MediaSource>> {
+    source_from_uri_with_hint_and_headers_slot(uri, source_hint, http_headers, 0)
+}
+
+/// 同 `source_from_uri_with_hint_and_headers`，但指定诊断槽位
+/// （DASH 双流：video=0 / audio=1，各源独立发布/清空诊断互不覆盖）。
+pub(crate) fn source_from_uri_with_hint_and_headers_slot(
+    uri: &str,
+    source_hint: MediaSourceHint,
+    http_headers: Vec<(String, String)>,
+    diag_slot: usize,
+) -> Result<Box<dyn MediaSource>> {
+    source_from_uri_with_hint_and_headers_slot_limits(
+        uri,
+        source_hint,
+        http_headers,
+        diag_slot,
+        HttpRangeSource::MAX_PREFETCH_IN_FLIGHT,
+    )
+}
+
+/// 同 `source_from_uri_with_hint_and_headers_slot`，但可指定并行预取上限。
+/// DASH 音频源传小值（如 2）：音频码率低，满额并发只与视频流抢带宽。
+pub(crate) fn source_from_uri_with_hint_and_headers_slot_limits(
+    uri: &str,
+    source_hint: MediaSourceHint,
+    http_headers: Vec<(String, String)>,
+    diag_slot: usize,
+    max_prefetch_in_flight: usize,
+) -> Result<Box<dyn MediaSource>> {
     match source_hint {
         MediaSourceHint::Auto => source_from_auto_uri(uri, http_headers),
         MediaSourceHint::LocalFile => source_from_local_uri(uri),
         MediaSourceHint::Http => {
             if uri.starts_with("http://") || uri.starts_with("https://") {
-                Ok(Box::new(HttpRangeSource::with_http_headers(
-                    uri,
-                    http_headers,
-                )))
+                Ok(Box::new(
+                    HttpRangeSource::with_http_headers_and_diag_slot_limits(
+                        uri,
+                        http_headers,
+                        diag_slot,
+                        max_prefetch_in_flight,
+                    ),
+                ))
             } else {
                 Err(SourceError::Unsupported(uri.to_string()))
             }
@@ -1620,6 +1917,13 @@ fn http_read_ahead_bytes() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(HttpRangeSource::DEFAULT_READ_AHEAD_BYTES)
+}
+
+fn http_back_bytes() -> u64 {
+    env::var("ERIKA_HTTP_BACK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(HttpRangeSource::DEFAULT_BACK_BUFFER_BYTES)
 }
 
 fn http_trace_log(line: impl AsRef<str>) {
@@ -1881,6 +2185,83 @@ mod tests {
         assert_eq!(HttpRangeSource::DEFAULT_READ_AHEAD_BYTES, 2 * 1024 * 1024);
     }
 
+    // ---- 带宽自适应（弱网修复）：段大小 / join 超时 / 估算器 ----
+
+    #[test]
+    fn prefetch_segment_bytes_scales_with_estimated_bandwidth() {
+        let mut source = HttpRangeSource::new("https://example.invalid/video.m4s");
+        // 冷启动（带宽未知）：保持 256KB 原行为
+        assert_eq!(
+            source.prefetch_segment_bytes(),
+            HttpRangeSource::SEEK_PREFETCH_SEGMENT_BYTES
+        );
+        // 高带宽（1MB/s，8 段并行）：1MB/s × 3s / 8 = 384KB → 封顶 256KB
+        source.est_bps = 1024.0 * 1024.0;
+        assert_eq!(source.prefetch_segment_bytes(), 256 * 1024);
+        // 中带宽（300KB/s）：300KB/s × 3s / 8 ≈ 112KB——低于 256KB 自动缩段
+        //（固定 256KB 在 <~400KB/s 时 8 段均摊会超 join 超时 → 退化同步 fetch）
+        source.est_bps = 300.0 * 1024.0;
+        assert!(source.prefetch_segment_bytes() < 256 * 1024);
+        assert_eq!(
+            source.prefetch_segment_bytes(),
+            (300.0 * 1024.0 * 3.0 / 8.0) as u64
+        );
+        // 极低带宽（50KB/s）：缩到下限 32KB（再小 HTTP 开销占比失控）
+        source.est_bps = 50.0 * 1024.0;
+        assert_eq!(
+            source.prefetch_segment_bytes(),
+            HttpRangeSource::MIN_PREFETCH_SEGMENT_BYTES
+        );
+        // 音频源并发上限 2：同等带宽下段更大（每段带宽份额更高，更快完成）
+        source.est_bps = 100.0 * 1024.0;
+        source.max_prefetch_in_flight = 2;
+        assert_eq!(
+            source.prefetch_segment_bytes(),
+            (100.0 * 1024.0 * 3.0 / 2.0) as u64
+        );
+    }
+
+    #[test]
+    fn prefetch_join_timeout_widens_when_bandwidth_is_low() {
+        let mut source = HttpRangeSource::new("https://example.invalid/video.m4s");
+        // 冷启动：5s 原行为
+        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(5));
+        // 300KB/s：整窗完成 ≈112KB×8/300KB/s ≈ 3s，×1.5 = 4.5s < 5s → 保持 5s
+        source.est_bps = 300.0 * 1024.0;
+        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(5));
+        // 50KB/s：32KB 段整窗 32×8/50 = 5.12s，×1.5 = 7.7s → 放宽到 ~7.7s
+        //（避免慢段被 5s 超时误杀后退化同步 fetch）
+        source.est_bps = 50.0 * 1024.0;
+        let widened = source.prefetch_join_timeout();
+        assert!(widened > Duration::from_secs(5));
+        assert_eq!(widened.as_secs_f64(), 32.0 * 1024.0 * 8.0 / (50.0 * 1024.0) * 1.5);
+    }
+
+    #[test]
+    fn bandwidth_estimator_accumulates_parallel_segments_and_emphasizes() {
+        let mut source = HttpRangeSource::new("https://example.invalid/video.m4s");
+        // 窗口内累计 8 段（并行段叠加吞吐计入同一差分窗口；elapsed<2s 只累计不更新）
+        for _ in 0..8 {
+            source.record_downloaded(32 * 1024);
+        }
+        // 拨回窗口起点 → 触发差分：约 256KB / 2s ≈ 128KB/s（冷启动直接采用）
+        source.last_est_at = Instant::now() - Duration::from_secs(2);
+        source.record_downloaded(1);
+        assert!((source.est_bps - 128.0 * 1024.0).abs() < 2.0);
+        // 第二次采样：8×64KB / 2s ≈ 256KB/s → EMA 0.7/0.3 平滑
+        for _ in 0..8 {
+            source.record_downloaded(64 * 1024);
+        }
+        source.last_est_at = Instant::now() - Duration::from_secs(2);
+        source.record_downloaded(1);
+        let expected = 128.0 * 1024.0 * 0.7 + 256.0 * 1024.0 * 0.3;
+        assert!((source.est_bps - expected).abs() < 2.0);
+        // 窗口未到期（<2s）不重算：追加字节只累计不更新
+        let before = source.est_bps;
+        source.record_downloaded(1024 * 1024);
+        assert_eq!(source.est_bps, before);
+    }
+
     #[test]
     fn http_source_constructor_preserves_custom_headers() {
         let source = HttpRangeSource::with_http_headers(
@@ -2075,10 +2456,38 @@ mod tests {
                 128 * 1024 * 1024,
                 &body,
             )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 3 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 4 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 5 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 6 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 7 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
         ]);
         let mut source = HttpRangeSource::new(uri);
         source.content_length = Some(128 * 1024 * 1024);
-        source.read_ahead_bytes = 2 * 1024 * 1024;
+        // 段大小固定 256KB（SEEK_PREFETCH_SEGMENT_BYTES），read_ahead 需大于段大小
+        // 才能拆出多段并行。12MB 窗口 / 256KB 段 → 48 段（到 MAX_PREFETCH_IN_FLIGHT
+        // 上限 8）。mock server 必须同配 8 个响应连接——每个 in-flight 段占一个。
+        source.read_ahead_bytes = 12 * 1024 * 1024;
         source.cache_start = 0;
         source.cache_bytes = vec![0u8; 1024 * 1024];
         // 请求末端 == 缓存末尾（remaining=0）→ 立即触发多段并行预取
@@ -2098,7 +2507,7 @@ mod tests {
             start = p.range_end();
         }
         assert!(start <= source.cache_end() + source.read_ahead_bytes);
-        // 三个后台请求均已发出（互不阻塞、并行发起）
+        // 全部后台请求均已发出（互不阻塞、并行发起）
         for _ in 0..HttpRangeSource::MAX_PREFETCH_IN_FLIGHT {
             let _ = recv_request_head(&requests);
         }
@@ -2121,10 +2530,39 @@ mod tests {
                 128 * 1024 * 1024,
                 &body,
             )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 3 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 4 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 5 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 6 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 7 * 698 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
         ]);
         let mut source = HttpRangeSource::new(uri);
         source.content_length = Some(128 * 1024 * 1024);
-        source.read_ahead_bytes = 2 * 1024 * 1024;
+        // 12MB read_ahead / 256KB 段 → 48 段（上限 8 并行，见 prefetch_fills 注释）；
+        // mock server 同配 8 个响应连接。
+        source.read_ahead_bytes = 12 * 1024 * 1024;
+        // 本测试只验证预取段保留语义：禁用后向缓冲，窗口起点保持新数据起点
+        source.back_bytes = 0;
         source.cache_start = 0;
         source.cache_bytes = vec![0u8; 1024 * 1024];
         let range = ByteRange {
@@ -2151,6 +2589,91 @@ mod tests {
         for _ in 0..HttpRangeSource::MAX_PREFETCH_IN_FLIGHT {
             let _ = recv_request_head(&requests);
         }
+    }
+
+    #[test]
+    fn rewind_seek_hits_back_buffer_without_redownload() {
+        // 后向缓冲：顺序播放推进后 seek 回退到后向区（mpv demuxer-max-back-bytes
+        // 等价），命中缓存不重新下载。两次顺序读后窗口含后向区，回退读无网络请求。
+        let body: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(0, 512, &body)),
+            MockResponse::immediate(http_206_response(256, 512, &body)),
+        ]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(512);
+        source.back_bytes = 512;
+        // 首次下载 [0, 256)
+        let first = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(256),
+            })
+            .unwrap();
+        assert_eq!(first, body);
+        // 顺序续读 [256, 512)：reset_cache 保留 [0, 256) 后向区，窗口 [0, 512)
+        let second = source
+            .read_range(ByteRange {
+                start: 256,
+                length: Some(256),
+            })
+            .unwrap();
+        assert_eq!(second, body);
+        assert_eq!(source.cache_start, 0);
+        assert_eq!(source.cache_bytes.len(), 512);
+        let _ = recv_request_head(&requests);
+        let _ = recv_request_head(&requests);
+        // seek 回 [0, 128)：命中后向缓冲 → 无新的网络请求
+        let rewind = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(128),
+            })
+            .unwrap();
+        assert_eq!(rewind, body[..128]);
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn reset_cache_drops_back_buffer_when_rewind_exceeds_cap() {
+        // 后向缓冲上限：回退超过 back_bytes 时旧数据整体丢弃、从目标全新建窗
+        //（与 mpv demuxer-max-back-bytes 一致，超范围 seek 重新拉流）。
+        let body: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(0, 1024, &body)),
+            MockResponse::immediate(http_206_response(256, 1024, &body)),
+            MockResponse::immediate(http_206_response(0, 1024, &body)),
+        ]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(1024);
+        source.back_bytes = 128; // 后向上限小于回退距离
+        let _ = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(256),
+            })
+            .unwrap();
+        let _ = source
+            .read_range(ByteRange {
+                start: 256,
+                length: Some(256),
+            })
+            .unwrap();
+        // 后向上限 128：窗口起点回退到 256-128=128，保留 [128,256) 的 128B
+        assert_eq!(source.cache_start, 128);
+        assert_eq!(source.cache_bytes.len(), 128 + 256);
+        let _ = recv_request_head(&requests);
+        let _ = recv_request_head(&requests);
+        // seek 回 [0, 64)：超出后向区（窗口起点在 128）→ 重新下载
+        let _ = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(64),
+            })
+            .unwrap();
+        assert_eq!(source.cache_start, 0);
+        let _ = recv_request_head(&requests); // 第三次网络请求发生
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
     #[test]
@@ -2360,3 +2883,4 @@ mod tests {
         );
     }
 }
+

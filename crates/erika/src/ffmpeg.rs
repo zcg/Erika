@@ -96,6 +96,21 @@ impl FfmpegError {
         matches!(self, Self::Api { code, .. } if *code == av_error(EINVAL))
     }
 
+    /// `avcodec_send_packet` 返回的 `AVERROR_INVALIDDATA`（`FFERRTAG('I','N','D','A')`
+    /// = -1094995529）。表示当前**数据包损坏/不完整**（慢网下下载截断、seek 后
+    /// 非关键帧数据等），**不是致命错误**——标准做法是丢弃该包、等待下一个关键帧
+    /// 重同步后继续，而不是终止整个播放会话。
+    ///
+    /// 注意：不等于 `EINVAL`（-22）。音频 seek 容错原本只匹配 `is_invalid_argument`
+    /// （EINVAL），导致真实坏包（INVALIDDATA）永远走 fatal → 慢网/seek 下反复
+    /// `playback_fatal` 崩溃循环（日志实测 156 次连续 video_tick Invalid data）。
+    pub fn is_invalid_data(&self) -> bool {
+        matches!(
+            self,
+            Self::Api { code, .. } if *code == av_error(-1_095_495_529)
+        )
+    }
+
     #[cfg(target_os = "android")]
     pub(crate) fn is_android_mediacodec_backpressure(&self) -> bool {
         matches!(self, Self::AndroidMediaCodecBackpressure(_))

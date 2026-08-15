@@ -2179,6 +2179,21 @@ fn update_buffering_from_worker(
                 tracker.last_video_frame_at = Some(now);
                 tracker.last_audio_underflow_frames =
                     audio_snapshot.map(|snapshot| snapshot.underflow_frames);
+                // 缓冲恢复诊断（状态跳变，低频）：恢复参考点与时钟来源。
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "playback_buffering",
+                        "stage": "resume",
+                        "referenceSeconds": reference.as_secs_f64(),
+                        "clock": match source {
+                            PlaybackClockSource::Audio => "audio",
+                            PlaybackClockSource::Wall => "wall",
+                            _ => "other",
+                        },
+                        "audioQueuedFrames": audio_snapshot.map(|s| s.queued_frames),
+                    })
+                    .to_string(),
+                );
                 return Some(false);
             }
         }
@@ -2214,6 +2229,25 @@ fn update_buffering_from_worker(
             tracker.active = true;
             tracker.last_audio_underflow_frames =
                 audio_snapshot.map(|snapshot| snapshot.underflow_frames);
+            // 缓冲起点诊断（状态跳变，低频）：成因 + 双流队列水位。
+            // 慢网/VOD 卡顿排查时据此区分"网络供给不足"与"解码/时钟问题"。
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "playback_buffering",
+                    "stage": "begin",
+                    "cause": if waiting_for_first_frame {
+                        "waiting_for_first_frame"
+                    } else if audio_starved {
+                        "audio_starved"
+                    } else {
+                        "video_starved"
+                    },
+                    "mediaSeconds": engine.media_time().as_secs_f64(),
+                    "audioQueuedFrames": audio_snapshot.map(|s| s.queued_frames),
+                    "audioUnderflowFrames": audio_snapshot.map(|s| s.underflow_frames),
+                })
+                .to_string(),
+            );
             return Some(true);
         }
     } else {

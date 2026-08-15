@@ -1248,6 +1248,15 @@ fn build_freetype(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
         .arg("-DFT_DISABLE_PNG=TRUE")
         .arg("-DFT_DISABLE_HARFBUZZ=TRUE")
         .arg("-DFT_DISABLE_BROTLI=TRUE");
+    if options.target.is_windows() {
+        // 静态 CRT，避免 __imp_* dllimport 符号与 rustc MSVC 静态 libucrt 冲突。
+        // 仅设 C_FLAGS=/MT 不够：CMake 默认 CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+        // 会在编译命令末尾追加 /MD（后出现者生效），两者并存时 /MD 胜出、dllimport
+        // 依旧。必须显式设为 MultiThreaded 抑制该自动追加。
+        configure
+            .arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
+            .arg("-DCMAKE_C_FLAGS=/MT");
+    }
     apply_cmake_target(&mut configure, options.target)?;
     run(&mut configure)?;
     cmake_build_install(&layout.freetype_build_dir, options.jobs, options.target)?;
@@ -1303,7 +1312,17 @@ fn build_harfbuzz(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
     if options.target.is_windows() {
         configure
             .arg("-DHB_HAVE_CORETEXT=OFF")
-            .arg("-DHB_HAVE_DIRECTWRITE=ON");
+            .arg("-DHB_HAVE_DIRECTWRITE=ON")
+            // 静态 CRT，避免 __imp_* dllimport 符号与 rustc MSVC 静态 libucrt 冲突。
+            // 同上：CMAKE_MSVC_RUNTIME_LIBRARY 必须设为 MultiThreaded，否则 CMake
+            // 在 C_FLAGS/CXX_FLAGS 的 /MT 之后追加 /MD，dllimport 依旧存在。
+            // 另需 CMAKE_POLICY_VERSION_MINIMUM>=3.15：harfbuzz 的
+            // cmake_minimum_required(3.14) 会把 CMP0091（3.15 引入）固定为 OLD，
+            // 导致上面的 MSVC_RUNTIME_LIBRARY 变量被忽略、仍追加 /MD。
+            .arg("-DCMAKE_POLICY_VERSION_MINIMUM=3.15")
+            .arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
+            .arg("-DCMAKE_C_FLAGS=/MT")
+            .arg("-DCMAKE_CXX_FLAGS=/MT");
     } else if options.target.is_apple() {
         configure
             .arg("-DHB_HAVE_CORETEXT=ON")
@@ -1360,6 +1379,10 @@ fn build_fribidi(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("--buildtype=release")
         .arg("-Ddocs=false")
         .arg("-Dtests=false");
+    if options.target.is_windows() {
+        // 静态 CRT，避免 __imp_* dllimport 符号与 rustc MSVC 静态 libucrt 冲突。
+        setup.arg("-Dc_args=/MT");
+    }
     apply_meson_target(&mut setup, layout, options.target, "fribidi")?;
     apply_windows_target_env(&mut setup, options.target)?;
     run(&mut setup)?;
@@ -1453,7 +1476,12 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     if options.target.is_windows() {
         setup
             .arg("-Dcoretext=disabled")
-            .arg("-Ddirectwrite=enabled");
+            .arg("-Ddirectwrite=enabled")
+            // rustc MSVC 目标链接静态 libucrt（ffmpeg 等其余依赖亦为静态
+            // CRT）。libass 若按默认 /MD 编译会引用 __imp_* dllimport 符号，
+            // 与静态 libucrt 冲突且缺导入库；统一 /MT 静态 CRT 保持一致。
+            .arg("-Dc_args=/MT")
+            .arg("-Dcpp_args=/MT");
     } else if options.target.is_apple() {
         setup
             .arg("-Dcoretext=enabled")

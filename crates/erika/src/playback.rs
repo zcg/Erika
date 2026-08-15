@@ -17,7 +17,10 @@ use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
     Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat, StreamSelection, SubtitleDecoder,
 };
-use crate::source::{self, source_from_uri_with_hint, source_from_uri_with_hint_and_headers};
+use crate::source::{
+    self, source_from_uri_with_hint, source_from_uri_with_hint_and_headers,
+    source_from_uri_with_hint_and_headers_slot_limits,
+};
 use crate::subtitle::{
     DecodedSubtitleFrame, SubtitleFontAttachment, SubtitleTrackConfig, SubtitleTrackSource,
 };
@@ -53,6 +56,16 @@ pub enum PlaybackError {
 
 pub type Result<T> = std::result::Result<T, PlaybackError>;
 
+impl PlaybackError {
+    /// `AVERROR_INVALIDDATA`（`FFERRTAG('I','N','D','A')`，-1094995529）表示
+    /// 数据包损坏/不完整（慢网下载截断、seek 后非关键帧数据等）。转发自
+    /// `FfmpegError::is_invalid_data`——视频解码路径据此丢弃坏包 + 等关键帧
+    /// 重同步，而非 fatal（避免慢网下播放崩溃循环）。
+    pub fn is_invalid_data(&self) -> bool {
+        matches!(self, Self::Ffmpeg(e) if e.is_invalid_data())
+    }
+}
+
 const DEFAULT_VIDEO_FRAME_QUEUE_LIMIT: usize = 8;
 const DEFAULT_AUDIO_FRAME_QUEUE_LIMIT: usize = 16;
 /// Ceiling on decoded audio frames a *video* demux request may accumulate
@@ -78,9 +91,16 @@ const SEEK_PREROLL_LOG_INTERVAL: Duration = Duration::from_millis(500);
 const VIDEO_PUMP_PACKET_BUDGET: usize = 64;
 const VIDEO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(5);
 const AUDIO_SEEK_INVALID_PACKET_LIMIT: usize = 64;
+/// 正常播放中连续跳过的音频坏包上限。慢网下偶发坏包跳过即可；连续超限说明
+/// 音频数据源已严重损坏（非偶发），交回 fatal 避免无限吞包。
+const AUDIO_PLAYBACK_INVALID_PACKET_LIMIT: usize = 32;
 const DECODER_EOF_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const DECODER_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const AUDIO_EOF_OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// DASH 音频源并行预取上限。音频码率低（~40KB/s），满额 8 段只与视频流
+/// 抢带宽（慢网下 16 连接均摊，视频预取更慢、更易超时退化）；2 段足够
+/// 维持音频供给，把连接留给视频流。
+const AUDIO_PREFETCH_IN_FLIGHT: usize = 2;
 /// 预载（preload）消费预算：与视频 pump 一致，一次 tick 的合理工作量。
 /// worker 每轮 tick 调用一次，按此限额分片消费，避免单轮阻塞过久。
 const PRELOAD_PACKET_BUDGET: usize = 64;
@@ -701,6 +721,11 @@ pub struct PlaybackSession {
     video_fallback_waiting_for_keyframe: bool,
     audio_seek_waiting_for_valid_packet: bool,
     audio_seek_dropped_packets: usize,
+    /// 正常播放中连续跳过的音频坏包数（`AVERROR_INVALIDDATA`）。慢网下载截断
+    /// 会产生孤立坏包，音频帧独立性强、丢一帧无感——跳过而非 fatal（否则
+    /// 一次坏包就杀死整个播放会话 → 宿主换源 → 又遇坏包 → 崩溃循环）。
+    /// 超过上限说明数据源已严重损坏，交回 fatal。成功解码一个包即清零。
+    audio_invalid_packets: usize,
     mediacodec_surface_disabled: bool,
     video_decoder_fallbacks: u64,
     video_decoder_events: VecDeque<VideoDecoderEvent>,
@@ -814,12 +839,17 @@ impl PlaybackSession {
         ));
         // DASH 双流：请求带 audio_uri 时独立打开音频源，由 Demuxer 合并
         // 成统一时间轴（video 全局 stream 0，audio 全局 stream 1）。
+        // 音频源用诊断槽 1：与视频槽 0 分离，宿主可分别观察两条流的缓冲。
+        // 音频源并发预取上限 2：音频码率低（~40KB/s），满额 8 段并行只与
+        // 视频流抢带宽（慢网下 16 连接均摊，视频预取更慢），2 段足够维持。
         let mut demuxer = match request.audio_uri.as_deref() {
             Some(audio_uri) => {
-                let audio_source = source_from_uri_with_hint_and_headers(
+                let audio_source = source_from_uri_with_hint_and_headers_slot_limits(
                     audio_uri,
                     request.source_hint,
                     request.http_headers.clone(),
+                    1,
+                    AUDIO_PREFETCH_IN_FLIGHT,
                 )?;
                 trace::log(format!(
                     "[erika-open-trace] stage=source_audio_created uri={audio_uri}"
@@ -1180,6 +1210,7 @@ impl PlaybackSession {
             video_fallback_waiting_for_keyframe: false,
             audio_seek_waiting_for_valid_packet: false,
             audio_seek_dropped_packets: 0,
+            audio_invalid_packets: 0,
             mediacodec_surface_disabled,
             video_decoder_fallbacks,
             video_decoder_events,
@@ -2138,13 +2169,14 @@ impl PlaybackSession {
                 }
                 self.audio_seek_waiting_for_valid_packet = false;
                 self.audio_seek_dropped_packets = 0;
+                self.audio_invalid_packets = 0;
                 self.drain_audio_frames()?;
                 Ok(())
             }
             Err(error)
                 if self.audio_seek_waiting_for_valid_packet
                     && self.audio_seek_dropped_packets < AUDIO_SEEK_INVALID_PACKET_LIMIT
-                    && error.is_invalid_argument() =>
+                    && (error.is_invalid_argument() || error.is_invalid_data()) =>
             {
                 self.audio_seek_dropped_packets = self.audio_seek_dropped_packets.saturating_add(1);
                 trace::diagnostic(
@@ -2154,6 +2186,32 @@ impl PlaybackSession {
                         "stream": packet.stream_index(),
                         "droppedPackets": self.audio_seek_dropped_packets,
                         "dropLimit": AUDIO_SEEK_INVALID_PACKET_LIMIT,
+                        "packetPtsSeconds": packet.pts().map(ffmpeg::PacketTimestamp::seconds),
+                        "packetDtsSeconds": packet.dts().map(ffmpeg::PacketTimestamp::seconds),
+                        "packetDurationSeconds": packet.duration_seconds(),
+                        "packetBytes": packet.size(),
+                        "reason": error.to_string(),
+                    })
+                    .to_string(),
+                );
+                Ok(())
+            }
+            // 非 seek 场景的音频坏包（慢网下载截断产生孤立坏包）：跳过 + 计数，
+            // 上限内不 fatal。原实现直接 Err → playback_fatal → 宿主换源 → 又遇
+            // 坏包 → 崩溃循环（日志实测多次 audio_tick Invalid data 后换源耗尽）。
+            // 音频帧独立性强，丢一帧无感，远比终止整个播放会话好。
+            Err(error)
+                if error.is_invalid_data()
+                    && self.audio_invalid_packets < AUDIO_PLAYBACK_INVALID_PACKET_LIMIT =>
+            {
+                self.audio_invalid_packets = self.audio_invalid_packets.saturating_add(1);
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "audio_decoder_recovery",
+                        "stage": "playback_invalid_packet_dropped",
+                        "stream": packet.stream_index(),
+                        "droppedPackets": self.audio_invalid_packets,
+                        "dropLimit": AUDIO_PLAYBACK_INVALID_PACKET_LIMIT,
                         "packetPtsSeconds": packet.pts().map(ffmpeg::PacketTimestamp::seconds),
                         "packetDtsSeconds": packet.dts().map(ffmpeg::PacketTimestamp::seconds),
                         "packetDurationSeconds": packet.duration_seconds(),
@@ -2412,8 +2470,53 @@ impl PlaybackSession {
                     }
                 }
             }
+            Err(error) if error.is_invalid_data() => {
+                // 坏包（慢网截断/seek 后损坏）：丢弃 + 等关键帧重同步，不 fatal。
+                // 原实现直接 Err → 播放崩溃循环（见 skip_invalid_video_packet 注释）。
+                let reason = error.to_string();
+                let skipped = self.skip_invalid_video_packet(&packet, reason)?;
+                Ok(self.video_frames.len() > before_frames || skipped)
+            }
             Err(error) => Err(error),
         }
+    }
+
+    /// 视频解码遇坏包（`AVERROR_INVALIDDATA`）时的容错：丢弃当前包、进入"等
+    /// 下一个关键帧"状态（`video_fallback_waiting_for_keyframe` 复用现有重同步
+    /// 机制），而非 fatal。慢网下下载截断/seek 后非关键帧数据都会触发 Invalid
+    /// data——原实现直接 `Err` → `playback_fatal` → 宿主换源 → 又遇同一段坏
+    /// 数据 → 反复崩溃循环（日志实测 156 次连续 video_tick Invalid data）。
+    /// 坏包一次性的：跳过它 + 等关键帧即可恢复，不必终止整个播放会话。
+    fn skip_invalid_video_packet(&mut self, packet: &ffmpeg::Packet, reason: String) -> Result<bool> {
+        if self.video_fallback_waiting_for_keyframe {
+            // 已在等关键帧：继续丢非关键帧包
+            return Ok(packet.is_key());
+        }
+        if packet.is_key() {
+            // 坏包本身是关键帧：只能重试发送（可能解码器状态已乱，重试失败则
+            // 交回上层处理——关键帧都损坏属于数据严重损坏，fatal 合理）。
+            return self
+                .route_video_packet_with_active_decoder(packet, self.active_video_frame_queue_limit())
+                .map(|_| false);
+        }
+        trace::diagnostic(
+            serde_json::json!({
+                "event": "video_decoder_recovery",
+                "stage": "invalid_packet_dropped_waiting_for_keyframe",
+                "backend": self
+                    .active_video_decoder_backend()
+                    .map(|b| b.as_str())
+                    .unwrap_or("unknown"),
+                "stream": packet.stream_index(),
+                "packetPtsSeconds": packet.pts().map(ffmpeg::PacketTimestamp::seconds),
+                "packetDtsSeconds": packet.dts().map(ffmpeg::PacketTimestamp::seconds),
+                "packetBytes": packet.size(),
+                "reason": reason,
+            })
+            .to_string(),
+        );
+        self.video_fallback_waiting_for_keyframe = true;
+        Ok(false)
     }
 
     fn route_video_packet_with_active_decoder(
@@ -4009,7 +4112,11 @@ impl VideoPlaybackEngine {
         }
         let media_time = self.media_time_at(now());
         let frame = self.session.select_subtitle_track(track_id, media_time)?;
-        self.reset_streams_at_with_decoder_flush(media_time, true, false, now)?;
+        // 字幕轨是独立 demuxer（ExternalSubtitleSession 自带 seek + pump 定位），
+        // 切换只改"选中哪条轨"，与音视频解码管线无关。这里不做
+        // reset_streams_at_with_decoder_flush——那会 seek 整个 demuxer + flush
+        // 音频解码器 + 丢弃待渲染帧 + 重置时钟进入"等首帧"，表现为切换字幕时
+        // 视频停顿一下、声音中断，而非"有去无痕"地换字幕。
         Ok(frame.map(|frame| TimedSubtitleFrame {
             frame,
             pts: Some(media_time),
