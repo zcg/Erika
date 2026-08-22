@@ -53,7 +53,7 @@ impl ByteRange {
 /// 复用 Erika 现有的进程级诊断先例（`trace`）。宿主用它渲染"流诊断
 /// 浮窗"——显示缓存窗口覆盖到哪里、还有多少段在下载、累计下载量
 /// （差分得实时速度），从而判断"为什么卡"（网络慢 / 窗口外 seek 等预取）。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SourceDiagSnapshot {
     /// 媒体总长度（字节），HEAD/Content-Range 得到；未知为 None。
     pub content_length: Option<u64>,
@@ -65,6 +65,11 @@ pub struct SourceDiagSnapshot {
     pub prefetch_in_flight: usize,
     /// 累计已下载字节（同步 fetch + 已消费预取段；用于差分下载速度）。
     pub downloaded_bytes: u64,
+    /// 源内带宽估算（字节/秒，2s 滑动 EMA）。基于每次 fetch 完成的字节
+    /// 累加差分，与宿主 poll 时机无关——宿主轮询差分在慢网下（一段
+    /// 2s+ 才完成一次 publish）大部分采样为 0，ABR/诊断会误判"无供给"
+    /// 而永不降档（弱网死扛高画质 → 周期饥饿卡顿）。
+    pub est_bps: f64,
 }
 
 /// 诊断槽数。DASH 双流（video + audio）各占一槽独立发布/清空，互不覆盖；
@@ -78,6 +83,7 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
         cache_end: 0,
         prefetch_in_flight: 0,
         downloaded_bytes: 0,
+        est_bps: 0.0,
     },
     SourceDiagSnapshot {
         content_length: None,
@@ -85,6 +91,7 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
         cache_end: 0,
         prefetch_in_flight: 0,
         downloaded_bytes: 0,
+        est_bps: 0.0,
     },
 ]);
 
@@ -567,34 +574,52 @@ impl HttpRangeSource {
         }
     }
 
-    /// 自适应预取段大小：目标整窗（段数 × 段大小）约 3s 完成（join 超时
-    /// 5s 内留余量）。带宽低自动缩段——固定 256KB 在总带宽 <~400KB/s 时
-    /// 8 段均摊单段完成 >5s，预取段被 join 超时放弃、退化为同步 fetch
-    /// （一顿一顿的根因）。下限 32KB 防 HTTP 开销占比失控；冷启动
+    /// 自适应预取段大小：目标单段（顺序预取 = 1 段在途）约 3s 完成
+    /// （join 超时 5s 内留余量）。带宽低自动缩段——固定 256KB 在总带宽
+    /// <~85KB/s 时单段完成 >3s；下限 32KB 防 HTTP 开销占比失控；冷启动
     /// （带宽未知）保持 256KB 原行为。
     fn prefetch_segment_bytes(&self) -> u64 {
         if self.est_bps <= 0.0 {
             return Self::SEEK_PREFETCH_SEGMENT_BYTES;
         }
-        let n = self.max_prefetch_in_flight.max(1) as f64;
-        let seg = self.est_bps * 3.0 / n;
+        let seg = self.est_bps * 3.0;
         seg.clamp(
             Self::MIN_PREFETCH_SEGMENT_BYTES as f64,
             Self::SEEK_PREFETCH_SEGMENT_BYTES as f64,
         ) as u64
     }
 
-    /// 自适应 join 超时：`max(5s, 整窗完成时间 × 1.5)`。段大小已按带宽
+    /// 自适应 join 超时：`max(5s, 单段完成时间 × 1.5)`。段大小已按带宽
     /// 缩放，此值只在带宽估算低于实际（段比预期慢）时兜底放宽，避免
     /// 慢段被误杀后同步 fetch 反而更卡。
     fn prefetch_join_timeout(&self) -> Duration {
         if self.est_bps <= 0.0 {
             return Self::PREFETCH_JOIN_TIMEOUT;
         }
-        let n = self.max_prefetch_in_flight.max(1) as f64;
         let seg = self.prefetch_segment_bytes() as f64;
-        let needed = seg * n / self.est_bps * 1.5;
+        let needed = seg / self.est_bps * 1.5;
         Self::PREFETCH_JOIN_TIMEOUT.max(Duration::from_secs_f64(needed))
+    }
+
+    /// 从窗口取 `[range.start, range.start + requested)` 的字节。
+    ///
+    /// **不能直接用 `cache_bytes[..n]`**：`reset_cache` 可能走 keep_back 分支把
+    /// `cache_start` 回退到 `keep_from(< range.start)`（保留已读后向缓冲），此时
+    /// 窗口前缀是旧数据、`cache_bytes[0]` 对应文件 `cache_start` 而非
+    /// `range.start` —— 直接取前缀会把窗口开头的旧字节当成本次请求的数据，
+    /// 造成 64KB 级错位（慢网 + 顺序预取下实测：读 393216 返回文件 0 处的
+    /// ftyp，avcodec Invalid data 坏包的根因）。
+    fn window_slice(&self, range: ByteRange, requested_length: u64) -> Option<Vec<u8>> {
+        if range.start < self.cache_start {
+            return None;
+        }
+        let offset = usize::try_from(range.start - self.cache_start).ok()?;
+        if offset >= self.cache_bytes.len() {
+            return Some(Vec::new());
+        }
+        let n =
+            usize::try_from(requested_length).unwrap_or(0).min(self.cache_bytes.len() - offset);
+        Some(self.cache_bytes[offset..offset + n].to_vec())
     }
 
     fn cache_end(&self) -> u64 {
@@ -613,6 +638,7 @@ impl HttpRangeSource {
                     cache_end: self.cache_end(),
                     prefetch_in_flight: self.prefetch.len(),
                     downloaded_bytes: self.downloaded_bytes,
+                    est_bps: self.est_bps,
                 };
             }
         }
@@ -766,6 +792,14 @@ impl HttpRangeSource {
     /// 缓存不重新下载。`start == cache_start`（同区域重读，如 prefetch 短读
     /// 后同步补拉同一段）不保留——旧数据与新数据同起点，保留会数据重复。
     /// 回退超过该范围（或向前跳到窗口外）则丢弃旧数据、从 `start` 全新建窗。
+    ///
+    /// **旧窗口只保留到 `start` 为止**：`bytes` 的起点恒等于 `start`（调用方
+    /// 保证：同步 fetch 从 `range.start` 起、prefetch 段从 `prefetch_start` 起、
+    /// prefix 拼接从 `range.start` 起）。若保留到旧窗口终点（`cache_end`），
+    /// 而 `start` 落在窗口内（cached_prefix 部分命中场景：读 `[400381, 64KB]`
+    /// 时窗口 `[0, X)`、`X` 在请求中途），旧窗口的 `[start..X)` 与新数据的
+    /// 起始部分完全重复 → 窗口内容从 `start` 起错位（实测：残留坏包的数据
+    /// 是文件 `start` 处的旧字节，错位 `X - start`）。
     fn reset_cache(&mut self, start: u64, bytes: Vec<u8>) {
         let new_end = start.saturating_add(bytes.len() as u64);
         let old_start = self.cache_start;
@@ -776,19 +810,29 @@ impl HttpRangeSource {
             if old_len > 0 {
                 let keep_from = start.saturating_sub(self.back_bytes).max(old_start);
                 let keep_begin = usize::try_from(keep_from - old_start).unwrap_or(0);
-                if keep_begin < old_len {
-                    let mut merged = self.cache_bytes[keep_begin..].to_vec();
+                // 旧窗口只保留到新数据起点 `start`（见函数注释：保留更多会重复）
+                let keep_end =
+                    usize::try_from(start - old_start).unwrap_or(0).min(old_len);
+                if keep_begin < keep_end {
+                    let mut merged = self.cache_bytes[keep_begin..keep_end].to_vec();
                     merged.extend_from_slice(&bytes);
                     self.cache_start = keep_from;
                     self.cache_bytes = merged;
                     http_trace_log(format!(
-                        "{{\"event\":\"http_cache_reset\",\"mode\":\"keep_back\",\"req_start\":{},\"new_start\":{},\"new_end\":{},\"old_start\":{},\"old_bytes\":{},\"keep_from\":{}}}",
+                        "{{\"event\":\"http_cache_reset\",\"mode\":\"keep_back\",\"req_start\":{},\"new_start\":{},\"new_end\":{},\"old_start\":{},\"old_bytes\":{},\"keep_from\":{},\"keep_end\":{},\"head\":\"{}\"}}",
                         start,
                         self.cache_start,
                         self.cache_end(),
                         old_start,
                         old_bytes,
                         keep_from,
+                        keep_end,
+                        self.cache_bytes
+                            .iter()
+                            .take(8)
+                            .map(|b| format!("{b:02X}"))
+                            .collect::<Vec<_>>()
+                            .join(""),
                     ));
                     self.publish_diag();
                     return;
@@ -798,12 +842,18 @@ impl HttpRangeSource {
         self.cache_start = start;
         self.cache_bytes = bytes;
         http_trace_log(format!(
-            "{{\"event\":\"http_cache_reset\",\"mode\":\"fresh\",\"req_start\":{},\"new_start\":{},\"new_end\":{},\"old_start\":{},\"old_bytes\":{}}}",
+            "{{\"event\":\"http_cache_reset\",\"mode\":\"fresh\",\"req_start\":{},\"new_start\":{},\"new_end\":{},\"old_start\":{},\"old_bytes\":{},\"head\":\"{}\"}}",
             start,
             self.cache_start,
             self.cache_end(),
             old_start,
             old_bytes,
+            self.cache_bytes
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(""),
         ));
         self.publish_diag();
     }
@@ -840,7 +890,7 @@ impl HttpRangeSource {
         // 退化同步 fetch、窗口卡 1MB。256KB 段均摊下约 2s 完成（<5s join
         // 超时），多段滚动叠加带宽，总吞吐持续远超播放消费。
         let seg_len = self.prefetch_segment_bytes();
-        if self.prefetch.len() < self.max_prefetch_in_flight {
+        if self.prefetch.is_empty() {
             http_trace_log(format!(
                 "{{\"event\":\"http_prefetch_fill\",\"cause\":\"remaining_low\",\"cache_end\":{},\"remaining\":{},\"read_ahead\":{},\"in_flight\":{}}}",
                 cache_end,
@@ -852,52 +902,51 @@ impl HttpRangeSource {
         self.spawn_prefetch_window(cache_end, seg_len);
     }
 
-    /// 从指定字节位置起把 read_ahead 窗口拆成多段并行下载。顺序预取
-    /// （`maybe_start_prefetch`）与窗口外 seek 预取（`prefetch_hint`）共用，
-    /// 避免两处维护重复的分段/去重逻辑。
+    /// 从指定字节位置起预取**一段**（顺序预取，PiliPlus mpv cache 式：
+    /// 播一段预取一段）。顺序预取（`maybe_start_prefetch`）与窗口外 seek
+    /// 预取（`prefetch_hint`）共用。
+    ///
+    /// **只发一段、任何时刻至多 1 个在途段**（`!self.prefetch.is_empty()`
+    /// 即返回）：多段并行拼接（8 段 × 32KB）在慢网/CDN 并发下实测出现
+    /// 数据错位（avcodec Invalid data 坏包的根因——HTTP 双流 demux 与
+    /// 本地文件在相同偏移读到不同字节，时序相关：同代码同用例有时
+    /// 0 错误有时 30 坏包）。顺序单段下载数据天然连续，杜绝拼接错位；
+    /// 带宽不足由自适应段大小（`prefetch_segment_bytes`，32KB~256KB）
+    /// 兜底，段消费后自动补下一段。
     fn spawn_prefetch_window(&mut self, from: u64, seg_len: u64) {
         let Some(total) = self.content_length else {
             return;
         };
-        if from >= total {
+        if from >= total || !self.prefetch.is_empty() {
             return;
         }
-        let target_end = from.saturating_add(self.read_ahead_bytes).min(total);
-        let mut next_start = from;
-        while next_start < target_end && self.prefetch.len() < self.max_prefetch_in_flight {
-            // 跳过已被 in-flight 段覆盖的区间，避免重复下载同一段。任何与
-            // 窗口重叠的段都参与（无论其起点在窗口内还是窗外）：`prefetch`
-            // 里只可能有两种——顺序预取从 cache_end 起、seek 预取从目标前起，
-            // 与当前窗口重叠即视为已覆盖。
-            if let Some(p) = self
-                .prefetch
-                .iter()
-                .find(|p| p.range.start < target_end && next_start < p.range_end())
-            {
-                next_start = next_start.max(p.range_end());
-                continue;
-            }
-            let len = seg_len.min(target_end - next_start);
-            if len == 0 {
-                break;
-            }
-            let prefetch_range = ByteRange {
-                start: next_start,
-                length: Some(len),
-            };
-            http_trace_log(format!(
-                "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{},\"in_flight\":{}}}",
-                prefetch_range.start,
-                len,
-                self.prefetch.len(),
-            ));
-            self.prefetch.push(PendingHttpFetch::spawn(
-                self.uri.clone(),
-                self.http_headers.clone(),
-                prefetch_range,
-            ));
-            next_start += len;
+        // 已有 in-flight 段覆盖该起点（顺序预取与 seek 预取可能重叠）→ 不重复发
+        if self
+            .prefetch
+            .iter()
+            .any(|p| p.range.start < from.saturating_add(seg_len) && from < p.range_end())
+        {
+            return;
         }
+        let len = seg_len.min(total.saturating_sub(from));
+        if len == 0 {
+            return;
+        }
+        let prefetch_range = ByteRange {
+            start: from,
+            length: Some(len),
+        };
+        http_trace_log(format!(
+            "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{},\"in_flight\":{}}}",
+            prefetch_range.start,
+            len,
+            self.prefetch.len(),
+        ));
+        self.prefetch.push(PendingHttpFetch::spawn(
+            self.uri.clone(),
+            self.http_headers.clone(),
+            prefetch_range,
+        ));
         self.publish_diag();
     }
 
@@ -1073,6 +1122,7 @@ impl HttpLiveStreamSource {
                     cache_end: self.offset,
                     prefetch_in_flight: 0,
                     downloaded_bytes: self.downloaded_bytes,
+                    est_bps: 0.0,
                 };
             }
         }
@@ -1681,6 +1731,7 @@ impl MediaSource for HttpRangeSource {
                 range.length.unwrap_or_default(),
                 bytes.len(),
             ));
+            trace_read_return("http_read", range, &self, &bytes);
             return Ok(bytes);
         }
 
@@ -1702,8 +1753,9 @@ impl MediaSource for HttpRangeSource {
                     cache_bytes.extend_from_slice(&prefetch_bytes);
                     self.reset_cache(range.start, cache_bytes);
                     self.maybe_start_prefetch(range);
-                    let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
-                    return Ok(self.cache_bytes[..copy_len].to_vec());
+                    let out = self.window_slice(range, requested_length).unwrap_or_default();
+                    trace_read_return("http_read_prefix_prefetch", range, self, &out);
+                    return Ok(out);
                 }
             }
 
@@ -1719,8 +1771,9 @@ impl MediaSource for HttpRangeSource {
             cache_bytes.extend_from_slice(&suffix);
             self.reset_cache(range.start, cache_bytes);
             self.maybe_start_prefetch(range);
-            let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
-            return Ok(self.cache_bytes[..copy_len].to_vec());
+            let out = self.window_slice(range, requested_length).unwrap_or_default();
+            trace_read_return("http_read_prefix_fetch", range, self, &out);
+            return Ok(out);
         }
         let fetch_length = self.fetch_length(range)?;
         if fetch_length == Some(0) {
@@ -1731,6 +1784,7 @@ impl MediaSource for HttpRangeSource {
                 self.reset_cache(start, bytes);
                 if let Some(bytes) = self.cached_slice(range) {
                     self.maybe_start_prefetch(range);
+                    trace_read_return("http_read_prefetch", range, self, &bytes);
                     return Ok(bytes);
                 }
                 // The prefetch returned fewer bytes than requested (short
@@ -1762,9 +1816,29 @@ impl MediaSource for HttpRangeSource {
 
         self.reset_cache(range.start, fetched);
         self.maybe_start_prefetch(range);
-        let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
-        Ok(self.cache_bytes[..copy_len].to_vec())
+        let out = self.window_slice(range, requested_length).unwrap_or_default();
+        trace_read_return("http_read_fetch", range, self, &out);
+        Ok(out)
     }
+}
+
+/// 诊断：read_range 返回数据与窗口状态（错位定位用——比较返回字节 head
+/// 与"预期文件字节"可区分窗口错位 vs 上层错位）。仅 ERIKA_HTTP_TRACE=1 时打。
+fn trace_read_return(event: &str, range: ByteRange, src: &HttpRangeSource, bytes: &[u8]) {
+    http_trace_log(format!(
+        "{{\"event\":\"{}\",\"rs\":{},\"rl\":{},\"cs\":{},\"cb\":{},\"head\":\"{}\"}}",
+        event,
+        range.start,
+        range.length.unwrap_or(0),
+        src.cache_start,
+        src.cache_bytes.len(),
+        bytes
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(""),
+    ));
 }
 
 pub fn source_from_uri(uri: &str) -> Result<Box<dyn MediaSource>> {
@@ -1823,7 +1897,9 @@ pub(crate) fn source_from_uri_with_hint_and_headers_slot_limits(
     max_prefetch_in_flight: usize,
 ) -> Result<Box<dyn MediaSource>> {
     match source_hint {
-        MediaSourceHint::Auto => source_from_auto_uri(uri, http_headers),
+        MediaSourceHint::Auto => {
+            source_from_auto_uri_with_slot(uri, http_headers, diag_slot, max_prefetch_in_flight)
+        }
         MediaSourceHint::LocalFile => source_from_local_uri(uri),
         MediaSourceHint::Http => {
             if uri.starts_with("http://") || uri.starts_with("https://") {
@@ -1850,9 +1926,16 @@ pub(crate) fn source_from_uri_with_hint_and_headers_slot_limits(
     }
 }
 
-fn source_from_auto_uri(
+/// Auto 提示的 URI 探测 + 源构造。**必须透传 diag_slot / 预取上限**：
+/// 早期版本 HTTP 分支走 `with_http_headers`（固定槽 0），DASH 双流若都
+/// 用 Auto hint（bili-rs 默认），视频与音频源会同时写诊断槽 0 互相覆盖
+/// ——宿主读到"视频缓存/音频缓存"错乱（音频缓存恒 0、视频总长在两个
+/// 流的长度间跳变）。
+fn source_from_auto_uri_with_slot(
     uri: &str,
     http_headers: Vec<(String, String)>,
+    diag_slot: usize,
+    max_prefetch_in_flight: usize,
 ) -> Result<Box<dyn MediaSource>> {
     if uri.starts_with("fd://") {
         return source_from_local_uri(uri);
@@ -1861,10 +1944,14 @@ fn source_from_auto_uri(
         return Ok(Box::new(LocalFileSource::open(path)?));
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        return Ok(Box::new(HttpRangeSource::with_http_headers(
-            uri,
-            http_headers,
-        )));
+        return Ok(Box::new(
+            HttpRangeSource::with_http_headers_and_diag_slot_limits(
+                uri,
+                http_headers,
+                diag_slot,
+                max_prefetch_in_flight,
+            ),
+        ));
     }
     let path = Path::new(uri);
     if path.exists() {
