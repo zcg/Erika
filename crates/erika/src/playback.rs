@@ -19,7 +19,7 @@ use crate::ffmpeg::{
 };
 use crate::source::{
     self, source_from_uri_with_hint, source_from_uri_with_hint_and_headers,
-    source_from_uri_with_hint_and_headers_slot_limits,
+    source_from_uri_with_hint_and_headers_slot,
 };
 use crate::subtitle::{
     DecodedSubtitleFrame, SubtitleFontAttachment, SubtitleTrackConfig, SubtitleTrackSource,
@@ -120,10 +120,6 @@ const AUDIO_PLAYBACK_INVALID_PACKET_LIMIT: usize = 32;
 const DECODER_EOF_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const DECODER_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const AUDIO_EOF_OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(10);
-/// DASH 音频源并行预取上限。音频码率低（~40KB/s），满额 8 段只与视频流
-/// 抢带宽（慢网下 16 连接均摊，视频预取更慢、更易超时退化）；2 段足够
-/// 维持音频供给，把连接留给视频流。
-const AUDIO_PREFETCH_IN_FLIGHT: usize = 2;
 /// 预载（preload）消费预算：与视频 pump 一致，一次 tick 的合理工作量。
 /// worker 每轮 tick 调用一次，按此限额分片消费，避免单轮阻塞过久。
 const PRELOAD_PACKET_BUDGET: usize = 64;
@@ -879,16 +875,13 @@ impl PlaybackSession {
         // DASH 双流：请求带 audio_uri 时独立打开音频源，由 Demuxer 合并
         // 成统一时间轴（video 全局 stream 0，audio 全局 stream 1）。
         // 音频源用诊断槽 1：与视频槽 0 分离，宿主可分别观察两条流的缓冲。
-        // 音频源并发预取上限 2：音频码率低（~40KB/s），满额 8 段并行只与
-        // 视频流抢带宽（慢网下 16 连接均摊，视频预取更慢），2 段足够维持。
         let mut demuxer = match request.audio_uri.as_deref() {
             Some(audio_uri) => {
-                let audio_source = source_from_uri_with_hint_and_headers_slot_limits(
+                let audio_source = source_from_uri_with_hint_and_headers_slot(
                     audio_uri,
                     request.source_hint,
                     request.http_headers.clone(),
                     1,
-                    AUDIO_PREFETCH_IN_FLIGHT,
                 )?;
                 trace::log(format!(
                     "[erika-open-trace] stage=source_audio_created uri={audio_uri}"

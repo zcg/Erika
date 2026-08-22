@@ -60,20 +60,19 @@ fn compare_http_vs_local_packet_sequences() {
     let video_url = extract_url(&trace, "upos-sz-mirrorali").expect("trace 视频 URL");
     let audio_url = extract_url(&trace, "upos-sz-mirror08h").expect("trace 音频 URL");
     let headers = vec![
-        ("Referer".to_string(), "https://www.bilibili.com".to_string()),
+        (
+            "Referer".to_string(),
+            "https://www.bilibili.com".to_string(),
+        ),
         ("User-Agent".to_string(), UA.to_string()),
     ];
 
     // HTTP 双流
     let http_video = HttpRangeSource::with_http_headers(video_url.clone(), headers.clone());
-    let http_audio = HttpRangeSource::with_http_headers_and_diag_slot_limits(
-        audio_url,
-        headers.clone(),
-        1,
-        2,
-    );
-    let http_demux = Demuxer::open_video_audio(Box::new(http_video), Box::new(http_audio))
-        .expect("http demux");
+    let http_audio =
+        HttpRangeSource::with_http_headers_and_diag_slot(audio_url, headers.clone(), 1);
+    let http_demux =
+        Demuxer::open_video_audio(Box::new(http_video), Box::new(http_audio)).expect("http demux");
     let http_recs = collect(http_demux, 200);
     eprintln!("[diag] http packets={}", http_recs.len());
 
@@ -130,19 +129,21 @@ fn compare_http_vs_local_packet_sequences() {
     let mut diffs = Vec::new();
     for i in 0..common {
         if http_recs[i] != local_recs[i] {
-            diffs.push((
-                i,
-                local_recs[i].clone(),
-                http_recs[i].clone(),
-            ));
+            diffs.push((i, local_recs[i].clone(), http_recs[i].clone()));
         }
     }
     eprintln!("[diag] 共对比 {common} 包，差异 {}(个)", diffs.len());
     for (idx, local, http) in diffs.iter().take(5) {
         eprintln!(
             "差异 @ #{idx}:\n  本地: stream={} size={} pos={} head={:02X?}\n  HTTP: stream={} size={} pos={} head={:02X?}",
-            local.stream, local.size, local.pos, local.head,
-            http.stream, http.size, http.pos, http.head
+            local.stream,
+            local.size,
+            local.pos,
+            local.head,
+            http.stream,
+            http.size,
+            http.pos,
+            http.head
         );
     }
     assert!(

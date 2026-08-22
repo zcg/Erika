@@ -69,5 +69,8 @@ fn http_download_matches_curl_reference() {
             bytes[offset], curl[offset]
         );
     }
-    eprintln!("OK: Erika 下载 0-1MB 与 curl 完全一致（{} 字节）", bytes.len());
+    eprintln!(
+        "OK: Erika 下载 0-1MB 与 curl 完全一致（{} 字节）",
+        bytes.len()
+    );
 }

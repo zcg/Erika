@@ -76,19 +76,17 @@ fn decode_http_dash(disable_prefetch: bool) {
     eprintln!("[diag] audio={}", &audio_url[..80.min(audio_url.len())]);
 
     let headers = vec![
-        ("Referer".to_string(), "https://www.bilibili.com".to_string()),
+        (
+            "Referer".to_string(),
+            "https://www.bilibili.com".to_string(),
+        ),
         ("User-Agent".to_string(), UA.to_string()),
     ];
     let video_source = HttpRangeSource::with_http_headers(video_url.clone(), headers.clone());
-    let audio_source = HttpRangeSource::with_http_headers_and_diag_slot_limits(
-        audio_url.clone(),
-        headers.clone(),
-        1,
-        2,
-    );
-    let mut demuxer =
-        Demuxer::open_video_audio(Box::new(video_source), Box::new(audio_source))
-            .expect("open dual http");
+    let audio_source =
+        HttpRangeSource::with_http_headers_and_diag_slot(audio_url.clone(), headers.clone(), 1);
+    let mut demuxer = Demuxer::open_video_audio(Box::new(video_source), Box::new(audio_source))
+        .expect("open dual http");
 
     // 本地对照：用**独立 source 实例**一次性全量下载 0-1MB（不经过 demux
     // 读取序列，与播放路径唯一的共享点是 CDN 数据本身）。若 demux 包与
@@ -100,26 +98,24 @@ fn decode_http_dash(disable_prefetch: bool) {
         move |url: String, name: &'static str| -> (std::path::PathBuf, Vec<u8>) {
             let path = temp.join(name);
             if !path.exists() {
-            let mut src = HttpRangeSource::with_http_headers(url, headers_for_fetch.clone());
-            let data = src
-                .read_range(ByteRange {
-                    start: 0,
-                    length: Some(1_048_576),
-                })
-                .expect("full fetch");
-            std::fs::write(&path, &data).expect("write fetch file");
-            eprintln!("[diag] 全量下载 {name} {}B", data.len());
-        }
-        let data = std::fs::read(&path).expect("read fetch file");
-        (path, data)
+                let mut src = HttpRangeSource::with_http_headers(url, headers_for_fetch.clone());
+                let data = src
+                    .read_range(ByteRange {
+                        start: 0,
+                        length: Some(1_048_576),
+                    })
+                    .expect("full fetch");
+                std::fs::write(&path, &data).expect("write fetch file");
+                eprintln!("[diag] 全量下载 {name} {}B", data.len());
+            }
+            let data = std::fs::read(&path).expect("read fetch file");
+            (path, data)
         }
     };
     let (_, full_video) = fetch_all(video_url.clone(), "diag_video_1MB.bin");
-    let (_, full_audio) = fetch_all(audio_url.clone(), "diag_audio_1MB.bin");
-    let local_video =
-        LocalFileSource::open(temp.join("diag_video_1MB.bin")).expect("local video");
-    let local_audio =
-        LocalFileSource::open(temp.join("diag_audio_1MB.bin")).expect("local audio");
+    let (_, _full_audio) = fetch_all(audio_url.clone(), "diag_audio_1MB.bin");
+    let local_video = LocalFileSource::open(temp.join("diag_video_1MB.bin")).expect("local video");
+    let local_audio = LocalFileSource::open(temp.join("diag_audio_1MB.bin")).expect("local audio");
     let local_demux = Demuxer::open_video_audio(Box::new(local_video), Box::new(local_audio))
         .expect("local demux");
     let local_recs = collect_demux(local_demux, 200);
@@ -197,7 +193,12 @@ fn decode_http_dash(disable_prefetch: bool) {
                 // 错误包与本地对照同 index 包对比，打印 pos/head 差异
                 let local_p = local_recs.get(http_recs.len() - 1);
                 let local_desc = local_p
-                    .map(|lp| format!("local: stream={} size={} pos={} head={:02X?}", lp.stream, lp.size, lp.pos, lp.head))
+                    .map(|lp| {
+                        format!(
+                            "local: stream={} size={} pos={} head={:02X?}",
+                            lp.stream, lp.size, lp.pos, lp.head
+                        )
+                    })
                     .unwrap_or_else(|| "local: 无对应包".into());
                 send_errors.push(format!(
                     "{} packet #{} stream={} size={} pos={} head={:02X?} err={e} | {local_desc}",
@@ -243,19 +244,11 @@ fn decode_http_dash(disable_prefetch: bool) {
         let v1 = erika::source::source_diag_snapshot_slot(1);
         eprintln!(
             "[diag] 槽0(video): content_length={:?} cache=[{},{}] dl={} est={:.0}B/s",
-            v0.content_length,
-            v0.cache_start,
-            v0.cache_end,
-            v0.downloaded_bytes,
-            v0.est_bps
+            v0.content_length, v0.cache_start, v0.cache_end, v0.downloaded_bytes, v0.est_bps
         );
         eprintln!(
             "[diag] 槽1(audio): content_length={:?} cache=[{},{}] dl={} est={:.0}B/s",
-            v1.content_length,
-            v1.cache_start,
-            v1.cache_end,
-            v1.downloaded_bytes,
-            v1.est_bps
+            v1.content_length, v1.cache_start, v1.cache_end, v1.downloaded_bytes, v1.est_bps
         );
     }
 
@@ -271,8 +264,14 @@ fn decode_http_dash(disable_prefetch: bool) {
     for (idx, local, http) in diffs.iter().take(5) {
         eprintln!(
             "差异 @ #{idx}:\n  本地: stream={} size={} pos={} head={:02X?}\n  HTTP: stream={} size={} pos={} head={:02X?}",
-            local.stream, local.size, local.pos, local.head,
-            http.stream, http.size, http.pos, http.head
+            local.stream,
+            local.size,
+            local.pos,
+            local.head,
+            http.stream,
+            http.size,
+            http.pos,
+            http.head
         );
     }
     assert!(

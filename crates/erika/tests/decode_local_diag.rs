@@ -40,10 +40,7 @@ fn decode_local_fmp4_with_software_decoder() {
                 match decoder.send_packet(&packet) {
                     Ok(()) => sent += 1,
                     Err(e) => {
-                        send_errors.push(format!(
-                            "packet #{sent} size={} err={e}",
-                            packet.size()
-                        ));
+                        send_errors.push(format!("packet #{sent} size={} err={e}", packet.size()));
                         // 坏包跳过继续（Erika 播放路径是 fatal；这里统计）
                         sent += 1;
                     }
@@ -74,7 +71,10 @@ fn decode_local_fmp4_with_software_decoder() {
         }
     }
     eprintln!("[diag] stage=done sent={sent} frames={frames}");
-    eprintln!("结果: 发送 {sent} 包, 解码 {frames} 帧, send 错误 {} 个", send_errors.len());
+    eprintln!(
+        "结果: 发送 {sent} 包, 解码 {frames} 帧, send 错误 {} 个",
+        send_errors.len()
+    );
     for e in send_errors.iter().take(5) {
         eprintln!("  {e}");
     }
