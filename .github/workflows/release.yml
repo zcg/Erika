@@ -398,8 +398,16 @@ jobs:
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
           ERIKA_NATIVE_PROFILE="$PROFILE" bash packaging/bundle.sh \
             erika-capi-android dist/erika-capi-android.zip out/android
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            ERIKA_NATIVE_PROFILE="$PROFILE" bash packaging/bundle.sh \
+              "erika-flutter-android-$ABI" \
+              "dist/erika-flutter-android-$ABI.zip" \
+              "out/android/$ABI/liberika_capi.so" \
+              "out/android/$ABI/libc++_shared.so"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: erika-capi-android
@@ -532,10 +540,23 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+      - name: Create release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' archive; do
+            digest="$(shasum -a 256 "$archive" | cut -d ' ' -f1)"
+            printf '%s  %s\n' "$digest" "$(basename "$archive")"
+          done < <(find artifacts -type f -name '*.zip' -print0 | sort -z) \
+            > SHA256SUMS
+          test -s SHA256SUMS
+          cat SHA256SUMS
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.zip
+          files: |
+            artifacts/**/*.zip
+            SHA256SUMS
           generate_release_notes: true
           body: |
             Prebuilt `erika_capi` C ABI bundles (static `lgpl` profile),
@@ -544,7 +565,8 @@ jobs:
             x86_64, and x86, plus OpenHarmony arm64.
 
             Each archive contains the library, `include/erika.h`, `LICENSE`
-            (MPL-2.0), and `THIRD_PARTY_NOTICES.md`. See
+            (MPL-2.0), and `THIRD_PARTY_NOTICES.md`. `SHA256SUMS` in this
+            release records the digest of every archive. See
             [docs/capi_reference.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/docs/capi_reference.md)
             and [docs/integration.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/docs/integration.md)
             to integrate. Review [CHANGELOG.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/CHANGELOG.md)

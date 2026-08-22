@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## 0.1.7 - 2026-08-16
+
+### Flutter package distribution
+
+- Prepared `erika_flutter` for its first pub.dev release with package-local
+  licensing, changelog, metadata, examples, and standalone package tests.
+- Made verified, version-pinned native release bundles the default on Android,
+  Apple platforms, Windows, and OpenHarmony; source builds are now explicitly
+  selected with `ERIKA_FORCE_SOURCE_BUILD=1`.
+- Added per-ABI Flutter Android runtime archives so app builds download only
+  the requested architecture and omit the native-embedder static library.
+- Added a release-level `SHA256SUMS` manifest covering every published native
+  archive.
+- Added isolated GitHub Actions consumers for Android, iOS, macOS, tvOS,
+  Windows, and OpenHarmony so package builds cannot depend on the monorepo.
+
+### OpenHarmony package distribution
+
+- Published the independent native ArkTS package `erika` to OHPM for
+  OpenHarmony arm64 (API 18+), with `XComponent` surface lifecycle,
+  `renderTick()` scheduling, playback controls, events, and screenshots.
+
 ## 0.1.6 - 2026-08-14
 
 ### Rendering and playback

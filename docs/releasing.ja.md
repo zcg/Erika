@@ -16,23 +16,71 @@
 | iOS | `erika-capi-ios.zip`、device と simulator の XCFramework slice |
 | tvOS | `erika-capi-tvos.zip`、device と arm64/x86_64 simulator の XCFramework slice |
 | Android | `erika-capi-android.zip`、`arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` |
+| Flutter Android | `erika-flutter-android-<abi>.zip`、1 archive あたり 1 ABI の shared runtime |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip`、`liberika_capi.so` と `liberika_flutter.so` |
 
 OpenHarmony archive は OpenHarmony 5.1.0 Native SDK、compatible SDK 18 で
 build され、C API runtime と Flutter N-API bridge を含みます。
-`ERIKA_PREBUILT=1` の場合、plugin CMake は対応する tag を download し、prebuilt
-runtime を link して N-API bridge とともに HAR/HAP に package します。download
-失敗時は source build に fallback します。
+Flutter plugin は package で固定された release を既定で download し、SHA-256 を
+検証して prebuilt runtime を link し、N-API bridge とともに HAR/HAP に package
+します。download または検証の失敗は明示的な error になり、source build は
+`ERIKA_FORCE_SOURCE_BUILD=1` を設定した場合だけ有効になります。
 
 各 archive には `include/erika.h`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、dependency license、tag/commit を記録する `MANIFEST.txt` も含まれます。native dependency は `lgpl` profile で static link され、Android は ABI に対応する `libc++_shared.so` も含みます。
+
+Flutter Android build は要求された ABI の
+`erika-flutter-android-<abi>.zip` だけを download し、他 architecture や native
+embedder 専用の static `.a` は download しません。combined
+`erika-capi-android.zip` は multi-ABI / static link の C/C++ consumer 向けに維持します。
+
+## Flutter package の公開
+
+`erika_flutter` は [pub.dev](https://pub.dev/packages/erika_flutter) で独立して公開します。
+`0.1.7` は最初の standalone package release で、macOS、iOS、tvOS、Windows、Android、
+HarmonyOS/OpenHarmony に対応します。package archive には plugin source、package
+`LICENSE`、README、example、version 固定の native artifact manifest が含まれ、platform
+build は対応する GitHub Release archive を download して SHA-256 を検証します。
+
+公開前に clean worktree の package directory で検証・公開します：
+
+```sh
+cd packages/erika_flutter
+dart pub publish --dry-run
+dart pub publish
+```
+
+merge 前に [flutter-package.yml](../.github/workflows/flutter-package.yml) が isolated package
+と各 platform consumer を検証します。Linux と Web はまだ package 公開対象ではありません。
+
+pub.dev への公開は [pub-publish.yml](../.github/workflows/pub-publish.yml) が自動実行します。
+native archive には build metadata が含まれるため、package に固定する SHA-256 は対応する
+GitHub Release の作成後に更新します。公開順序は次の通りです：
+
+1. 下記の手順で `v0.1.8` を push する；
+2. native GitHub Release と `SHA256SUMS` の完了後、Action が package manifest を更新し、
+   `erika_flutter-v0.1.8` tag を自動作成する；
+3. その tag の Action が package version、native version、GitHub Release の全 SHA-256 を
+   検証してから pub.dev OIDC で公開する。
+
+`erika_flutter-vX.Y.Z` は workflow 内部の package release tag で、maintainer が手動で push
+する必要はありません。pub.dev Admin の one-time 設定は repository `AimesSoft/Erika`、
+tag pattern `erika_flutter-v{{version}}` です。
+
+### pub.dev publisher identity
+
+`unverified uploader` は、検証済み pub.dev publisher に紐付いていない account が package を
+upload したことを示します。package validation、License、build の失敗ではありません。検証済み
+publisher を表示するには、管理している domain の pub.dev publisher を作成または参加し、domain
+verification を完了してから package ownership をその publisher に移します。
 
 ## Release の作成
 
 Release は [release.yml](../.github/workflows/release.yml) で自動化されています。GitHub Release を作成するには `v*` tag を push します：
 
 ```sh
-git tag v0.1.6
-git push origin v0.1.6
+VERSION=0.1.8
+git tag "v${VERSION}"
+git push origin "v${VERSION}"
 ```
 
 `workflow_dispatch` の手動実行は Actions Artifact のみを生成し、`ERIKA_PREBUILT_TAG` から取得できる GitHub Release は公開しません。
@@ -55,12 +103,11 @@ FFI glue の整合性、各 archive の manifest と license、NipaPlay で固�
 
 ## Flutter で prebuilt を使用
 
-```sh
-export ERIKA_PREBUILT=1
-export ERIKA_PREBUILT_TAG=v0.1.6
-```
-
-plugin source と C ABI の version を一致させるため、`ERIKA_PREBUILT_TAG` を明示的に固定することを推奨します。download または展開に失敗した場合は source build に fallback します。local debug では次を設定します：
+plugin は package 内で固定された release tag と SHA-256 を既定で使用します。
+`ERIKA_PREBUILT_TAG` を上書きする場合は、対応する `ERIKA_PREBUILT_SHA256` も必須です。
+Android multi-ABI build では `ERIKA_PREBUILT_SHA256_ARM64_V8A`、
+`ERIKA_PREBUILT_SHA256_ARMEABI_V7A`、`ERIKA_PREBUILT_SHA256_X86_64`、
+`ERIKA_PREBUILT_SHA256_X86` を ABI ごとに指定します。download、展開、検証の失敗は明示的な error になります。local source debug では次を設定します：
 
 ```sh
 export ERIKA_FORCE_SOURCE_BUILD=1
@@ -82,7 +129,6 @@ Platform architecture の選択：
 Android の例：
 
 ```sh
-ERIKA_PREBUILT=1 ERIKA_PREBUILT_TAG=v0.1.6 \
 ERIKA_ANDROID_ABIS=arm64-v8a,x86_64 flutter build apk
 ```
 
