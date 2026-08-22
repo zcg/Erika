@@ -289,11 +289,13 @@ fn decode_http_dash(disable_prefetch: bool) {
 }
 
 #[test]
+#[ignore = "deps on session trace %TEMP%/erika_http_trace.jsonl (expiring signed URLs); run: cargo test -- --ignored"]
 fn decode_http_dash_streams_software() {
     decode_http_dash(false);
 }
 
 #[test]
+#[ignore = "deps on session trace %TEMP%/erika_http_trace.jsonl (expiring signed URLs); run: cargo test -- --ignored"]
 fn decode_http_dash_software_no_prefetch() {
     decode_http_dash(true);
 }

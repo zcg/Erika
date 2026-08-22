@@ -45,6 +45,7 @@ fn collect(mut demuxer: Demuxer, count: usize) -> Vec<PacketRec> {
 }
 
 #[test]
+#[ignore = "deps on session trace %TEMP%/erika_http_trace.jsonl (expiring signed URLs); run: cargo test -- --ignored"]
 fn compare_http_vs_local_packet_sequences() {
     // 独立 HTTP trace：观察 demux 期间 HTTP 源的实际请求序列（start/length）
     unsafe {

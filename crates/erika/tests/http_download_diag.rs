@@ -9,6 +9,7 @@
 use erika::source::{ByteRange, HttpRangeSource, MediaSource};
 
 #[test]
+#[ignore = "deps on session trace %TEMP%/erika_http_trace.jsonl (expiring signed URLs); run: cargo test -- --ignored"]
 fn http_download_matches_curl_reference() {
     // 1. 从 trace 提取视频 URL（head_request uri=... cache_start）
     let trace_path = std::env::temp_dir().join("erika_http_trace.jsonl");
