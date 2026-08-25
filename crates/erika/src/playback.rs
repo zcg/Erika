@@ -1131,6 +1131,55 @@ impl PlaybackSession {
                             decoder
                         }
                     }
+                    Err(error) if decoder_config.backend == DecoderBackend::D3d11va => {
+                        // Windows 硬解（D3D11VA）打开失败 → 自动回退软解。
+                        // 宿主策略：默认硬解，失败自动软解（设置页无手动选项）。
+                        let hw_error = error.to_string();
+                        video_decoder_fallbacks = 1;
+                        let decoder = match Decoder::open_owned_with_config(
+                            parameters,
+                            DecoderConfig::software(),
+                        ) {
+                            Ok(decoder) => decoder,
+                            Err(software_error) => {
+                                return Err(video_decoder_open_unavailable_error(
+                                    "open_d3d11va_to_software_failed",
+                                    decoder_config.backend,
+                                    stream_index,
+                                    codec.as_deref(),
+                                    video_decoder_fallbacks,
+                                    format!(
+                                        "D3D11VA open failed: {hw_error}; software decoder open failed: {software_error}"
+                                    ),
+                                ));
+                            }
+                        };
+                        trace::diagnostic(
+                            serde_json::json!({
+                                "event": "windows_d3d11va_fallback",
+                                "stage": "open_d3d11va_to_software",
+                                "fromMode": "d3d11va",
+                                "toMode": "software_decode",
+                                "fallbackCount": video_decoder_fallbacks,
+                                "reason": hw_error.as_str(),
+                            })
+                            .to_string(),
+                        );
+                        let event = VideoDecoderEvent {
+                            stage: "open_d3d11va_to_software".to_string(),
+                            requested_backend: decoder_config.backend,
+                            previous_backend: Some(decoder_config.backend),
+                            active_backend: decoder.backend(),
+                            fallback_count: video_decoder_fallbacks,
+                            codec: codec.clone(),
+                            pixel_format: None,
+                            line_sizes: None,
+                            reason: Some(hw_error),
+                        };
+                        trace::diagnostic(event.structured_message());
+                        video_decoder_events.push_back(event);
+                        decoder
+                    }
                     Err(error) => {
                         return Err(video_decoder_open_unavailable_error(
                             video_decoder_open_stage(decoder_config),

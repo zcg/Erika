@@ -1282,8 +1282,7 @@ impl Decoder {
             DecoderBackend::D3d11va => decoder.configure_d3d11va(codec)?,
             DecoderBackend::AvCodec => {}
         }
-        let mut codec_options = ptr::null_mut();
-        #[cfg(target_os = "android")]
+        let mut codec_options = ptr::null_mut();        #[cfg(target_os = "android")]
         if config.backend == DecoderBackend::MediaCodec {
             let option_result = check(
                 unsafe {
