@@ -108,7 +108,19 @@ const BUFFERING_AUDIO_VIDEO_SCAN_PACKET_LIMIT: usize = 4096;
 const BUFFERING_AUDIO_VIDEO_SCAN_BYTE_LIMIT: usize = 256 * 1024 * 1024;
 const BUFFERING_AUDIO_VIDEO_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_AUDIO_CLOCK_STALE_TOLERANCE: Duration = Duration::from_millis(250);
-const DEMUX_PACKET_QUEUE_LIMIT: usize = 512;
+/// demux 包队列上限（包数）。它就是**播放前沿缓冲的真实天花板**：demux
+/// worker 领先播放位置读取，队列满即停——源侧 read_ahead（32MB）根本填
+/// 不满。B站 CDN 实测按「≈1×码率」限速单连接（供给永远贴着需求），缓冲
+/// 余量全靠这个队列吸收码率高峰/瞬时断流：512 包 @720P ≈5MB ≈ 20s。
+/// **1024**（`ERIKA_DEMUX_PACKET_QUEUE_LIMIT` 覆盖）≈ 10-16MB ≈ 40-60s，
+/// 配合源侧 32MB 窗口与 3 路并行预取，"供给≈需求"也能无冻帧播放
+///（用户实测反馈：720P 播一小段冻在某一帧等一会）。
+fn demux_packet_queue_limit() -> usize {
+    std::env::var("ERIKA_DEMUX_PACKET_QUEUE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024)
+}
 const SEEK_PREROLL_DECODE_TIME_BUDGET: Duration = Duration::from_millis(5);
 const SEEK_PREROLL_LOG_INTERVAL: Duration = Duration::from_millis(500);
 const VIDEO_PUMP_PACKET_BUDGET: usize = 64;
@@ -213,7 +225,7 @@ struct AsyncDemuxer {
 
 impl AsyncDemuxer {
     fn spawn(demuxer: Demuxer) -> Self {
-        let (packet_sender, packets) = bounded(DEMUX_PACKET_QUEUE_LIMIT);
+        let (packet_sender, packets) = bounded(demux_packet_queue_limit());
         let (commands, command_receiver) = unbounded();
         thread::Builder::new()
             .name("erika-demux".to_string())
@@ -867,6 +879,7 @@ impl PlaybackSession {
             &request.uri,
             request.source_hint,
             request.http_headers.clone(),
+            request.video_candidates.clone(),
         )?;
         trace::log(format!(
             "[erika-open-trace] stage=source_video_created uri={}",
@@ -882,6 +895,7 @@ impl PlaybackSession {
                     request.source_hint,
                     request.http_headers.clone(),
                     1,
+                    request.audio_candidates.clone(),
                 )?;
                 trace::log(format!(
                     "[erika-open-trace] stage=source_audio_created uri={audio_uri}"
@@ -6242,6 +6256,8 @@ mod tests {
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
             audio_uri: None,
+            video_candidates: Vec::new(),
+            audio_candidates: Vec::new(),
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,
@@ -7776,6 +7792,8 @@ mod tests {
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
             audio_uri: None,
+            video_candidates: Vec::new(),
+            audio_candidates: Vec::new(),
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,

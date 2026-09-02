@@ -2971,18 +2971,26 @@ fn blob_to_string(blob: &ID3DBlob) -> String {
     String::from_utf8_lossy(blob_bytes(blob)).into_owned()
 }
 
+/// ERIKA_D3D11_TRACE 门控缓存（进程内 env 不变）：trace() 在渲染热路径上
+/// 每帧至少调用 1 次（render_video enter）+ 每次帧导入 1 次（D3D11VA 零拷
+/// 贝）——此前每次调用都 env::var_os 查询（Windows 拿进程环境锁 + 线性查
+/// 找），60fps 下 ~120 次/秒白拿锁。LazyLock 首次求值后零开销。
+static D3D11_TRACE_ENABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("ERIKA_D3D11_TRACE").is_some());
+
 fn trace(message: &str) {
-    if std::env::var_os("ERIKA_D3D11_TRACE").is_some() {
-        eprintln!("erika d3d11: {message}");
-        // 崩溃定位：同时写文件（GUI 宿主 stderr 不可见）
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(std::env::temp_dir().join("erika_d3d11_trace.log"))
-        {
-            let _ = writeln!(f, "{message}");
-        }
+    if !*D3D11_TRACE_ENABLED {
+        return;
+    }
+    eprintln!("erika d3d11: {message}");
+    // 崩溃定位：同时写文件（GUI 宿主 stderr 不可见）
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("erika_d3d11_trace.log"))
+    {
+        let _ = writeln!(f, "{message}");
     }
 }
 

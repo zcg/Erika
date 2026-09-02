@@ -6,7 +6,8 @@ use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(target_os = "android")]
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -63,13 +64,33 @@ pub struct SourceDiagSnapshot {
     pub cache_end: u64,
     /// 正在下载的预取段数（多连接并行 in-flight）。
     pub prefetch_in_flight: usize,
-    /// 累计已下载字节（同步 fetch + 已消费预取段；用于差分下载速度）。
+    /// **实时**累计已接收字节（字节在线路上到达即计入，不等待整段完成）。
+    ///
+    /// 语义变更（2026-09-01）：此前只在「整段下载完成」时累加，慢网下一个
+    /// 预取段要数秒到十几秒才完成，传输期间本值不动 → 宿主差分恒为 0 →
+    /// 把「正在缓慢下载」误判成「无供给」，触发饥饿换源 / ABR 连环降档
+    /// （用户反馈的「无故换源」「自动降级画质」根因）。现由 `fetch_http_range`
+    /// 在 body 分块读循环里逐块 `fetch_add`，涓流也如实反映。
+    ///
+    /// 含**被丢弃**的字节（seek 后作废的在飞段、整片预载被前移丢弃的段）——
+    /// 带宽估算要的是「线路上真实到达的量」，丢不丢不影响吞吐判定。
     pub downloaded_bytes: u64,
-    /// 源内带宽估算（字节/秒，2s 滑动 EMA）。基于每次 fetch 完成的字节
-    /// 累加差分，与宿主 poll 时机无关——宿主轮询差分在慢网下（一段
-    /// 2s+ 才完成一次 publish）大部分采样为 0，ABR/诊断会误判"无供给"
-    /// 而永不降档（弱网死扛高画质 → 周期饥饿卡顿）。
+    /// 源内带宽估算（字节/秒，2s 滑动 EMA）。
+    ///
+    /// **拉模型**（2026-09-01 改）：此前是推模型——只在「段完成」事件里结算，
+    /// 慢网下 est_bps 会在整段传输期间**冻结**在旧值（不归零、也不更新），
+    /// 与宿主差分同样失真。现在任何读取方（`publish_diag` 或宿主
+    /// `source_diag_snapshot_slot`）调用即以「实时已收字节总量」做窗口差分，
+    /// 与段完成事件解耦——即使 demux 线程正阻塞在长 join 上，宿主的 500ms
+    /// poll 也能读到新鲜值。
     pub est_bps: f64,
+    /// 当前活跃 host（多源无缝换 host 用）：显示"现在用的是哪家 CDN"，
+    /// 换源时随之变化，便于直观确认切换生效。无候选时为空。
+    pub active_host: String,
+    /// 当前活跃候选下标（0 = candidates[0]）。
+    pub active_idx: usize,
+    /// 候选 host 总数（0 = 单源模式）。
+    pub candidate_count: usize,
 }
 
 /// 诊断槽数。DASH 双流（video + audio）各占一槽独立发布/清空，互不覆盖；
@@ -84,6 +105,9 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
         prefetch_in_flight: 0,
         downloaded_bytes: 0,
         est_bps: 0.0,
+        active_host: String::new(),
+        active_idx: 0,
+        candidate_count: 0,
     },
     SourceDiagSnapshot {
         content_length: None,
@@ -92,8 +116,105 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
         prefetch_in_flight: 0,
         downloaded_bytes: 0,
         est_bps: 0.0,
+        active_host: String::new(),
+        active_idx: 0,
+        candidate_count: 0,
     },
 ]);
+
+/// 每槽位的「实时已收字节」计数器集合（一个槽可能同时登记多个计数器：
+/// 源自身的 `rx` + 整片预载桶的 `downloaded`）。
+///
+/// HTTP 段在 body 分块读循环里直接 `fetch_add` 到这里登记的计数器，因此
+/// 慢网下「段在飞、未完成」期间总量也在增长——这是 `downloaded_bytes` /
+/// `est_bps` 不再失真的基础。源构造时登记、`Drop` 时按 `Arc::ptr_eq` 注销。
+static SOURCE_RX: Mutex<[Vec<Arc<AtomicU64>>; SOURCE_DIAG_SLOTS]> =
+    Mutex::new([Vec::new(), Vec::new()]);
+
+/// 带宽估算的窗口采样状态（拉模型用）。
+struct BandwidthSample {
+    at: Instant,
+    total: u64,
+    bps: f64,
+}
+
+/// 每槽位上一窗口的采样点。宿主 poll 与 `publish_diag` 共用——先到者触发结算，
+/// 后到者读到缓存值（窗口未满时复用），保证「同一窗口内多次读取得到同一值」。
+static SOURCE_BW: Mutex<[Option<BandwidthSample>; SOURCE_DIAG_SLOTS]> = Mutex::new([None, None]);
+
+/// 带宽估算差分窗口：每 2s 用窗口内**实时到达**的字节更新一次 EMA。
+/// 太短（<1s）会被单次请求的突发抖动带偏；太长响应迟缓。
+const BANDWIDTH_ESTIMATE_WINDOW: Duration = Duration::from_secs(2);
+
+/// EMA 权重：新瞬时值 0.3 / 历史 0.7（沿用推模型取值，行为连续）。
+const BANDWIDTH_EMA_NEW: f64 = 0.3;
+
+/// 槽位实时已收字节总量（该槽登记的所有计数器之和）。
+fn live_rx_bytes(slot: usize) -> u64 {
+    let Ok(counters) = SOURCE_RX.lock() else {
+        return 0;
+    };
+    counters
+        .get(slot)
+        .map(|list| {
+            list.iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .fold(0u64, u64::saturating_add)
+        })
+        .unwrap_or(0)
+}
+
+/// 带宽估算（**拉模型**）：以「实时已收字节总量」为基准做窗口差分并更新 EMA。
+///
+/// 关键性质：与「段完成事件」解耦。旧推模型在慢网下整段传输期间不结算，
+/// est_bps 冻结在旧值；现在任何调用方（demux 的 `publish_diag` 或宿主的
+/// `source_diag_snapshot_slot`）调用都会按真实窗口时间结算——宿主 500ms
+/// 轮询即使撞上 demux 正阻塞在长 join 上，也能读到新鲜供给值。
+///
+/// 跨源（换源）时总量会回落（旧计数器注销、新计数器从 0 起），此处用
+/// `saturating_sub` 兜底——该窗口瞬时值记 0，EMA 平滑吸收，不会出负速率。
+fn refresh_bandwidth(slot: usize, total_rx: u64) -> f64 {
+    let now = Instant::now();
+    let Ok(mut slots) = SOURCE_BW.lock() else {
+        return 0.0;
+    };
+    let Some(entry) = slots.get_mut(slot) else {
+        return 0.0;
+    };
+    let Some(prev) = entry.as_ref() else {
+        // 冷启动：只记基线，本窗口不出估算（避免把"从 0 起"算成瞬时速率）。
+        *entry = Some(BandwidthSample {
+            at: now,
+            total: total_rx,
+            bps: 0.0,
+        });
+        return 0.0;
+    };
+    let elapsed = now.duration_since(prev.at);
+    if elapsed < BANDWIDTH_ESTIMATE_WINDOW {
+        return prev.bps;
+    }
+    let inst_bps = total_rx.saturating_sub(prev.total) as f64 / elapsed.as_secs_f64();
+    let mut bps = if prev.bps > 0.0 {
+        prev.bps * (1.0 - BANDWIDTH_EMA_NEW) + inst_bps * BANDWIDTH_EMA_NEW
+    } else {
+        inst_bps
+    };
+    // 零供给地板：长时间无字节（暂停/挂起数分钟）时 EMA 指数衰减趋零但**永不
+    // 等于 0**——denormal 级的 est_bps 仍满足 `> 0.0`，自适应路径
+    // （`prefetch_join_timeout` 的 `seg / est_bps`）会拿它当真实带宽去除，
+    // 得到天文数字秒数，`Duration::from_secs_f64` 对 "too big" 直接 panic。
+    // 低于 1bps 归零，回到「est_bps <= 0 = 未知」语义（下游走默认值分支）。
+    if bps < 1.0 {
+        bps = 0.0;
+    }
+    *entry = Some(BandwidthSample {
+        at: now,
+        total: total_rx,
+        bps,
+    });
+    bps
+}
 
 /// 读取当前 `HttpRangeSource` 诊断快照（宿主轮询用；无播放时返回零值/上次刷新）。
 /// 兼容旧单槽语义：返回槽 0（主流/单流/直播）。
@@ -105,12 +226,20 @@ pub fn source_diag_snapshot() -> SourceDiagSnapshot {
 /// 各源独立发布/清空，宿主据此分别显示两条流的缓冲状态。
 /// 槽位越界或无对应源时返回零值。
 pub fn source_diag_snapshot_slot(slot: usize) -> SourceDiagSnapshot {
-    SOURCE_DIAG
+    let mut snap = SOURCE_DIAG
         .lock()
         .unwrap()
         .get(slot)
         .cloned()
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // **读取时刻刷新供给信号**（拉模型的核心）。快照其余字段（缓存窗口/在飞段
+    // 数/总长）由 demux 线程写，demux 阻塞期间不动是合理的；但供给速度必须实时
+    // ——宿主 500ms 一次的策略 poll 正是靠这里拿到真值。若 demux 正卡在长 join
+    // 上（慢网常态），没有这一步 est_bps 与 downloaded_bytes 会一起冻结。
+    let total = live_rx_bytes(slot);
+    snap.downloaded_bytes = total;
+    snap.est_bps = refresh_bandwidth(slot, total);
+    snap
 }
 
 pub trait MediaSource: Send {
@@ -415,7 +544,10 @@ fn parse_owned_fd_value(value: &str, uri: &str) -> Result<i32> {
 }
 
 pub struct HttpRangeSource {
-    uri: String,
+    uri: Arc<Mutex<String>>,
+    /// 打开时登记的主 URI（首候选）。多源换 host 时只变 `uri`（活跃 fetch
+    /// 地址），此字段保持不变，作为源的稳定标识供 `uri()` / 日志使用。
+    primary_uri: String,
     agent: ureq::Agent,
     http_headers: Vec<(String, String)>,
     content_length: Option<u64>,
@@ -447,9 +579,45 @@ pub struct HttpRangeSource {
     /// 最近一次窗口外预取提示的目标位置（`prefetch_hint`）。用于防抖：
     /// `av_seek_frame` 内部可能对相近位置多次 seek，同一窗口内不重复预取。
     prefetch_target: Option<u64>,
-    /// 累计已下载字节（同步 fetch 完成 + 预取段被消费时累加）。仅供诊断
-    /// 快照差分计算实时下载速度，不参与任何取数逻辑。
+    /// 累计**已消费**的字节（同步 fetch 完成 + 预取段被 join 时累加）。
+    /// 仅供内部记账，不参与任何取数逻辑；对外诊断一律走 `rx`（实时已收）。
     downloaded_bytes: u64,
+    /// **实时已收字节**计数器：本源所有 HTTP 段（同步 fetch / 并行预取 /
+    /// 整片预载）在 body 分块读循环里逐块 `fetch_add`。登记进全局
+    /// `SOURCE_RX[diag_slot]`，宿主 poll 与 `publish_diag` 都读它。
+    /// 与 `downloaded_bytes` 的区别：前者是「线路上到达即计」，后者是
+    /// 「整段完成并被消费才计」——慢网下二者差距就是一个段的传输时长。
+    rx: Arc<AtomicU64>,
+    /// 后台整片预载（见 `FullPreloadState`）。None = 不启用（直播源等）。
+    full_preload: Option<Arc<FullPreloadState>>,
+    /// 后台整片预载线程句柄。**故意不在 `Drop` 里 join**——预载线程会一直
+    /// 跑到文件尾（数 GB），若窗口关闭时 join 会把 UI 线程卡到下载完成，正是
+    /// 用户最忌讳的"关窗卡死"。`Drop` 只置 `stop = true`，线程在下次循环看到
+    /// 后即退出（退出前可能再发一个 256KB 段请求，几十毫秒级，可接受），不
+    /// 阻塞任何调用方。句柄留在这里仅用于 drop 时显式 `drop(handle)` 让线程
+    /// 在 stop 后自然结束、不被提前 detach 成 leaked（保持可观测）。
+    preload_thread: Option<std::thread::JoinHandle<()>>,
+    /// 多 host 候选（按快→慢排序；index 0 最优）。Option A 无缝换 host：
+    /// 当前 host 慢/死时，无需重建 source、缓存零丢失地切到下一个候选，
+    /// 循环回到起点。空 = 单源模式（沿用旧行为）。
+    candidates: Vec<CandidateHost>,
+    /// 当前活跃候选下标（0 = candidates[0]）。
+    active_idx: usize,
+    /// 最近一次收到字节的 epoch 毫秒（死连检测：长时间无字节且 demux 仍在
+    /// 调用 read_range = 源已死，触发换 host）。
+    last_byte_ms: u64,
+    /// 最近一次被 read_range 调用的 epoch 毫秒（活跃检测：demux 在等数据
+    /// 才算"在播"，暂停时不误换）。
+    last_read_call_ms: u64,
+    /// 换 host 冷却截止时刻：避免一轮内对同一死连反复横跳。
+    switch_cooldown_until: Instant,
+}
+
+/// 多 host 候选（Option A 无缝换 host 用）。
+struct CandidateHost {
+    uri: String,
+    /// 诊断/排序用得分（B站侧按历史失败分+测速综合得出，越大越好）。
+    score: f64,
 }
 
 struct PendingHttpFetch {
@@ -465,6 +633,356 @@ struct PendingHttpFetch {
 struct HttpRangeResponse {
     bytes: Vec<u8>,
     total_length: Option<u64>,
+}
+
+/// 后台整片预载存储（用户定规 2026-08-30：打开播放页就应持续缓冲直到整片
+/// 下载完毕，暂停也不例外；窗口关闭随源销毁）。独立线程顺序下载文件到内
+/// 存桶，与 demux 队列/播放时钟完全解耦——队列满、暂停、seek 都不中断。
+/// `read_range` 完整落在桶区段内时直接取用（零网络）；`spawn_prefetch_window`
+/// 跳过桶已覆盖的区段（不重复下载）。诊断 `cache_end`/`downloaded_bytes`
+/// 并入桶进度（缓冲前沿/下载速度如实反映整片下载）。
+struct FullPreloadState {
+    stop: AtomicBool,
+    /// 桶已覆盖到的**绝对**文件偏移终点（= `inner.start` + `bytes.len()`）。
+    /// 0 = 尚未开始。注意桶起点会前移，故区间未必从 0 起（见 `start`）。
+    end: AtomicU64,
+    /// 累计网络下载字节（诊断速度差分用，单调递增）。
+    ///
+    /// 用 `Arc` 包一层的原因：它是**实时**计数器，需要登记进全局
+    /// `SOURCE_RX` 供宿主 poll 读取（与源自身的 `rx` 同口径）。`fetch_http_range`
+    /// 在 body 分块读循环里直接 `fetch_add`，因此暂停后桶接管下载时诊断面板
+    /// 也能看到非零速度。
+    downloaded: Arc<AtomicU64>,
+    /// demux 端已覆盖到的前沿（`cache_end`）。桶**跳过**该偏移之前的区间，
+    /// 避免与 demux 并行预取重复下载同一段——实测重复下载把有效供给砍半
+    /// （23KB/s 里一半是重复字节，缓冲永远建不起来 → 一路饥渴换源 → 换到
+    /// 差源就表现为"拉流失败"）。由 `read_range` 每次同步，单调取 max。
+    floor: AtomicU64,
+    /// demux 最近一次 `read_range` 的墙上时钟（epoch 毫秒）。用于判定 demux
+    /// 是否正在消费（播放中）——活跃时桶让路，见 `demux_active`。
+    last_demux_read_ms: AtomicU64,
+    inner: Mutex<FullPreloadInner>,
+}
+
+struct FullPreloadInner {
+    /// 文件总长（由首个成功响应的 total 回填；None = 未探测到，线程等待）。
+    total: Option<u64>,
+    /// 桶存储区间的**绝对起点**，初始 0。demux 预取跑赢桶时整体前移到
+    /// `floor` 并丢弃旧字节——那些字节 demux cache 里已有一份，桶里再留
+    /// 就是重复下载（纯浪费带宽）。前移后桶表示 [start, end)。
+    start: u64,
+    /// 存储桶：文件 [start, end) 的连续字节。
+    bytes: Vec<u8>,
+}
+
+/// 整片预载单步：从当前 `end` 下载一段（≤256KB）追加进桶。返回 true 表示
+/// 已完成（总量已知且到顶/达上限）或被停止；false 表示还有后续（调用方循
+/// 环）。失败时不前进、由调用方退避重试——瞬时断流在这里被消化，不升级。
+fn full_preload_step(
+    state: &FullPreloadState,
+    agent: &ureq::Agent,
+    uri: &str,
+    http_headers: &[(String, String)],
+    cap: u64,
+) -> bool {
+    if state.stop.load(Ordering::Relaxed) {
+        return true;
+    }
+    let floor = state.floor.load(Ordering::Relaxed);
+    let (start, end, total) = {
+        let g = state.inner.lock().expect("full preload poisoned");
+        (g.start, state.end.load(Ordering::Relaxed), g.total)
+    };
+    let Some(total) = total else {
+        return false; // 总长未探测到：等待（调用方退避后重试）
+    };
+    // demux 并行预取已跑赢桶：整体前移到 floor 并丢弃旧字节，下一步从 floor
+    // 起下载。旧字节 demux cache 里已持有一份，桶再从 0 追就是与 demux 重复
+    // 下载同一区间——实测这会把有效供给砍半（23KB/s 中一半是重复字节），缓冲
+    // 永远建不起来 → 一路饥渴换源。前移 = 放弃追赶、只补 demux 前方，是带宽
+    // 受限下的正确取舍（暂停后 demux 停止推进，桶随即接管并持续补到文件尾）。
+    if floor > end {
+        let mut g = state.inner.lock().expect("full preload poisoned");
+        g.bytes.clear();
+        g.start = floor;
+        drop(g);
+        state.end.store(floor, Ordering::Relaxed);
+        return false; // 无网络动作，下一步直接从 floor 下载
+    }
+    if end >= total || end >= cap {
+        return true;
+    }
+    let want = (total.min(cap) - end).min(256 * 1024);
+    if want == 0 {
+        return true;
+    }
+    let range = ByteRange {
+        start: end,
+        length: Some(want),
+    };
+    // 把桶的计数器交给分块读循环实时累加（整片预载是暂停期间唯一的数据通路，
+    // 没有实时进度时"暂停后缓冲"在诊断里表现为速度 0）。收尾不再单独
+    // `fetch_add`——那会重复计数（分块循环已按实际到达字节累加过一遍）。
+    match fetch_http_range(
+        agent,
+        uri,
+        http_headers,
+        range,
+        "http_full_preload",
+        Some(state.downloaded.as_ref()),
+    ) {
+        Ok(response) => {
+            let n = response.bytes.len() as u64;
+            if n == 0 {
+                return true; // 服务器判定到尾（短于 Content-Range 声明）
+            }
+            let mut g = state.inner.lock().expect("full preload poisoned");
+            if g.total.is_none() {
+                g.total = response.total_length;
+            }
+            // 顺序完整性守卫：写入偏移与桶起点都必须与快照一致——其间若发生
+            // 前移（start 变化）或并发写入，丢弃本次并退避重试，绝不产生空洞
+            // 或把新字节追加到已前移的桶上造成错位。
+            if state.end.load(Ordering::Relaxed) != end || g.start != start {
+                return false;
+            }
+            g.bytes.extend_from_slice(&response.bytes);
+            drop(g);
+            state.end.fetch_add(n, Ordering::Relaxed);
+            // 注意：`state.downloaded` 已由 `fetch_http_range` 的分块读循环实时
+            // 累加（含本段被完整性守卫丢弃的情形——字节确实到过线路上，计入
+            // 带宽估算是正确的，丢弃只影响桶内容不影响吞吐判定）。
+            false
+        }
+        Err(_) => false, // 调用方退避后重试（同一段续传）
+    }
+}
+
+/// 后台整片预载线程循环。独立 `OS` 线程，与 demux/runtime/UI 都无关联——
+/// `core::time` 自然带，`AtomicBool::load(Relaxed)` 唤醒，单调追加直到
+/// `step` 返回 true（end ≥ total 或 ≥ cap 或被 stop）。失败退避 200ms 后重试
+/// 同一段续传（HTTP range 服务器天然支持），不会破坏桶的连续性。退出条件：
+/// 1) stop 信号；2) 完成（end ≥ total/cap）；3) 致命错误（连续失败默认让循环
+/// 继续；Drop 时由 `HttpRangeSource::drop` 兜底终止）。
+fn full_preload_loop(
+    agent: &ureq::Agent,
+    uri: Arc<Mutex<String>>,
+    headers: &[(String, String)],
+    state: &FullPreloadState,
+    cap: u64,
+) {
+    const RETRY_BACKOFF: Duration = Duration::from_millis(200);
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        if state.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // demux 正在消费（播放中）→ 让路：本轮不下载，把带宽完整留给 demux 的
+        // 多段并行预取。两路同时下载同一区间会把有效供给砍半（实测 23KB/s 里
+        // 一半是重复字节），而多段并行正是聚合被 CDN 限速的单连接带宽的手段
+        // ——桶只有单段顺序，既抢不过也不该抢。暂停/缓冲充足后 demux 停止
+        // read，桶自动接管并持续补到文件尾（用户定规：打开就应一直缓冲）。
+        if state.demux_active() {
+            std::thread::sleep(PRELOAD_YIELD_SLEEP);
+            continue;
+        }
+        let end_before = state.covered_until();
+        // 每步取最新 host（换 host 时自动跟随，字节偏移缓存不变 → 无缝续下）。
+        let uri_str = uri.lock().expect("uri poisoned").clone();
+        let done = full_preload_step(state, agent, &uri_str, headers, cap);
+        if done {
+            break;
+        }
+        // step 未结束：若 end 没推进 → 失败退避；否则立即下一段。
+        // 注意：与 demux 并行的良性 race 下，可能把"成功刚推进一毫米"读
+        // 成相等，代价只是偶尔多睡 200ms——不会反向，所以对桶正确性安全。
+        if state.covered_until() == end_before {
+            consecutive_failures = consecutive_failures.saturating_add(1).min(60);
+            let sleep = RETRY_BACKOFF * consecutive_failures.min(5);
+            std::thread::sleep(sleep);
+        } else {
+            consecutive_failures = 0;
+        }
+    }
+}
+
+fn full_preload_cap() -> u64 {
+    std::env::var("ERIKA_HTTP_FULLPRELOAD_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512 * 1024 * 1024)
+}
+
+/// demux 活跃判定窗口：最近该时长内有 read 即视为"正在播放"，桶让路。
+/// 500ms 覆盖播放中的常规读间隔与缓冲充足时的短暂空档，又足够短——暂停后
+/// 约 0.5s 桶即接管（用户感知不到）。
+const DEMUX_ACTIVE_WINDOW_MS: u64 = 500;
+
+/// 让路时的休眠步长，同时决定 stop 信号的响应粒度（关窗时最多多等 100ms）。
+const PRELOAD_YIELD_SLEEP: Duration = Duration::from_millis(100);
+
+/// 当前墙上时钟（epoch 毫秒）。仅用于"最近是否有 demux 读"这类粗粒度判定，
+/// 不需要单调性——系统时钟回拨最坏导致一次误判让路，无正确性影响。
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl FullPreloadState {
+    /// 构造一份新的预载状态（桶空、总长未知）。调用方随后用 `enable_full_preload`
+    /// 启动后台下载线程；线程第一个成功响应将回填 `total`。
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stop: AtomicBool::new(false),
+            end: AtomicU64::new(0),
+            downloaded: Arc::new(AtomicU64::new(0)),
+            floor: AtomicU64::new(0),
+            last_demux_read_ms: AtomicU64::new(0),
+            inner: Mutex::new(FullPreloadInner {
+                total: None,
+                start: 0,
+                bytes: Vec::new(),
+            }),
+        })
+    }
+
+    /// 全文件总长（首个成功响应回填）。None 表示尚未探测完成。
+    fn len(&self) -> Option<u64> {
+        self.inner.lock().ok().and_then(|g| g.total)
+    }
+
+    /// 已覆盖到的最大文件偏移。0 表示尚未下载任何字节。
+    fn covered_until(&self) -> u64 {
+        self.end.load(Ordering::Acquire)
+    }
+
+    /// 桶是否完整覆盖整片文件（end ≥ total 且 total 已知）。
+    fn is_complete(&self) -> bool {
+        match self.len() {
+            Some(total) => self.covered_until() >= total,
+            None => false,
+        }
+    }
+
+    /// 桶当前是否正有一段下载在飞。整片预载线程单段顺序下载，故 1/0。
+    /// 诊断面板「下载速度 > 0」「缓冲前进」直接由该字段反映出来——不再依赖
+    /// demux 主动 read 触发的 prefetch（暂停了就归 0）。
+    fn in_flight_segments(&self) -> u32 {
+        if self.is_complete() {
+            0
+        } else if self.stop.load(Ordering::Relaxed) {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// 请求线程退出。Drop 时由 HttpRangeSource 调用。Relaxed 序即可——线程在
+    /// 每次 `full_preload_step` 开头都会检查，且 0/1 二值不需要与状态量同步。
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// 记录 demux 读取时刻（由 `read_range` 每次调用）。
+    fn mark_demux_read(&self) {
+        self.last_demux_read_ms
+            .store(now_epoch_ms(), Ordering::Relaxed);
+    }
+
+    /// demux 是否在最近 `DEMUX_ACTIVE_WINDOW_MS` 内读过数据。活跃 → 桶让路：
+    /// 播放期的带宽必须完整留给 demux 的多段并行预取。两路同下同一区间会把
+    /// 有效供给砍半（实测 23KB/s 里一半是重复字节），而多段并行是聚合被 CDN
+    /// 限速的单连接带宽的关键——桶单段抢不过。暂停/缓冲充足后 demux 停止
+    /// read，桶随即接管。
+    fn demux_active(&self) -> bool {
+        let last = self.last_demux_read_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            // 尚无任何 read（open 探测阶段）：桶可先跑，demux 后续读直接命中桶。
+            return false;
+        }
+        now_epoch_ms().saturating_sub(last) < DEMUX_ACTIVE_WINDOW_MS
+    }
+
+    /// 同步 demux 端已覆盖前沿（`cache_end`）。桶据此跳过该偏移之前的区间，
+    /// 避免与 demux 并行预取重复下载同一段。单调取 max——demux 回退读（seek
+    /// 后窗口收缩）不应让 floor 倒退，否则桶会回头重下已覆盖区间。
+    fn set_floor(&self, floor: u64) {
+        self.floor.fetch_max(floor, Ordering::Relaxed);
+    }
+
+    /// 桶是否完整覆盖给定 [offset, offset+length) 范围。满足时调用方复制返回，
+    /// 走零网络直返路径。桶表示 [start, end)：起点会随 demux 前沿前移，故必须
+    /// 同时判定下界——只判 `end >= offset+length` 会在桶已前移时把低地址请求
+    /// 误判为覆盖（那些字节已随前移丢弃），`copy_range` 会 copy 出错位数据。
+    /// 未覆盖的走原 demux 链路（互不干扰）。
+    fn covers(&self, offset: u64, length: u64) -> bool {
+        // 一次加锁同时取 total 与 start：covers 在 read 热路径上每次都调，
+        // 两次 lock 无谓（无竞争但仍是两次原子操作）。
+        let (total, start) = match self.inner.lock() {
+            Ok(g) => (g.total, g.start),
+            Err(_) => return false,
+        };
+        let Some(total) = total else {
+            return false;
+        };
+        if offset >= total {
+            return false;
+        }
+        // 范围终点 = offset + length (u64 wrap 保护)
+        let end = match offset.checked_add(length) {
+            Some(e) => e,
+            None => return false,
+        };
+        offset >= start && self.covered_until() >= end
+    }
+
+    /// 复制 [offset, offset+length) 字节出桶。调用方必须先 `covers()` 返回 true。
+    /// 绝对偏移需减去桶起点 `start` 才是桶内下标。
+    fn copy_range(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        let g = self.inner.lock().ok()?;
+        if g.total.is_none() {
+            return None;
+        }
+        let end = offset.checked_add(length)?;
+        // 绝对 → 桶内相对偏移（checked_sub 覆盖 offset < start 的情况）
+        let rel_start = offset.checked_sub(g.start)?;
+        let rel_end = end.checked_sub(g.start)?;
+        if rel_end as usize > g.bytes.len() {
+            return None;
+        }
+        Some(g.bytes[rel_start as usize..rel_end as usize].to_vec())
+    }
+}
+
+/// 多源无缝换 host（Option A）参数。
+/// 死连判定：超过 `MULTI_HOST_STALL_MS` 没收到字节、且 demux 仍在调用
+/// read_range（播放活跃）→ 源已死，切到下一个候选。
+const MULTI_HOST_STALL_MS: u64 = 6_000;
+/// 活跃窗口：read_range 最近被调用的时间须落在此窗口内，才判定"在播"
+/// （暂停时不误换）。
+const MULTI_HOST_ACTIVE_MS: u64 = 6_000;
+/// 慢速提早换阈值：带宽持续低于此值（字节/秒）即切，不等完全死。
+const MULTI_HOST_LOW_BPS: f64 = 25_000.0;
+/// 换 host 后冷却：避免一轮内对同一死连反复横跳。
+const MULTI_HOST_COOLDOWN: Duration = Duration::from_secs(4);
+
+/// 当前 epoch 毫秒（与 `FullPreloadState.last_demux_read_ms` 同口径）。
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 从 URL 提取 host（仅用于诊断日志，不触及签名）。
+fn host_of(uri: &str) -> &str {
+    uri.split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or(uri)
 }
 
 impl HttpRangeSource {
@@ -489,9 +1007,6 @@ impl HttpRangeSource {
     /// 自适应段大小下限：带宽极低（<~100KB/s）时 32KB 段（8 段整窗 256KB）
     /// 约 2.5s 完成，仍在 join 超时内；再小 HTTP 请求开销占比失控。
     const MIN_PREFETCH_SEGMENT_BYTES: u64 = 32 * 1024;
-    /// 带宽估算差分窗口：每 2s 用窗口内累计下载字节更新一次 EMA。
-    /// 太短（<1s）会被单次请求的突发抖动带偏；太长响应迟缓。
-    const BANDWIDTH_ESTIMATE_WINDOW: Duration = Duration::from_secs(2);
 
     pub fn new(uri: impl Into<String>) -> Self {
         Self::with_http_headers(uri, Vec::new())
@@ -509,33 +1024,167 @@ impl HttpRangeSource {
         diag_slot: usize,
     ) -> Self {
         let agent = http_agent();
+        let rx = Arc::new(AtomicU64::new(0));
+        // 登记到本槽的实时计数器集合：宿主 poll（`source_diag_snapshot_slot`）
+        // 与 `publish_diag` 都从这里取「线路上已到达」的字节总量。
+        if let Ok(mut counters) = SOURCE_RX.lock() {
+            if let Some(list) = counters.get_mut(diag_slot) {
+                list.push(rx.clone());
+            }
+        }
+        let uri: String = uri.into();
+        let primary = uri.clone();
         Self {
-            uri: uri.into(),
+            uri: Arc::new(Mutex::new(uri)),
+            primary_uri: primary,
             agent,
             http_headers,
             content_length: None,
             diag_slot,
             cache_start: 0,
             cache_bytes: Vec::new(),
-            back_bytes: http_back_bytes(),
-            read_ahead_bytes: http_read_ahead_bytes(),
+            back_bytes: http_back_bytes(diag_slot),
+            read_ahead_bytes: http_read_ahead_bytes(diag_slot),
             est_bps: 0.0,
             last_est_at: Instant::now(),
             est_window_bytes: 0,
             prefetch: Vec::new(),
             prefetch_target: None,
             downloaded_bytes: 0,
+            rx,
+            // 整片预载默认关闭（直播源 / 单流场景不需要）：None 即不启用，
+            // 由上层在需要时通过 `set_full_preload` 注入 `FullPreloadState`。
+            full_preload: None,
+            preload_thread: None,
+            candidates: Vec::new(),
+            active_idx: 0,
+            last_byte_ms: now_ms(),
+            last_read_call_ms: now_ms(),
+            switch_cooldown_until: Instant::now(),
         }
+    }
+
+    /// 启用后台整片预载。新建 `FullPreloadState`、记录预载上限（环境变量
+    /// `ERIKA_FULL_PRELOAD_CAP`，默认 512MB），把状态 `Arc` 注入自身，再用
+    /// `std::thread::spawn` 启动独立下载线程。线程是 `Fn` 循环（不在 demux
+    /// 与 runtime 上、也不在 UI 线程上），顺序按 `full_preload_step` 推进桶：
+    /// 自然被 `core::time` 与 OS 调度器带，独立于 demux 队列——demux 暂停
+    /// 或队列已满都不影响下载继续。失败由线程自身退避重试（瞬时网络抖动
+    /// 在此消化）。返回 `self` 便于链式调用
+    ///
+    /// ```ignore
+    /// HttpRangeSource::with_http_headers_and_diag_slot(uri, hdr, slot)
+    ///     .enable_full_preload()
+    /// ```
+    ///
+    /// 注入多 host 候选（按快→慢排序的 `(uri, score)`）。必须在
+    /// `enable_full_preload` 之前调用，使桶线程捕获到含候选的共享 uri 引用。
+    /// 空列表 = 单源模式（沿用旧行为）。注入后立即把活跃 uri 切到最优候选
+    /// （index 0），保证 open 即从最快源起。
+    pub fn set_candidates(&mut self, list: Vec<(String, f64)>) {
+        if list.is_empty() {
+            self.candidates.clear();
+            return;
+        }
+        if let Some((best, _)) = list.first() {
+            *self.uri.lock().expect("uri poisoned") = best.clone();
+        }
+        self.candidates = list
+            .into_iter()
+            .map(|(uri, score)| CandidateHost { uri, score })
+            .collect();
+        self.active_idx = 0;
+        self.last_byte_ms = now_ms();
+        self.switch_cooldown_until = Instant::now();
+    }
+
+    /// 死连/慢速无缝换 host（Option A）。在 read_range / publish_diag 入口调用。
+    /// 切 host 只替换 `uri`（字节偏移缓存、预载桶、prefetch 队列全部保留），
+    /// 因此零缓存丢失、零重建 source——正解决"CDN 源死 → 周期性卡顿"。
+    fn maybe_switch_host(&mut self) {
+        if self.candidates.len() < 2 {
+            return; // 需 ≥2 个候选才有得换
+        }
+        let now = Instant::now();
+        if now < self.switch_cooldown_until {
+            return;
+        }
+        let t = now_ms();
+        // 死连：长时间无字节，但 demux 仍在调用 read_range（播放活跃）。
+        let stalled = t.saturating_sub(self.last_byte_ms) > MULTI_HOST_STALL_MS
+            && t.saturating_sub(self.last_read_call_ms) < MULTI_HOST_ACTIVE_MS;
+        // 慢速：带宽过低（提早换，不等完全死）。
+        let slow = self.est_bps > 1_000.0 && self.est_bps < MULTI_HOST_LOW_BPS;
+        if !stalled && !slow {
+            return;
+        }
+        let next = (self.active_idx + 1) % self.candidates.len();
+        if next == self.active_idx {
+            return;
+        }
+        let new_uri = self.candidates[next].uri.clone();
+        *self.uri.lock().expect("uri poisoned") = new_uri.clone();
+        http_trace_log(format!(
+            "{{\"event\":\"mhost_switch\",\"from\":{},\"to\":{},\"reason\":\"{}\",\"est_bps\":{:.0},\"next_score\":{:.2}}}",
+            self.active_idx,
+            next,
+            if stalled { "stalled" } else { "slow" },
+            self.est_bps,
+            self.candidates[next].score
+        ));
+        self.active_idx = next;
+        self.last_byte_ms = t;
+        self.switch_cooldown_until = now + MULTI_HOST_COOLDOWN;
+    }
+
+    /// 主调用方 `source_from_uri_with_hint_and_headers` / `source_from_auto_uri_with_slot`
+    /// 在 VOD 路径自动启用；直播与本地文件不调本方法。Drop 时由
+    /// `Drop for HttpRangeSource` 调 `stop.store(true, Relaxed)` 并 join 线程。
+    pub fn enable_full_preload(mut self) -> Self {
+        // 已经启用过则幂等跳过——避免上游多次构造/换源场景下重复启动。
+        if self.full_preload.is_some() || self.preload_thread.is_some() {
+            return self;
+        }
+        // 音频流（diag_slot 1）不启用整片预载桶：音频体积小（数 MB 级），
+        // 单段预取足够覆盖；桶线程与预取段并跑会把双流稳态并发推到 8，
+        // 实测触发 B 站 CDN 单 IP 并发限流（段挂死/新连接被断，见
+        // `http_prefetch_parallel` 注释）。返回未启用状态的 self（桶字段
+        // 保持 None，`in_flight_segments()` 恒 0，诊断口径不变）。
+        if self.diag_slot == 1 {
+            return self;
+        }
+        let cap = full_preload_cap();
+        let state = FullPreloadState::new();
+        // 桶的计数器和源共用同一套「实时已收」语义：桶下载期间（尤其暂停后
+        // 桶接管全速补片的阶段）宿主读到非零供给速度，而不是"暂停=0 速度"。
+        if let Ok(mut counters) = SOURCE_RX.lock() {
+            if let Some(list) = counters.get_mut(self.diag_slot) {
+                list.push(state.downloaded.clone());
+            }
+        }
+        self.full_preload = Some(state.clone());
+        let uri = self.uri.clone(); // Arc<Mutex<String>>：换 host 时桶线程自动跟随
+        let headers = self.http_headers.clone();
+        let agent = self.agent.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("erika-full-preload-{}", self.diag_slot))
+            .spawn(move || {
+                full_preload_loop(&agent, uri, &headers, &state, cap);
+            })
+            .expect("failed to spawn full-preload thread");
+        self.preload_thread = Some(handle);
+        self
     }
 
     /// 累计已下载字节进带宽估算窗口；跨 2s 差分做 EMA 更新。
     /// 同步 fetch 与预取段消费两处都调用——窗口内并行段全部计入，
     /// 估算反映多连接叠加后的真实总吞吐。
     fn record_downloaded(&mut self, bytes: u64) {
+        self.last_byte_ms = now_ms(); // 收到字节 = 源仍活着（死连检测）
         self.est_window_bytes = self.est_window_bytes.saturating_add(bytes);
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_est_at);
-        if elapsed >= Self::BANDWIDTH_ESTIMATE_WINDOW {
+        if elapsed >= BANDWIDTH_ESTIMATE_WINDOW {
             let inst_bps = self.est_window_bytes as f64 / elapsed.as_secs_f64();
             self.est_bps = if self.est_bps <= 0.0 {
                 inst_bps
@@ -566,11 +1215,22 @@ impl HttpRangeSource {
     /// 缩放，此值只在带宽估算低于实际（段比预期慢）时兜底放宽，避免
     /// 慢段被误杀后同步 fetch 反而更卡。
     fn prefetch_join_timeout(&self) -> Duration {
-        if self.est_bps <= 0.0 {
+        // 守卫必须先于除法：est_bps 为 NaN/inf（EMA 混入坏值）、趋零 denormal
+        // （长期暂停后 EMA 衰减，`refresh_bandwidth` 地板兜底前的存量值）或
+        // 低于 1bps 的"亚正常"值时，`seg / est_bps` 会得到 NaN 或天文数字，
+        // `Duration::from_secs_f64` 对 "too big or NaN" 直接 panic。而本函数
+        // 运行在 demux 线程 `extern "C"` 的 AVIO 读回调内，panic 不可 unwind
+        // → 进程 fail-fast abort（实测 0xc0000409 闪退：2026-09-01 16:55，
+        // 暂停 10 分钟后点播放即崩）。地板取 1bps 与 `refresh_bandwidth`
+        // 的零供给地板一致：这种量级必然是估算失真而非真实带宽。
+        if !(self.est_bps.is_finite() && self.est_bps >= 1.0) {
             return Self::PREFETCH_JOIN_TIMEOUT;
         }
         let seg = self.prefetch_segment_bytes() as f64;
-        let needed = seg / self.est_bps * 1.5;
+        // 上限 30s：est_bps 极小（<1.6KB/s）时 needed 无界，钳到上限后最多等
+        // 30s 放弃慢段、退化同步 fetch。自适应放宽的本意只对 ~KB/s 级慢网
+        // 有意义（32KB 段 / 8KB/s → 6s），更慢的源等再久也只是冻结 demux。
+        let needed = (seg / self.est_bps * 1.5).min(30.0);
         Self::PREFETCH_JOIN_TIMEOUT.max(Duration::from_secs_f64(needed))
     }
 
@@ -603,16 +1263,41 @@ impl HttpRangeSource {
 
     /// 把当前网络/缓冲状态发布到自己的诊断槽（宿主 UI 轮询读取）。
     /// DASH 双流（video=0/audio=1）各发布各的，互不覆盖。
-    fn publish_diag(&self) {
+    fn publish_diag(&mut self) {
+        // 多源无缝换 host：诊断刷新时顺带判定死连/慢速并切到下一候选。
+        self.maybe_switch_host();
+        // 合并桶数据：缓存窗口前沿 = max(demux 端 cache_end, 桶 covered_until)。
+        // 用户定规的核心表征——「缓冲百分比」「下载速度」—都通过这两个字段
+        // 反映：桶独立于 demux 推进，pause 后桶仍覆盖到更前方，诊断面板如实
+        // 显示「缓冲 80% 仍在涨」。
+        let cache_end = match self.full_preload.as_ref() {
+            Some(p) => self.cache_end().max(p.covered_until()),
+            None => self.cache_end(),
+        };
+        let prefetch_in_flight = match self.full_preload.as_ref() {
+            Some(p) => self.prefetch.len() + p.in_flight_segments() as usize,
+            None => self.prefetch.len(),
+        };
+        // 供给信号一律走**实时**口径：取本槽登记的全部计数器之和（源自身 rx +
+        // 整片预载桶），而不是「段完成才累加」的 `self.downloaded_bytes`。
+        let downloaded_bytes = live_rx_bytes(self.diag_slot);
+        // 拉模型结算（见 `refresh_bandwidth`）：此处刷新后写入 `self.est_bps`，
+        // 段大小/join 超时的自适应也跟着用上实时口径，慢网下不再冻结。
+        self.est_bps = refresh_bandwidth(self.diag_slot, downloaded_bytes);
+        let uri_guard = self.uri.lock().expect("uri poisoned");
+        let active_host = host_of(&uri_guard);
         if let Ok(mut slots) = SOURCE_DIAG.lock() {
             if let Some(slot) = slots.get_mut(self.diag_slot) {
                 *slot = SourceDiagSnapshot {
                     content_length: self.content_length,
                     cache_start: self.cache_start,
-                    cache_end: self.cache_end(),
-                    prefetch_in_flight: self.prefetch.len(),
-                    downloaded_bytes: self.downloaded_bytes,
+                    cache_end,
+                    prefetch_in_flight,
+                    downloaded_bytes,
                     est_bps: self.est_bps,
+                    active_host: active_host.to_string(),
+                    active_idx: self.active_idx,
+                    candidate_count: self.candidates.len(),
                 };
             }
         }
@@ -643,12 +1328,18 @@ impl HttpRangeSource {
     }
 
     fn fetch_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
+        // uri 是共享 Arc<Mutex<String>>：克隆出当前 host 字符串（不持锁过网络调用），
+        // 换 host 时桶线程/本函数各自取到最新值。
+        let uri = self.uri.lock().expect("uri poisoned").clone();
         let response = fetch_http_range(
             &self.agent,
-            &self.uri,
+            &uri,
             &self.http_headers,
             range,
             "http_range",
+            // 同步 fetch 同样实时计数：demux 正等这段数据时，宿主 poll 能看出
+            // 它到底是在下（慢）还是根本没在下（挂死）。
+            Some(self.rx.as_ref()),
         )?;
         if self.content_length.is_none() {
             self.content_length = response.total_length;
@@ -848,15 +1539,24 @@ impl HttpRangeSource {
         if end > cache_end || cache_end >= total {
             return;
         }
+        // 整片预载桶已覆盖到 demux 窗口前沿：demux 端并行预取（默认 2 段在飞）
+        // 会变成与后台线程重复下载同一区间。桶线程独立于 demux 与 runtime、
+        // 暂停也持续向前，让桶独占后续字节下载更省带宽——这里短路掉 demux
+        // 端的预取填充，避免双份流量。
+        if let Some(state) = self.full_preload.as_ref() {
+            if state.covered_until() >= cache_end {
+                return;
+            }
+        }
         let remaining = cache_end.saturating_sub(end);
-        // 激进预缓冲：只要还有存量数据即发起顺序预取，持续把 cache_end
-        // 后方的 read_ahead 窗口向前推进（对齐 PiliPlus：播放中持续
-        // 大步向前缓冲）。不设"剩余 > 半窗才停"的门限——那会导致慢网下
-        // 半窗未到预取段无法启动，且窗口被消费后才补段，预取永远落后。
-        // spawn_prefetch_window 内部以"至多 1 个在途段"为限自然停滞
-        // （已有在飞段时不重复发起），这里每次缓存命中后检查即可。
-        // **顺序单段**（防慢网/CDN 并发拼接错位，见 spawn_prefetch_window
-        // 注释）：吞吐不足由带宽自适应段大小（32KB~256KB）兜底。
+        // 激进预缓冲：只要还有存量数据即发起并行预取（spawn_prefetch_window
+        // 按 ERIKA_HTTP_PREFETCH_PARALLEL 默认 2 段在飞），持续把 cache_end
+        // 后方的 read_ahead 窗口向前推进（对齐 PiliPlus：播放中持续大步向前
+        // 缓冲）。不设"剩余 > 半窗才停"门限——慢网下半窗未到预取段无法启动，
+        // 窗口被消费后才补段，预取永远落后。段间按字节偏移连续切分、join 严格
+        // 按覆盖关系（读哪段 join 哪段），乱序完成段在队列中等待前序段——窗口
+        // 按偏移有序增长，无拼接错位（历史坏包根因是 window_slice 偏移与
+        // reset_cache 重复保留，均已修复，见各自注释）。
         let seg_len = self.prefetch_segment_bytes();
         if self.prefetch.is_empty() {
             http_trace_log(format!(
@@ -870,52 +1570,85 @@ impl HttpRangeSource {
         self.spawn_prefetch_window(cache_end, seg_len);
     }
 
-    /// 从指定字节位置起预取**一段**（顺序预取，PiliPlus mpv cache 式：
-    /// 播一段预取一段）。顺序预取（`maybe_start_prefetch`）与窗口外 seek
-    /// 预取（`prefetch_hint`）共用。
+    /// 从 `from` 起连续切分**并行预取段**，填满并发上限（默认 2 段在飞；
+    /// `ERIKA_HTTP_PREFETCH_PARALLEL` 覆盖，钳 1..=8）。顺序预取
+    /// （`maybe_start_prefetch`）与窗口外 seek 预取（`prefetch_hint`）共用。
     ///
-    /// **只发一段、任何时刻至多 1 个在途段**（`!self.prefetch.is_empty()`
-    /// 即返回）：多段并行拼接（8 段 × 32KB）在慢网/CDN 并发下实测出现
-    /// 数据错位（avcodec Invalid data 坏包的根因——HTTP 双流 demux 与
-    /// 本地文件在相同偏移读到不同字节，时序相关：同代码同用例有时
-    /// 0 错误有时 30 坏包）。顺序单段下载数据天然连续，杜绝拼接错位；
-    /// 带宽不足由自适应段大小（`prefetch_segment_bytes`，32KB~256KB）
-    /// 兜底，段消费后自动补下一段。
+    /// 历史"坏包"根因（avcodec Invalid data 的 30 坏包/时序相关）**不是并行
+    /// 本身**，而是 `window_slice` 偏移与 `reset_cache` 重复保留旧窗口数据——
+    /// 这两处已修复，并行安全。段间按字节偏移紧邻切分、join 严格按覆盖关系
+    /// （读哪段 join 哪段），乱序完成的段在队列中等待前序段，窗口按偏移有序
+    /// 增长，无拼接错位。多段并发把高 RTT/单连接限速链路的吞吐叠加 ×N：
+    /// 弱源 150-250KB/s 多为服务端单连接限速，多连接是唯一杠杆。
+    /// 从 `from` 起**连续切分**并行预取段，填满并发上限（默认 2 段在飞；
+    /// `ERIKA_HTTP_PREFETCH_PARALLEL` 覆盖）。多段并发把高 RTT/限速链路的
+    /// 单连接吞吐叠加 ×N——弱源 150-250KB/s 多为服务端单连接限速，单段
+    /// 串行无论怎么调参都突破不了，多连接是唯一杠杆。
+    /// 段间按字节偏移紧邻切分；take_prefetch 仅 join 覆盖当前读取的段，
+    /// 乱序完成的段在队列中等待前序段——窗口按偏移有序增长，无拼接错位。
+    /// 同时补上 read_ahead 窗口硬约束：在飞段+新段不得越过
+    /// `cache_end + read_ahead_bytes`（此前该上限仅在日志中打印、未真正
+    /// 执行，快网下窗口可无界涨到整个文件）。
     fn spawn_prefetch_window(&mut self, from: u64, seg_len: u64) {
         let Some(total) = self.content_length else {
             return;
         };
-        if from >= total || !self.prefetch.is_empty() {
+        if from >= total {
             return;
         }
-        // 已有 in-flight 段覆盖该起点（顺序预取与 seek 预取可能重叠）→ 不重复发
-        if self
-            .prefetch
-            .iter()
-            .any(|p| p.range.start < from.saturating_add(seg_len) && from < p.range_end())
-        {
-            return;
-        }
-        let len = seg_len.min(total.saturating_sub(from));
-        if len == 0 {
-            return;
-        }
-        let prefetch_range = ByteRange {
-            start: from,
-            length: Some(len),
+        let window_cap = self.cache_end().saturating_add(self.read_ahead_bytes);
+        // 音频流（diag_slot 1）强制单段：音频码率 ≈ 视频的 1/10，单段吞吐
+        // 绰绰有余，多连接只有并发风险没有收益。双流各按视频上限拉段时
+        // 稳态并发 8（v3+桶1 + a3+桶1），实测触发 B 站 CDN 单 IP 并发限流
+        // ——在飞段集体挂死 0 字节、新连接 Peer disconnected（见
+        // `http_prefetch_parallel` 注释）。压并发是"点播放转圈/播不出"的
+        // 主修复之一。
+        let parallel = if self.diag_slot == 1 {
+            1
+        } else {
+            http_prefetch_parallel()
         };
-        http_trace_log(format!(
-            "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{},\"in_flight\":{}}}",
-            prefetch_range.start,
-            len,
-            self.prefetch.len(),
-        ));
-        self.prefetch.push(PendingHttpFetch::spawn(
-            self.uri.clone(),
-            self.http_headers.clone(),
-            prefetch_range,
-        ));
-        self.publish_diag();
+        let mut cursor = from;
+        while self.prefetch.len() < parallel {
+            if cursor >= total || cursor >= window_cap {
+                break;
+            }
+            // 已有在飞段覆盖 cursor（顺序预取与 seek 预取可能重叠）→
+            // 跳到该段末尾继续切下一段
+            if let Some(covered_end) = self
+                .prefetch
+                .iter()
+                .find(|p| p.range.start <= cursor && cursor < p.range_end())
+                .map(|p| p.range_end())
+            {
+                cursor = covered_end;
+                continue;
+            }
+            let len = seg_len
+                .min(total.saturating_sub(cursor))
+                .min(window_cap.saturating_sub(cursor));
+            if len == 0 {
+                break;
+            }
+            let prefetch_range = ByteRange {
+                start: cursor,
+                length: Some(len),
+            };
+            http_trace_log(format!(
+                "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{},\"in_flight\":{}}}",
+                prefetch_range.start,
+                len,
+                self.prefetch.len(),
+            ));
+            self.prefetch.push(PendingHttpFetch::spawn(
+                self.uri.lock().expect("uri poisoned").clone(),
+                self.http_headers.clone(),
+                prefetch_range,
+                self.rx.clone(),
+            ));
+            self.publish_diag();
+            cursor = cursor.saturating_add(len);
+        }
     }
 
     /// 窗口外 seek 的目标预取提示（由 AVIO seek 钩子调用）。target 超出
@@ -963,7 +1696,14 @@ impl HttpRangeSource {
 }
 
 impl PendingHttpFetch {
-    fn spawn(uri: String, http_headers: Vec<(String, String)>, range: ByteRange) -> Self {
+    /// `progress`：与源共享的实时计数器。预取段是慢网下的主要数据通路，
+    /// **在飞期间**就要能看出字节在涨——否则宿主只能等整段完成才知道有供给。
+    fn spawn(
+        uri: String,
+        http_headers: Vec<(String, String)>,
+        range: ByteRange,
+        progress: Arc<AtomicU64>,
+    ) -> Self {
         http_trace_log(format!(
             "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{}}}",
             range.start,
@@ -976,8 +1716,14 @@ impl PendingHttpFetch {
         let (sender, receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
             let agent = http_agent();
-            let result =
-                fetch_http_range(&agent, &uri, &http_headers, range, "http_prefetch_range");
+            let result = fetch_http_range(
+                &agent,
+                &uri,
+                &http_headers,
+                range,
+                "http_prefetch_range",
+                Some(progress.as_ref()),
+            );
             let _ = sender.send(result);
         });
         Self {
@@ -1000,11 +1746,40 @@ impl PendingHttpFetch {
 
 impl Drop for HttpRangeSource {
     fn drop(&mut self) {
+        // 后台整片预载线程：**只置 stop，不 join**（见 `preload_thread` 字段
+        // 注释）。线程下次循环看到 `stop` 即退出——关闭播放窗后网络连接在
+        // 一个段请求（≤256KB，几十毫秒）内归零，绝不阻塞 UI 线程。把句柄
+        // take 出来再 drop，让线程在 stop 后自然结束而非 leaked（保持可观测）。
+        // 注销实时计数器：按 `Arc::ptr_eq` 精确摘掉自己登记的那几个（换源时
+        // 新源已先登记，误删会让它"永远 0 字节"→ 换源后立刻被判饥饿）。
+        let unregister = |counter: &Arc<AtomicU64>| {
+            if let Ok(mut counters) = SOURCE_RX.lock() {
+                if let Some(list) = counters.get_mut(self.diag_slot) {
+                    list.retain(|c| !Arc::ptr_eq(c, counter));
+                }
+            }
+        };
+        unregister(&self.rx);
+        if let Some(state) = self.full_preload.take() {
+            unregister(&state.downloaded);
+            state.stop();
+        }
+        if let Some(handle) = self.preload_thread.take() {
+            drop(handle); // 线程已在 stop 后自退，drop 句柄不阻塞（detached）。
+        }
         // source 销毁（播放停止/换源）→ 清空**自己的**诊断槽，宿主读到
         // 零值即"该流无播放"。只清本槽：DASH 双流另一条流的诊断不受影响。
         if let Ok(mut slots) = SOURCE_DIAG.lock() {
             if let Some(slot) = slots.get_mut(self.diag_slot) {
                 *slot = SourceDiagSnapshot::default();
+            }
+        }
+        // 带宽采样点一并作废：新源从 0 起累计，若沿用旧基线会算出
+        // `saturating_sub = 0` 的瞬时速率并拖低 EMA（新源起步期被低估）。
+        // 清成 None → 下一个窗口冷启动，直接取真实瞬时值。
+        if let Ok(mut samples) = SOURCE_BW.lock() {
+            if let Some(entry) = samples.get_mut(self.diag_slot) {
+                *entry = None;
             }
         }
     }
@@ -1091,6 +1866,9 @@ impl HttpLiveStreamSource {
                     prefetch_in_flight: 0,
                     downloaded_bytes: self.downloaded_bytes,
                     est_bps: 0.0,
+                    active_host: String::new(),
+                    active_idx: 0,
+                    candidate_count: 0,
                 };
             }
         }
@@ -1350,12 +2128,21 @@ fn http_range_header(range: ByteRange) -> String {
     }
 }
 
+/// body 分块读取的块大小。64KB 兼顾两件事：块够大 → 单次 `fetch_add` 的
+/// 原子操作开销可忽略（1MB/s 下每秒仅 16 次）；块够小 → 慢网（如 50KB/s）
+/// 下每 1.3s 就有一次进度可见，诊断不会"长时间不动"。
+const HTTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
+
+/// `progress`：实时进度计数器（可选）。**不为 None 时**，body 每读到一块就
+/// `fetch_add` 一次，使 `downloaded_bytes` 在段传输期间持续增长——慢网下
+/// 「正在缓慢下载」不再被宿主差分读成 0（换源/降档误判的根因）。
 fn fetch_http_range(
     agent: &ureq::Agent,
     uri: &str,
     http_headers: &[(String, String)],
     range: ByteRange,
     event: &str,
+    progress: Option<&AtomicU64>,
 ) -> Result<HttpRangeResponse> {
     let mut bytes = Vec::new();
     let mut total_length = None;
@@ -1509,7 +2296,28 @@ fn fetch_http_range(
                 )));
             }
         }
-        if let Err(error) = response.body_mut().as_reader().read_to_end(&mut bytes) {
+        // 分块读替代 `read_to_end`：每块到达即累加实时进度（见 `progress` 参数
+        // 注释）。读失败时保留已到达的字节——下面的重试按 `bytes.len()` 续传，
+        // 已计入的字节不会被重复计数。
+        let mut reader = response.body_mut().as_reader();
+        let mut chunk = [0u8; HTTP_RECV_CHUNK_BYTES];
+        let mut read_error: Option<std::io::Error> = None;
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(counter) = progress {
+                        counter.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+                Err(error) => {
+                    read_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = read_error {
             http_trace_log(format!(
                 "{{\"event\":\"{}_error\",\"phase\":\"body\",\"attempt\":{},\"start\":{},\"length\":{},\"status\":{},\"bytes\":{},\"elapsed_ms\":{:.3},\"error\":\"{}\"}}",
                 event,
@@ -1561,8 +2369,9 @@ fn fetch_http_range(
 
 impl std::fmt::Debug for HttpRangeSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let u = self.uri.lock().expect("uri poisoned");
         f.debug_struct("HttpRangeSource")
-            .field("uri", &redacted_uri(&self.uri))
+            .field("uri", &redacted_uri(&u))
             .field("content_length", &self.content_length)
             .field("cache_start", &self.cache_start)
             .field("cache_bytes", &self.cache_bytes.len())
@@ -1573,7 +2382,7 @@ impl std::fmt::Debug for HttpRangeSource {
 
 impl MediaSource for HttpRangeSource {
     fn uri(&self) -> &str {
-        &self.uri
+        &self.primary_uri
     }
 
     fn len(&mut self) -> Result<Option<u64>> {
@@ -1583,7 +2392,7 @@ impl MediaSource for HttpRangeSource {
         let started = Instant::now();
         http_trace_log(format!(
             "[erika-http-trace] stage=head_request uri={} cache_start={} cache_end={} read_ahead={}",
-            redacted_uri(&self.uri),
+            redacted_uri(&self.uri.lock().expect("uri poisoned")),
             self.cache_start,
             self.cache_end(),
             self.read_ahead_bytes,
@@ -1596,10 +2405,11 @@ impl MediaSource for HttpRangeSource {
         // repeated `len()` probes without Content-Length do not rebuild the TLS
         // client, while still keeping HEAD sockets out of the range-request pool.
         let head_agent = http_agent();
+        let uri = self.uri.lock().expect("uri poisoned").clone();
         let mut attempt = 0u32;
         let head_error = loop {
             attempt += 1;
-            let mut request = head_agent.head(&self.uri);
+            let mut request = head_agent.head(&uri);
             for (name, value) in &self.http_headers {
                 request = request.header(name, value);
             }
@@ -1622,9 +2432,10 @@ impl MediaSource for HttpRangeSource {
                             status,
                             started.elapsed().as_secs_f64() * 1000.0,
                         ));
+                        let uri = self.uri.lock().expect("uri poisoned").clone();
                         return match probe_http_total_length(
                             &self.agent,
-                            &self.uri,
+                            &uri,
                             &self.http_headers,
                         ) {
                             Ok(total_length) => {
@@ -1676,7 +2487,8 @@ impl MediaSource for HttpRangeSource {
             "[erika-http-trace] stage=head_fallback_range error={}",
             json_escape(&head_error.to_string()),
         ));
-        match probe_http_total_length(&self.agent, &self.uri, &self.http_headers) {
+        let uri = self.uri.lock().expect("uri poisoned").clone();
+        match probe_http_total_length(&self.agent, &uri, &self.http_headers) {
             Ok(total_length) => {
                 self.content_length = total_length;
                 self.publish_diag();
@@ -1691,6 +2503,38 @@ impl MediaSource for HttpRangeSource {
     }
 
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
+        self.last_read_call_ms = now_ms();
+        self.maybe_switch_host();
+        // 与整片预载桶的两个协同信号（都是无锁原子写，每次读刷新，成本可忽略）：
+        // ① mark_demux_read：告诉桶"demux 正在消费"，播放中桶让路，把带宽完整
+        //    留给 demux 的多段并行预取（聚合被 CDN 限速的单连接带宽）；
+        // ② set_floor：把 demux 已覆盖前沿交给桶，桶跳过该偏移之前的区间，
+        //    绝不重复下载 demux 已下过的字节（重复下载会让有效供给砍半）。
+        if let Some(state) = self.full_preload.as_ref() {
+            state.mark_demux_read();
+            state.set_floor(self.cache_end());
+        }
+        // 整片预载桶优先：桶 [start, covered_until) 是独立线程下载、跨 demux 与
+        // 暂停依然持续推进的"档案式"内存镜像。被桶完整覆盖的请求直接复制
+        // 返回（零网络，绕开 demux prefetch 队列的全部路径），让 demux 哪怕
+        // 暂停也能从桶里取到字节流而不退化。
+        if let Some(state) = self.full_preload.as_ref() {
+            if let Some(length) = range.length {
+                if state.covers(range.start, length) {
+                    if let Some(bytes) = state.copy_range(range.start, length) {
+                        self.maybe_start_prefetch(range);
+                        self.publish_diag();
+                        http_trace_log(format!(
+                            "{{\"event\":\"http_full_preload_hit\",\"start\":{},\"length\":{}}}",
+                            range.start,
+                            length,
+                        ));
+                        trace_read_return("http_read_full_preload", range, self, &bytes);
+                        return Ok(bytes);
+                    }
+                }
+            }
+        }
         if let Some(bytes) = self.cached_slice(range) {
             self.maybe_start_prefetch(range);
             http_trace_log(format!(
@@ -1833,15 +2677,16 @@ pub fn source_from_uri_with_hint(
     uri: &str,
     source_hint: MediaSourceHint,
 ) -> Result<Box<dyn MediaSource>> {
-    source_from_uri_with_hint_and_headers(uri, source_hint, Vec::new())
+    source_from_uri_with_hint_and_headers(uri, source_hint, Vec::new(), Vec::new())
 }
 
 pub fn source_from_uri_with_hint_and_headers(
     uri: &str,
     source_hint: MediaSourceHint,
     http_headers: Vec<(String, String)>,
+    candidates: Vec<(String, f64)>,
 ) -> Result<Box<dyn MediaSource>> {
-    source_from_uri_with_hint_and_headers_slot(uri, source_hint, http_headers, 0)
+    source_from_uri_with_hint_and_headers_slot(uri, source_hint, http_headers, 0, candidates)
 }
 
 /// 同 `source_from_uri_with_hint_and_headers`，但指定诊断槽位
@@ -1851,17 +2696,19 @@ pub(crate) fn source_from_uri_with_hint_and_headers_slot(
     source_hint: MediaSourceHint,
     http_headers: Vec<(String, String)>,
     diag_slot: usize,
+    candidates: Vec<(String, f64)>,
 ) -> Result<Box<dyn MediaSource>> {
     match source_hint {
-        MediaSourceHint::Auto => source_from_auto_uri_with_slot(uri, http_headers, diag_slot),
+        MediaSourceHint::Auto => {
+            source_from_auto_uri_with_slot(uri, http_headers, diag_slot, candidates)
+        }
         MediaSourceHint::LocalFile => source_from_local_uri(uri),
         MediaSourceHint::Http => {
             if uri.starts_with("http://") || uri.starts_with("https://") {
-                Ok(Box::new(HttpRangeSource::with_http_headers_and_diag_slot(
-                    uri,
-                    http_headers,
-                    diag_slot,
-                )))
+                let mut s =
+                    HttpRangeSource::with_http_headers_and_diag_slot(uri, http_headers, diag_slot);
+                s.set_candidates(candidates);
+                Ok(Box::new(s.enable_full_preload()))
             } else {
                 Err(SourceError::Unsupported(uri.to_string()))
             }
@@ -1886,6 +2733,7 @@ fn source_from_auto_uri_with_slot(
     uri: &str,
     http_headers: Vec<(String, String)>,
     diag_slot: usize,
+    candidates: Vec<(String, f64)>,
 ) -> Result<Box<dyn MediaSource>> {
     if uri.starts_with("fd://") {
         return source_from_local_uri(uri);
@@ -1894,11 +2742,10 @@ fn source_from_auto_uri_with_slot(
         return Ok(Box::new(LocalFileSource::open(path)?));
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        return Ok(Box::new(HttpRangeSource::with_http_headers_and_diag_slot(
-            uri,
-            http_headers,
-            diag_slot,
-        )));
+        let mut s =
+            HttpRangeSource::with_http_headers_and_diag_slot(uri, http_headers, diag_slot);
+        s.set_candidates(candidates);
+        return Ok(Box::new(s.enable_full_preload()));
     }
     let path = Path::new(uri);
     if path.exists() {
@@ -1941,22 +2788,80 @@ fn range_contains(container: ByteRange, range: ByteRange) -> bool {
     range.start >= container.start && range_end <= container_end
 }
 
-fn http_read_ahead_bytes() -> u64 {
+/// DASH 音频流（diag_slot > 0）的默认 read-ahead。音频码率与视频差两个
+/// 数量级：B 站音频 128-320Kbps（杜比 ~768Kbps）≈ 40-96KB/s，而视频
+/// 1080P ≈ 2-4MB/s。**之前音频与视频共用同一 read-ahead（宿主 24MB）**
+/// ——24MB 音频 = 4-10 分钟的缓冲，纯浪费（音频消费端 audio_lead_time
+/// 仅 1.5s）。2MB 对 40KB/s 也有 50s 余量，弱网 + 自适应段大小（32KB
+/// 下限）下预取链路依然成立。整体省 ~22MB 播放常驻。
+const AUDIO_DEFAULT_READ_AHEAD_BYTES: u64 = 2 * 1024 * 1024;
+/// DASH 音频流默认 back buffer（对齐上面音频 read-ahead 的量级逻辑）：
+/// 1MB ≈ 10-25s 的回退缓冲，seek 回退命中缓存足够；再大性价比低。
+const AUDIO_DEFAULT_BACK_BUFFER_BYTES: u64 = 1024 * 1024;
+
+/// diag_slot == 0：视频/单流（跟随 `ERIKA_HTTP_READAHEAD_BYTES`，默认
+/// `DEFAULT_READ_AHEAD_BYTES`）。diag_slot > 0：DASH 音频流——**用音频
+/// 默认值而非视频值**（见 `AUDIO_DEFAULT_READ_AHEAD_BYTES` 注释），可用
+/// `ERIKA_HTTP_READAHEAD_BYTES_AUDIO` 覆盖（设 0 关闭音频预取）。
+/// 顺序预取并行在途段数（`ERIKA_HTTP_PREFETCH_PARALLEL` 覆盖，默认 2，
+/// 钳制 1..=8；音频流强制 1，见 `spawn_prefetch_window`）。多段并发把
+/// 高 RTT/单连接限速链路的吞吐叠加 ×N；段间按字节偏移连续切分、join
+/// 严格按覆盖关系（读哪段 join 哪段），乱序完成的段在队列中等待前序段
+/// ——窗口按偏移有序增长，无拼接错位。历史"坏包"根因是 window_slice
+/// 偏移与 reset_cache 重复保留（均已修复），并行安全。
+///
+/// **默认 3→2（2026-09-02）**：DASH 双流各按上限拉段，视频 3 + 桶 1 +
+/// 音频 3 + 桶 1 = 8 个并发 Range 连接。B 站 CDN 对单 IP 并发连接数
+/// 有限制，实测 8 并发触发限流惩罚：在飞段集体挂死（0 字节数十秒）、
+/// 新建连接被主动断开（Peer disconnected / TLS unexpected EOF）→ open
+/// 失败循环 + 播放约 10s 追上缓冲边界后断流。2 并行 + 桶 + 音频单段
+/// 把稳态并发压到 4，仍是单连接限速下 2-4 倍吞吐聚合。
+fn http_prefetch_parallel() -> usize {
+    std::env::var("ERIKA_HTTP_PREFETCH_PARALLEL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 8))
+        .unwrap_or(2)
+}
+
+fn http_read_ahead_bytes(diag_slot: usize) -> u64 {
+    if diag_slot > 0 {
+        return env::var("ERIKA_HTTP_READAHEAD_BYTES_AUDIO")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(AUDIO_DEFAULT_READ_AHEAD_BYTES);
+    }
     env::var("ERIKA_HTTP_READAHEAD_BYTES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(HttpRangeSource::DEFAULT_READ_AHEAD_BYTES)
 }
 
-fn http_back_bytes() -> u64 {
+/// 同 [`http_read_ahead_bytes`]：视频/单流走 `ERIKA_HTTP_BACK_BYTES`，
+/// 音频流走 `ERIKA_HTTP_BACK_BYTES_AUDIO`（默认 `AUDIO_DEFAULT_BACK_BUFFER_BYTES`）。
+fn http_back_bytes(diag_slot: usize) -> u64 {
+    if diag_slot > 0 {
+        return env::var("ERIKA_HTTP_BACK_BYTES_AUDIO")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(AUDIO_DEFAULT_BACK_BUFFER_BYTES);
+    }
     env::var("ERIKA_HTTP_BACK_BYTES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(HttpRangeSource::DEFAULT_BACK_BUFFER_BYTES)
 }
 
+/// ERIKA_HTTP_TRACE 门控缓存（进程内 env 只在启动阶段写入，值不变）。
+/// read_range 每个 cache hit 都会走 http_trace_log（FFmpeg AVIO 32KB 块读
+/// → 视频流 ~100 次/秒）——此前每次都做 env::var 查询：Windows 上拿进程
+/// 环境锁 + 线性查找，在 demux 热路径上是实打实的锁竞争开销。LazyLock
+/// 首次求值后零开销（宿主在 main 早期 set_var，先于任何源创建，时序安全）。
+static HTTP_TRACE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| trace::env_flag("ERIKA_HTTP_TRACE"));
+
 fn http_trace_log(line: impl AsRef<str>) {
-    if !trace::env_flag("ERIKA_HTTP_TRACE") {
+    if !*HTTP_TRACE_ENABLED {
         return;
     }
     let path = env::var_os("ERIKA_HTTP_TRACE_FILE")
@@ -2017,6 +2922,39 @@ mod tests {
             Duration::from_millis(200)
         ));
         assert!(!http_retry_fits_budget(nearly_done, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn full_preload_skips_ranges_already_covered_by_demux() {
+        // demux 并行预取跑赢桶时，桶必须整体前移到 demux 前沿再继续下载——
+        // 否则就是与 demux 重复下载同一区间，有效供给被自己砍半（实测
+        // 23KB/s 里一半是重复字节，缓冲永远建不起来 → 一路饥渴换源 → 换到
+        // 差源就表现为"拉流失败"）。
+        let body = vec![7u8; 256 * 1024];
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(512 * 1024, 1024 * 1024, &body),
+        )]);
+        let state = FullPreloadState::new();
+        state.inner.lock().unwrap().total = Some(1024 * 1024);
+        // demux 已覆盖到 512KB
+        state.set_floor(512 * 1024);
+
+        // 第一步：只前移（丢弃 demux 已持有的旧字节），不发任何网络请求
+        assert!(!full_preload_step(&state, &http_agent(), &uri, &[], 1024 * 1024));
+        assert_eq!(state.covered_until(), 512 * 1024);
+        assert!(
+            requests.recv_timeout(Duration::from_millis(100)).is_err(),
+            "前移步不应发起请求"
+        );
+
+        // 第二步：从 demux 前沿（512KB）起下载，绝不回头重下 [0, 512KB)
+        assert!(!full_preload_step(&state, &http_agent(), &uri, &[], 1024 * 1024));
+        let head = recv_request_head(&requests);
+        assert!(
+            head.contains("range: bytes=524288-"),
+            "应从 demux 前沿 512KB 起下载，实际请求头: {head}"
+        );
+        assert_eq!(state.covered_until(), 512 * 1024 + 256 * 1024);
     }
 
     struct MockResponse {
@@ -2217,6 +3155,45 @@ mod tests {
     // ---- 带宽自适应（弱网修复）：段大小 / join 超时 / 估算器 ----
 
     #[test]
+    fn dash_audio_source_uses_small_buffers_by_default() {
+        // 音频流（diag_slot=1）：read-ahead/back 走音频独立配置（码率比
+        // 视频低两个数量级，视频级窗口是纯浪费——见 AUDIO_DEFAULT_* 注释）。
+        // 断言按"构造值 == 同槽位配置函数值"路由一致性写，宿主设置
+        // ERIKA_HTTP_*_BYTES 环境变量时测试依然成立（env 变更在 edition
+        // 2024 是 unsafe，测试不做增删）。
+        let audio = HttpRangeSource::with_http_headers_and_diag_slot(
+            "https://example.invalid/audio.m4s",
+            Vec::new(),
+            1,
+        );
+        assert_eq!(audio.read_ahead_bytes, http_read_ahead_bytes(1));
+        assert_eq!(audio.back_bytes, http_back_bytes(1));
+        // 音频槽位不继承视频槽位的 env 覆盖（宿主只调大 ERIKA_HTTP_
+        // READAHEAD_BYTES 时，音频保持 2MB 小窗而非跟着变大）
+        unsafe {
+            std::env::set_var("ERIKA_HTTP_READAHEAD_BYTES", "8388608");
+        }
+        let audio_after = HttpRangeSource::with_http_headers_and_diag_slot(
+            "https://example.invalid/audio.m4s",
+            Vec::new(),
+            1,
+        );
+        let video_after = HttpRangeSource::with_http_headers_and_diag_slot(
+            "https://example.invalid/video.m4s",
+            Vec::new(),
+            0,
+        );
+        assert_eq!(audio_after.read_ahead_bytes, AUDIO_DEFAULT_READ_AHEAD_BYTES);
+        assert_eq!(video_after.read_ahead_bytes, 8 * 1024 * 1024);
+        // 常规测试环境（两个 env 均未设置）：音频与视频同为内核默认 2MB，
+        // 区别只在宿主调大视频窗口时显现
+        assert_eq!(
+            HttpRangeSource::DEFAULT_READ_AHEAD_BYTES,
+            AUDIO_DEFAULT_READ_AHEAD_BYTES
+        );
+    }
+
+    #[test]
     fn prefetch_segment_bytes_scales_with_estimated_bandwidth() {
         let mut source = HttpRangeSource::new("https://example.invalid/video.m4s");
         // 冷启动（带宽未知）：保持 256KB 原行为
@@ -2253,6 +3230,113 @@ mod tests {
         );
     }
 
+    /// 预构造一个已完成/延迟完成的预取段（不经真实 HTTP：sender 由测试
+    /// 控制发送时机，可模拟乱序完成）。
+    fn pending_from_bytes(range: ByteRange, bytes: Vec<u8>, delay_ms: u64) -> PendingHttpFetch {
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            if delay_ms > 0 {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+            let _ = sender.send(Ok(HttpRangeResponse {
+                bytes,
+                total_length: None,
+            }));
+        });
+        PendingHttpFetch {
+            range,
+            handle,
+            receiver,
+        }
+    }
+
+    /// 每个文件偏移一个确定的字节值——任何拼接错位都会让断言立刻失败。
+    fn patterned(range: ByteRange) -> Vec<u8> {
+        (0..range.length.unwrap_or(0))
+            .map(|i| ((range.start + i) % 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn parallel_prefetch_joins_out_of_order_completions_in_offset_order() {
+        let mut source = HttpRangeSource::new("https://example.invalid/v.m4s");
+        source.content_length = Some(1024 * 1024);
+        source.cache_start = 0;
+        source.cache_bytes = patterned(ByteRange {
+            start: 0,
+            length: Some(256 * 1024),
+        });
+        let seg1 = ByteRange {
+            start: 256 * 1024,
+            length: Some(256 * 1024),
+        };
+        let seg2 = ByteRange {
+            start: 512 * 1024,
+            length: Some(256 * 1024),
+        };
+        // seg2 先完成、seg1 延迟 200ms —— 并行下载的乱序完成场景
+        source.prefetch.push(pending_from_bytes(seg2, patterned(seg2), 0));
+        source.prefetch.push(pending_from_bytes(seg1, patterned(seg1), 200));
+
+        // 读 seg1 起点：join seg1（等它完成），必须返回 seg1 的字节
+        let out = source
+            .read_range(ByteRange {
+                start: 256 * 1024,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        assert_eq!(out, patterned(ByteRange { start: 256 * 1024, length: Some(64 * 1024) }));
+        // 窗口连续延伸到 seg1 末尾；队列 = seg2（等待）+ join 后自动回填的
+        // seg3（流水线常满：消费一段即补一段）
+        assert_eq!(source.cache_end(), 512 * 1024);
+        assert_eq!(source.prefetch.len(), 2);
+
+        // 读 seg2：join 后字节正确（绝不允许 seg1/seg2 内容错位）
+        let out = source
+            .read_range(ByteRange {
+                start: 512 * 1024,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        assert_eq!(out, patterned(ByteRange { start: 512 * 1024, length: Some(64 * 1024) }));
+        assert_eq!(source.cache_end(), 768 * 1024);
+        // join seg2 后 refill 又回填 [768K,1MB)（该段打 example.invalid 不可达
+        // 而 Err，窗口推进到它时走同步兜底——队列非空属正常）
+        assert_eq!(source.prefetch.len(), 1);
+    }
+
+    #[test]
+    fn spawn_prefetch_fills_parallel_segments() {
+        let mut source = HttpRangeSource::new("https://example.invalid/v.m4s");
+        source.content_length = Some(8 * 1024 * 1024);
+        source.cache_start = 0;
+        source.cache_bytes = vec![0u8; 256 * 1024];
+        source.read_ahead_bytes = 1024 * 1024;
+        source.spawn_prefetch_window(256 * 1024, 256 * 1024);
+        // 并发上限 2（默认，2026-09-02 由 3 下调——见 `http_prefetch_parallel`）：
+        // 从 cache_end 起连续切 2 段
+        assert_eq!(source.prefetch.len(), 2);
+        for (i, p) in source.prefetch.iter().enumerate() {
+            assert_eq!(p.range.start, (256 * 1024 + i * 256 * 1024) as u64);
+            assert_eq!(p.range.length, Some(256 * 1024));
+        }
+    }
+
+    #[test]
+    fn prefetch_respects_read_ahead_window_cap() {
+        let mut source = HttpRangeSource::new("https://example.invalid/v.m4s");
+        source.content_length = Some(8 * 1024 * 1024);
+        source.cache_start = 0;
+        source.cache_bytes = vec![0u8; 256 * 1024];
+        // 窗口上限 = cache_end + 384KB = 640KB：第二段被截到 128KB
+        source.read_ahead_bytes = 384 * 1024;
+        source.spawn_prefetch_window(256 * 1024, 256 * 1024);
+        assert_eq!(source.prefetch.len(), 2);
+        assert_eq!(source.prefetch[0].range.length, Some(256 * 1024));
+        assert_eq!(source.prefetch[1].range.length, Some(128 * 1024));
+        assert_eq!(source.prefetch[1].range_end(), 640 * 1024);
+    }
+
     #[test]
     fn prefetch_join_timeout_widens_when_bandwidth_is_low() {
         let mut source = HttpRangeSource::new("https://example.invalid/video.m4s");
@@ -2268,6 +3352,31 @@ mod tests {
         let widened = source.prefetch_join_timeout();
         assert!(widened > Duration::from_secs(5));
         assert_eq!(widened.as_secs_f64(), 32.0 * 1024.0 / (8.0 * 1024.0) * 1.5);
+    }
+
+    #[test]
+    fn prefetch_join_timeout_survives_degenerate_bandwidth_estimates() {
+        // 回归（2026-09-01 16:55 闪退）：暂停 10 分钟后 EMA 衰减到 denormal 级
+        // est_bps，`seg / est_bps` 得到 ~1e44 秒，`Duration::from_secs_f64`
+        // panic（"too big"），且 panic 落在 `extern "C"` AVIO 回调内不可
+        // unwind → 进程 fail-fast（0xc0000409）。此处逐一验证退化输入
+        // 都回落默认 5s 超时而不是 panic。
+        let mut source = HttpRangeSource::new("https://example.invalid/video.m4s");
+        // denormal 趋零（EMA 衰减 ~300 个 2s 窗口的产物）
+        source.est_bps = 1e-40;
+        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(5));
+        // NaN / inf（坏值混入 EMA 的假想情形）
+        source.est_bps = f64::NAN;
+        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(5));
+        source.est_bps = f64::INFINITY;
+        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(5));
+        // 低于 1bps 地板（与 refresh_bandwidth 零供给地板一致）：视为未知
+        source.est_bps = 0.001;
+        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(5));
+        // 有限但荒谬小的带宽（10bps）：needed ~4915s → 钳到 30s 上限，
+        // 最多等 30s 就放弃慢段退化同步 fetch，而不是冻结 demux 半小时
+        source.est_bps = 10.0;
+        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(30));
     }
 
     #[test]
@@ -2475,11 +3584,13 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_spawns_single_sequential_segment() {
+    fn prefetch_spawns_parallel_segments() {
         let body: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
-        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
-            http_206_response(1024 * 1024, 128 * 1024 * 1024, &body),
-        )]);
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(1024 * 1024, 128 * 1024 * 1024, &body)),
+            MockResponse::immediate(http_206_response(1024 * 1024 + 256 * 1024, 128 * 1024 * 1024, &body)),
+            MockResponse::immediate(http_206_response(1024 * 1024 + 512 * 1024, 128 * 1024 * 1024, &body)),
+        ]);
         let mut source = HttpRangeSource::new(uri);
         source.content_length = Some(128 * 1024 * 1024);
         source.read_ahead_bytes = 12 * 1024 * 1024;
@@ -2491,15 +3602,17 @@ mod tests {
             length: Some(1024 * 1024),
         };
         source.maybe_start_prefetch(range);
-        // **任何时刻至多 1 个在途段**（顺序预取，PiliPlus mpv cache 式）：
-        // 多段并行拼接在慢网/CDN 并发下实测出现数据错位，顺序单段天然连续；
-        // 段从 cache_end 起连续、长度为冷启动默认段大小
-        assert_eq!(source.prefetch.len(), 1);
-        assert_eq!(source.prefetch[0].range.start, source.cache_end());
-        assert_eq!(
-            source.prefetch[0].range.length,
-            Some(HttpRangeSource::SEEK_PREFETCH_SEGMENT_BYTES)
-        );
+        // 并行预取（默认 2 段在飞）：从 cache_end 起按偏移连续切 2 段，
+        // 段间紧邻；join 按覆盖关系保序，乱序完成不产生拼接错位
+        //（错位回归由 parallel_prefetch_joins_out_of_order 测试盯防）。
+        assert_eq!(source.prefetch.len(), 2);
+        for (i, p) in source.prefetch.iter().enumerate() {
+            assert_eq!(p.range.start, source.cache_end() + (i * 256 * 1024) as u64);
+            assert_eq!(
+                p.range.length,
+                Some(HttpRangeSource::SEEK_PREFETCH_SEGMENT_BYTES)
+            );
+        }
         // 后台请求确已发出
         let _ = recv_request_head(&requests);
     }
@@ -2524,11 +3637,11 @@ mod tests {
             length: Some(1024 * 1024),
         };
         source.maybe_start_prefetch(range);
-        assert_eq!(source.prefetch.len(), 1);
+        assert_eq!(source.prefetch.len(), 2);
         // 模拟回退读后窗口收缩：新窗口 [512KB, 768KB)，在飞段（1MB 起）
-        // 在窗口末尾之外 → 必须保留
+        // 在窗口末尾之外 → 必须保留（全部 2 段）
         source.reset_cache(512 * 1024, vec![0u8; 256 * 1024]);
-        assert_eq!(source.prefetch.len(), 1);
+        assert_eq!(source.prefetch.len(), 2);
         assert_eq!(source.prefetch[0].range.start, 1024 * 1024);
         for p in &source.prefetch {
             assert!(p.range.start >= source.cache_end());
@@ -2634,7 +3747,12 @@ mod tests {
             start: 0,
             length: Some(100),
         };
-        source.prefetch = vec![PendingHttpFetch::spawn(uri, Vec::new(), range)];
+        source.prefetch = vec![PendingHttpFetch::spawn(
+            uri,
+            Vec::new(),
+            range,
+            Arc::new(AtomicU64::new(0)),
+        )];
         assert_eq!(source.read_range(range).unwrap(), body);
         let _ = recv_request_head(&requests);
         // Joining the pending prefetch must not issue a duplicate download.
@@ -2655,7 +3773,12 @@ mod tests {
             start: 0,
             length: Some(100),
         };
-        source.prefetch = vec![PendingHttpFetch::spawn(uri, Vec::new(), range)];
+        source.prefetch = vec![PendingHttpFetch::spawn(
+            uri,
+            Vec::new(),
+            range,
+            Arc::new(AtomicU64::new(0)),
+        )];
         // A short prefetch must trigger the synchronous fallback, not an
         // empty (fake-EOF) read.
         assert_eq!(source.read_range(range).unwrap(), body);

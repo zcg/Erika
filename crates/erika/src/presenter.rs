@@ -846,7 +846,14 @@ impl PresenterRuntime {
     pub fn open(&mut self, media: MediaRequest) -> Result<()> {
         self.quiesce_frame_output("open")?;
         self.reset_audio_output_with_committed_rate();
-        self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
+        // open 转场保留最后一帧（宿主换源/切画质复用同一 open）：新源首帧
+        // 到达前维持已呈现的画面，替代清屏黑帧——d3d11 后端 preserve 即
+        // "不清 current_video"，首帧自然覆盖。全新媒体同样受益：旧帧在
+        // 缓冲遮罩下短暂停留，优于闪黑。stop() 仍走 Clear（收尾必须清屏）。
+        self.clear_playback_visual_state(
+            Duration::ZERO,
+            TransitionFramePolicy::PreserveRendererSnapshot,
+        );
         self.drain_pending_player_frames();
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.latest_video_decoder = None;

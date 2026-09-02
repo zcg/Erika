@@ -158,7 +158,7 @@ pub enum MediaSourceHint {
     HttpStream,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct MediaRequest {
     pub uri: String,
     pub source_hint: MediaSourceHint,
@@ -166,6 +166,12 @@ pub struct MediaRequest {
     /// DASH 双流的音频流 URI。有值时分流打开（Demuxer::open_video_audio），
     /// 音频请求复用 `http_headers`（同一 CDN 签名直链）。
     pub audio_uri: Option<String>,
+    /// 视频流多 host 候选（按快→慢排序的 `(uri, score)`）。非空时 Erika 在当前
+    /// host 慢/死时**无缝换 host**（缓存零丢失，不重建 source）继续下载，循环
+    /// 回到起点（死掉的源多已恢复）。空 = 单源模式（沿用旧行为）。
+    pub video_candidates: Vec<(String, f64)>,
+    /// 音频流多 host 候选。语义同 `video_candidates`。
+    pub audio_candidates: Vec<(String, f64)>,
 }
 
 /// Hand-written so that credentials carried by custom headers (`Authorization`,
@@ -196,6 +202,8 @@ impl MediaRequest {
             source_hint: MediaSourceHint::Auto,
             http_headers: Vec::new(),
             audio_uri: None,
+            video_candidates: Vec::new(),
+            audio_candidates: Vec::new(),
         }
     }
 
@@ -214,6 +222,18 @@ impl MediaRequest {
     /// 附加 DASH 音频流 URI（与主 URI 组成双流播放）。
     pub fn with_audio_uri(mut self, audio_uri: impl Into<String>) -> Self {
         self.audio_uri = Some(audio_uri.into());
+        self
+    }
+
+    /// 注入视频流多 host 候选（按快→慢排序的 `(uri, score)`）。
+    pub fn with_video_candidates(mut self, candidates: Vec<(String, f64)>) -> Self {
+        self.video_candidates = candidates;
+        self
+    }
+
+    /// 注入音频流多 host 候选（按快→慢排序的 `(uri, score)`）。
+    pub fn with_audio_candidates(mut self, candidates: Vec<(String, f64)>) -> Self {
+        self.audio_candidates = candidates;
         self
     }
 }
@@ -950,6 +970,12 @@ struct PlayerInner {
     pending_play: bool,
     /// 异步 open 期间收到的 preload() 请求：Ready 后自动执行（进入界面即缓存第一段）
     pending_preload: Option<Duration>,
+    /// 异步 open 期间收到的 set_playback_rate 请求：Ready 后自动下发。
+    /// presenter.open 在 open() 提交后立即同步重放用户倍速——此刻异步
+    /// bg_open 尚未创建 playback worker，`send_playback_command` 必然
+    /// Err("no media is open")，宿主误判 open 提交失败（换源重开链路
+    /// 错乱、timer100 预载编排被跳过）。与 pending_play 同款排队语义。
+    pending_rate: Option<f64>,
 }
 
 struct PlayerLifecycle {
@@ -1097,6 +1123,7 @@ impl Player {
                 subtitle_frame_backpressure_drops: 0,
                 pending_play: false,
                 pending_preload: None,
+                pending_rate: None,
             })),
             lifecycle: Arc::new(Mutex::new(PlayerLifecycle {
                 epoch: 1,
@@ -1328,7 +1355,12 @@ impl Player {
             inner.playback_command_sequence = 0;
             inner.pending_play_sequence = None;
             inner.ended = false;
-            inner.pending_preload = None;
+            // 注意：`pending_play` / `pending_preload` / `pending_rate` 在此
+            // **不得清理**——它们是 open 提交后（Opening 期间）宿主排队的
+            // 意图，正是要等这里 open 成功转 Ready 后消费（见下方取用段）。
+            // 曾在此误清 pending_preload：慢网下 open 耗时 8-13s，进入播放
+            // 页即排队的预载（timer100 → preload）被静默丢弃 → 缓存永远
+            // 建不起来，用户点播放只能黑屏现下现播。
             inner.tracks = info.tracks.clone();
             inner.track_selection = info.track_selection();
             generation
@@ -1359,22 +1391,27 @@ impl Player {
             self.emit(PlayerEvent::VideoDecoderChanged(event));
         }
         self.transition(PlayerState::Ready)?;
-        // 排队中的 play()/preload()：Ready 后执行。play 优先（播放取消预载）。
-        let (pending_play, pending_preload) = {
+        // 排队中的 play()/preload()/set_playback_rate：Ready 后执行。
+        // rate 最先下发（播放/预载以新倍速起跑），play 优先于 preload
+        // （播放取消预载）。
+        let (pending_play, pending_preload, pending_rate) = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             let play = inner.pending_play;
             let preload = inner.pending_preload.take();
+            let rate = inner.pending_rate.take();
             inner.pending_play = false;
             inner.pending_preload = None;
-            (play, preload)
+            (play, preload, rate)
         };
+        // 必须先释放 lifecycle 锁：下方三个调用内部 playback_commands() 要重新
+        // 获取 lifecycle 锁（std Mutex 非递归，持锁调用会死锁）。
+        drop(lifecycle);
+        if let Some(rate) = pending_rate {
+            let _ = self.set_playback_rate(rate);
+        }
         if pending_play {
-            // 必须先释放 lifecycle 锁：play() 内部 playback_commands() 要重新获取
-            // lifecycle 锁（std Mutex 非递归，持锁调用会死锁）。
-            drop(lifecycle);
             let _ = self.play();
         } else if let Some(target) = pending_preload {
-            drop(lifecycle);
             let _ = self.preload(target);
         }
         Ok(())
@@ -1577,6 +1614,16 @@ impl Player {
 
     pub fn set_playback_rate(&self, rate: f64) -> Result<()> {
         self.ensure_not_closed()?;
+        // Opening：playback worker 尚未创建（open 异步拉流中），命令下发
+        // 必然 Err("no media is open")——presenter.open 提交后立即重放用户
+        // 倍速正踩中这条路径。与 play/preload 同款：排队，Ready 后自动下发。
+        if self.state() == PlayerState::Opening {
+            self.inner
+                .lock()
+                .expect("player mutex poisoned")
+                .pending_rate = Some(rate);
+            return Ok(());
+        }
         self.send_playback_command(PlaybackCommand::SetPlaybackRate(rate))
     }
 
@@ -4466,6 +4513,8 @@ mod tests {
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
             audio_uri: None,
+            video_candidates: Vec::new(),
+            audio_candidates: Vec::new(),
         };
         let mut engine = VideoPlaybackEngine::open(
             &request,
@@ -4692,6 +4741,52 @@ mod tests {
             events.try_recv().expect("state event"),
             PlayerEvent::StateChanged(PlayerState::Error),
         );
+    }
+
+    #[test]
+    fn set_playback_rate_queues_while_opening_instead_of_erroring() {
+        // presenter.open 提交后立即同步重放用户倍速——此刻 bg_open 进行中
+        // （Opening），playback worker 尚未创建。此前直接下发必报
+        // "no media is open"，宿主把该 Err 误判为 open 提交失败（换源
+        // 重开链路错乱、timer100 预载编排被跳过）。
+        let player = Player::new(PlayerConfig::default());
+        {
+            let mut inner = player.inner.lock().expect("player mutex poisoned");
+            inner.state = PlayerState::Opening;
+        }
+        player
+            .set_playback_rate(1.25)
+            .expect("rate must queue during Opening instead of erroring");
+        assert_eq!(
+            player
+                .inner
+                .lock()
+                .expect("player mutex poisoned")
+                .pending_rate,
+            Some(1.25)
+        );
+
+        // 对照：Ready + worker 就位 → 命令直发，不再排队
+        let commands =
+            install_fake_playback(&player, PlayerState::Ready, Duration::from_secs(3), 7, false);
+        player
+            .set_playback_rate(1.5)
+            .expect("rate sends directly when Ready");
+        // 排队意图保持：pending_rate 只由 open 完成（Ready 转换）路径消费，
+        // Ready 后的直发不清它——先后两次 rate 以最后一次为准由消费顺序保证
+        //（先放排队 1.25、后直发 1.5，播放开始后轮询兜底重设收敛到目标值）。
+        assert_eq!(
+            player
+                .inner
+                .lock()
+                .expect("player mutex poisoned")
+                .pending_rate,
+            Some(1.25)
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(PlaybackCommand::SetPlaybackRate(1.5))
+        ));
     }
 
     #[test]
