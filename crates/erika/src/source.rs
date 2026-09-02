@@ -91,6 +91,13 @@ pub struct SourceDiagSnapshot {
     pub active_idx: usize,
     /// 候选 host 总数（0 = 单源模式）。
     pub candidate_count: usize,
+    /// demux 端缓存窗口终点（**未合并**整片预载桶）。宿主策略算「真实可播
+    /// 缓冲秒」必须用它：`cache_end = max(demux, 桶 covered_until)` 会把桶
+    /// 从 0 顺序预载的进度混进来，seek 后窗口被严重高估 → ABR「余粮充足」
+    /// 误判不降档 / starve 判不出来（2026-09-02 无感化改造 K4）。
+    pub demux_cache_end: u64,
+    /// 源 host 代数（每次实际切换 +1）。宿主据此确认 request_host_switch 已生效。
+    pub host_epoch: u64,
 }
 
 /// 诊断槽数。DASH 双流（video + audio）各占一槽独立发布/清空，互不覆盖；
@@ -108,6 +115,8 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
         active_host: String::new(),
         active_idx: 0,
         candidate_count: 0,
+        demux_cache_end: 0,
+        host_epoch: 0,
     },
     SourceDiagSnapshot {
         content_length: None,
@@ -119,6 +128,8 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
         active_host: String::new(),
         active_idx: 0,
         candidate_count: 0,
+        demux_cache_end: 0,
+        host_epoch: 0,
     },
 ]);
 
@@ -611,6 +622,17 @@ pub struct HttpRangeSource {
     last_read_call_ms: u64,
     /// 换 host 冷却截止时刻：避免一轮内对同一死连反复横跳。
     switch_cooldown_until: Instant,
+    /// 源 host 代数：每次 `maybe_switch_host` 实际切换时 +1。在飞预取段记录
+    /// spawn 时刻的代数，代数不匹配 = 段落在旧 host 上 → 作废（K1）。
+    host_epoch: u64,
+    /// 宿主经 `request_host_switch(slot)` 下发的强制切换请求计数（本源上次
+    /// 消费到的值）。构造/`set_candidates` 时同步为当前计数，防止一开播就被
+    /// 旧请求误触发（K4）。
+    last_switch_req: u64,
+    /// 重入护栏：切换中重发预取段会经 `spawn_prefetch_window` →
+    /// `publish_diag` → 回到 `maybe_switch_host`。护栏让重入调用直接返回
+    /// （切后已有冷却兜底，护栏只是不让重入路径再做无谓判定）。
+    switching_host: bool,
 }
 
 /// 多 host 候选（Option A 无缝换 host 用）。
@@ -624,6 +646,12 @@ struct PendingHttpFetch {
     range: ByteRange,
     handle: JoinHandle<()>,
     receiver: mpsc::Receiver<Result<HttpRangeResponse>>,
+    /// spawn 时刻的源 host epoch。宿主等待本段期间若发生 host 切换
+    ///（`take_prefetch` 分片轮询里调用 `maybe_switch_host`），epoch 不匹配
+    /// 即判定本段落在旧 host 上 → 作废并返回 None，让 read_range 走同步
+    /// fetch（取**当前** uri = 新 host）——这是「卡在等段时也能换 host」
+    /// 的关键一环（2026-09-02 无感化改造 K1/K3）。
+    host_epoch: u64,
 }
 
 /// Bytes fetched for one HTTP range request plus the resource total reported
@@ -869,8 +897,12 @@ impl FullPreloadState {
     /// 桶当前是否正有一段下载在飞。整片预载线程单段顺序下载，故 1/0。
     /// 诊断面板「下载速度 > 0」「缓冲前进」直接由该字段反映出来——不再依赖
     /// demux 主动 read 触发的 prefetch（暂停了就归 0）。
+    ///
+    /// **demux 活跃（播放中）时返回 0**（2026-09-02 K4）：播放期桶在让路、
+    /// 实际没有下载在飞，此前恒返回 1 导致宿主「prefetch_in_flight == 0」
+    /// 判据永不成立（源空闲检测退化为单一字节停滞条件）。
     fn in_flight_segments(&self) -> u32 {
-        if self.is_complete() {
+        if self.is_complete() || self.demux_active() {
             0
         } else if self.stop.load(Ordering::Relaxed) {
             0
@@ -967,6 +999,28 @@ const MULTI_HOST_ACTIVE_MS: u64 = 6_000;
 const MULTI_HOST_LOW_BPS: f64 = 25_000.0;
 /// 换 host 后冷却：避免一轮内对同一死连反复横跳。
 const MULTI_HOST_COOLDOWN: Duration = Duration::from_secs(4);
+/// 宿主强制切换（`request_host_switch`）的冷却。比自发切换短——宿主只在
+/// 「视频流停滞而音频流在涨」这类强证据下才请求，策略层另有 10s 冷却，
+/// 这里只防同一 host 被瞬时重复请求（2026-09-02 无感化改造 K4）。
+const MULTI_HOST_FORCED_COOLDOWN: Duration = Duration::from_secs(2);
+/// 宿主强制切换请求计数（每槽位）。`request_host_switch` 只 +1 计数，
+/// 实际切换由该源在下一个判定点（read_range / publish_diag /
+/// take_prefetch 等待分片）消费——不触碰 source 所有权，demux 线程安全。
+static HOST_SWITCH_REQ: [AtomicU64; SOURCE_DIAG_SLOTS] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// 宿主请求指定槽位立即换到下一个候选 host（返回 false = 槽位越界）。
+/// DASH 双流约定 video=0、audio=1。只是置位请求计数，实际切换在该源的
+/// `maybe_switch_host` 下一次被调用时执行（read_range 入口 / publish_diag /
+/// take_prefetch 等待分片），强制切换冷却 2s。
+pub fn request_host_switch(slot: usize) -> bool {
+    match HOST_SWITCH_REQ.get(slot) {
+        Some(counter) => {
+            counter.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
 
 /// 当前 epoch 毫秒（与 `FullPreloadState.last_demux_read_ms` 同口径）。
 fn now_ms() -> u64 {
@@ -1004,6 +1058,11 @@ impl HttpRangeSource {
     /// 同步兜底只取当前读取所需（≤256KB），比等 10MB 级慢段快得多。
     /// 5s：256KB 段在 ≥0.5MB/s 的总带宽下均可在超时内完成，慢网不被误杀。
     const PREFETCH_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+    /// 自适应放宽的硬上界（K2，2026-09-02）：join 超时区间固定 `[5s, 8s]`。
+    /// 原实现可随 est_bps 反向放大到 30s——链路越慢挂死代价越大，与
+    /// 「慢网要更快放弃」的直觉相反。8s 内新 host 轮换（强制冷却 2s）+
+    /// 桶接管补片通常已能恢复，超过 8s 的等待换不来数据只换冻结。
+    const PREFETCH_JOIN_TIMEOUT_MAX: Duration = Duration::from_secs(8);
     /// 自适应段大小下限：带宽极低（<~100KB/s）时 32KB 段（8 段整窗 256KB）
     /// 约 2.5s 完成，仍在 join 超时内；再小 HTTP 请求开销占比失控。
     const MIN_PREFETCH_SEGMENT_BYTES: u64 = 32 * 1024;
@@ -1061,6 +1120,13 @@ impl HttpRangeSource {
             last_byte_ms: now_ms(),
             last_read_call_ms: now_ms(),
             switch_cooldown_until: Instant::now(),
+            // 新源不消费旧请求：同步为当前计数，宿主的 stale 请求不触发切换
+            host_epoch: 0,
+            last_switch_req: HOST_SWITCH_REQ
+                .get(diag_slot)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            switching_host: false,
         }
     }
 
@@ -1096,16 +1162,41 @@ impl HttpRangeSource {
         self.active_idx = 0;
         self.last_byte_ms = now_ms();
         self.switch_cooldown_until = Instant::now();
+        // 候选链重建 = 换了新的一轮注入，宿主的旧强制请求不再适用
+        self.last_switch_req = HOST_SWITCH_REQ
+            .get(self.diag_slot)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
     }
 
-    /// 死连/慢速无缝换 host（Option A）。在 read_range / publish_diag 入口调用。
+    /// 死连/慢速无缝换 host（Option A）。在 read_range / publish_diag /
+    /// `take_prefetch` 等待分片入口调用。
     /// 切 host 只替换 `uri`（字节偏移缓存、预载桶、prefetch 队列全部保留），
     /// 因此零缓存丢失、零重建 source——正解决"CDN 源死 → 周期性卡顿"。
+    ///
+    /// 切换时**作废落在旧 host 上的在飞预取段并按新 host 重发**（K1，
+    /// 2026-09-02 无感化改造）：此前在飞段 spawn 时已 clone 旧 uri，换 host
+    /// 后它们会一直挂到 join 超时才被放弃，把一次本应零成本的切换放大成
+    /// 5~30s 的 demux 冻结。现复用 `prefetch_hint` 的"clear + respawn"语义。
     fn maybe_switch_host(&mut self) {
         if self.candidates.len() < 2 {
             return; // 需 ≥2 个候选才有得换
         }
+        // 重入护栏：respawn 路径 publish_diag → 回到这里，直接让路
+        if self.switching_host {
+            return;
+        }
         let now = Instant::now();
+        // 宿主强制请求（request_host_switch）：消费计数并放宽自发条件，
+        // 但仍尊重更短的强制冷却（2s），防止同一 host 被瞬时重复请求。
+        let req = HOST_SWITCH_REQ
+            .get(self.diag_slot)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(self.last_switch_req);
+        let forced = req != self.last_switch_req;
+        if forced {
+            self.last_switch_req = req;
+        }
         if now < self.switch_cooldown_until {
             return;
         }
@@ -1115,7 +1206,7 @@ impl HttpRangeSource {
             && t.saturating_sub(self.last_read_call_ms) < MULTI_HOST_ACTIVE_MS;
         // 慢速：带宽过低（提早换，不等完全死）。
         let slow = self.est_bps > 1_000.0 && self.est_bps < MULTI_HOST_LOW_BPS;
-        if !stalled && !slow {
+        if !forced && !stalled && !slow {
             return;
         }
         let next = (self.active_idx + 1) % self.candidates.len();
@@ -1128,13 +1219,40 @@ impl HttpRangeSource {
             "{{\"event\":\"mhost_switch\",\"from\":{},\"to\":{},\"reason\":\"{}\",\"est_bps\":{:.0},\"next_score\":{:.2}}}",
             self.active_idx,
             next,
-            if stalled { "stalled" } else { "slow" },
+            if forced {
+                "forced"
+            } else if stalled {
+                "stalled"
+            } else {
+                "slow"
+            },
             self.est_bps,
             self.candidates[next].score
         ));
         self.active_idx = next;
         self.last_byte_ms = t;
-        self.switch_cooldown_until = now + MULTI_HOST_COOLDOWN;
+        self.host_epoch = self.host_epoch.wrapping_add(1);
+        self.switch_cooldown_until =
+            now + if forced { MULTI_HOST_FORCED_COOLDOWN } else { MULTI_HOST_COOLDOWN };
+        // 作废旧 host 上的在飞段，按新 host 从最早未覆盖处重发（K1）。
+        // clear 只丢 receiver：后台线程跑完自退，结果无人接收即丢弃。
+        if !self.prefetch.is_empty() {
+            let from = self
+                .prefetch
+                .iter()
+                .map(|p| p.range.start)
+                .min()
+                .unwrap_or(0);
+            let discarded = self.prefetch.len();
+            self.prefetch.clear();
+            http_trace_log(format!(
+                "{{\"event\":\"http_prefetch_abandoned_after_host_switch\",\"discarded\":{},\"respawn_from\":{},\"epoch\":{}}}",
+                discarded, from, self.host_epoch
+            ));
+            self.switching_host = true;
+            self.spawn_prefetch_window(from, self.prefetch_segment_bytes());
+            self.switching_host = false;
+        }
     }
 
     /// 主调用方 `source_from_uri_with_hint_and_headers` / `source_from_auto_uri_with_slot`
@@ -1211,9 +1329,12 @@ impl HttpRangeSource {
         ) as u64
     }
 
-    /// 自适应 join 超时：`max(5s, 单段完成时间 × 1.5)`。段大小已按带宽
-    /// 缩放，此值只在带宽估算低于实际（段比预期慢）时兜底放宽，避免
-    /// 慢段被误杀后同步 fetch 反而更卡。
+    /// 自适应 join 超时：`max(5s, min(单段完成时间 × 1.5, 8s))`，结果有界
+    /// `[5s, 8s]`。段大小已按带宽缩放，放宽只对「带宽估算偏低、段比预期
+    /// 慢一点」兜底；**不随 est_bps 反向放大**（2026-09-02 无感化改造 K2）：
+    /// 原上限 30s 在极慢链路（est_bps≈2KB/s）下把一次 host 死连放大成
+    /// 半分钟 demux 冻结——链路越慢越该早点放弃慢段、走同步小段 fetch
+    /// （只取当前读取所需，与预取段同量级），比干等廉价得多。
     fn prefetch_join_timeout(&self) -> Duration {
         // 守卫必须先于除法：est_bps 为 NaN/inf（EMA 混入坏值）、趋零 denormal
         // （长期暂停后 EMA 衰减，`refresh_bandwidth` 地板兜底前的存量值）或
@@ -1227,10 +1348,7 @@ impl HttpRangeSource {
             return Self::PREFETCH_JOIN_TIMEOUT;
         }
         let seg = self.prefetch_segment_bytes() as f64;
-        // 上限 30s：est_bps 极小（<1.6KB/s）时 needed 无界，钳到上限后最多等
-        // 30s 放弃慢段、退化同步 fetch。自适应放宽的本意只对 ~KB/s 级慢网
-        // 有意义（32KB 段 / 8KB/s → 6s），更慢的源等再久也只是冻结 demux。
-        let needed = (seg / self.est_bps * 1.5).min(30.0);
+        let needed = (seg / self.est_bps * 1.5).min(Self::PREFETCH_JOIN_TIMEOUT_MAX.as_secs_f64());
         Self::PREFETCH_JOIN_TIMEOUT.max(Duration::from_secs_f64(needed))
     }
 
@@ -1298,6 +1416,9 @@ impl HttpRangeSource {
                     active_host: active_host.to_string(),
                     active_idx: self.active_idx,
                     candidate_count: self.candidates.len(),
+                    // demux 自身窗口终点（不含桶）：宿主策略算真实缓冲秒用
+                    demux_cache_end: self.cache_end(),
+                    host_epoch: self.host_epoch,
                 };
             }
         }
@@ -1403,11 +1524,21 @@ impl HttpRangeSource {
         // 带超时 join：慢段会卡死 demux 线程。超过上限放弃该段（后台线程
         // 继续下载、结果丢弃），返回 None 让 read_range 走同步小范围 fetch
         // 兜底——同步只取当前读取所需（≤1MB），比等 10MB 级慢段快得多。
-        // 超时按实测带宽自适应：慢网下段大小已同步缩小，整窗可在超时内
-        // 完成，正常情况不触发放弃（避免退化同步 fetch 的"一顿一顿"）。
-        let result = match pending.receiver.recv_timeout(self.prefetch_join_timeout()) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        // 超时按实测带宽自适应（有界 [5s, 8s]，见 `prefetch_join_timeout`）。
+        //
+        // **分片轮询**（K3，2026-09-02 无感化改造）：此前是单次 recv_timeout
+        // 一次性睡满整个超时——期间 demux 线程完全阻塞，`maybe_switch_host`
+        // 的两个既有调用点（read_range 入口 / publish_diag）都不可达，等于
+        // 「卡住的时候恰好换不了 host」。改为每 250ms 醒一次并判定一次
+        // host 切换；若等待期间 epoch 已变（宿主强制请求或死连判定生效），
+        // 本段落在了旧 host 上 → 作废并返回 None，read_range 的同步 fetch
+        // 取当前 uri（= 新 host）立即重取，把一次 host 死连的可见代价从
+        // 「join 超时全值」压到「下一个 250ms 分片」。
+        let deadline = Instant::now() + self.prefetch_join_timeout();
+        let slice = Duration::from_millis(250);
+        let result = loop {
+            let remain = deadline.saturating_duration_since(Instant::now());
+            if remain.is_zero() {
                 http_trace_log(format!(
                     "{{\"event\":\"http_prefetch_join_timeout\",\"start\":{},\"length\":{},\"waited_ms\":{:.3}}}",
                     start,
@@ -1419,10 +1550,26 @@ impl HttpRangeSource {
                 ));
                 return None;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Some(Err(SourceError::Http(
-                    "http prefetch thread panicked".to_string(),
-                )));
+            match pending.receiver.recv_timeout(slice.min(remain)) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // 等待期间允许换 host：死连判定 / 宿主强制请求都从这里生效
+                    self.maybe_switch_host();
+                    if pending.host_epoch != self.host_epoch {
+                        http_trace_log(format!(
+                            "{{\"event\":\"http_prefetch_abandoned_in_join\",\"start\":{},\"waited_ms\":{:.3},\"epoch\":{}}}",
+                            start,
+                            join_started.elapsed().as_secs_f64() * 1000.0,
+                            self.host_epoch
+                        ));
+                        return None; // 同步 fetch 将用新 host 重取该区间
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Some(Err(SourceError::Http(
+                        "http prefetch thread panicked".to_string(),
+                    )));
+                }
             }
         };
         http_trace_log(format!(
@@ -1645,6 +1792,7 @@ impl HttpRangeSource {
                 self.http_headers.clone(),
                 prefetch_range,
                 self.rx.clone(),
+                self.host_epoch,
             ));
             self.publish_diag();
             cursor = cursor.saturating_add(len);
@@ -1703,6 +1851,7 @@ impl PendingHttpFetch {
         http_headers: Vec<(String, String)>,
         range: ByteRange,
         progress: Arc<AtomicU64>,
+        host_epoch: u64,
     ) -> Self {
         http_trace_log(format!(
             "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{}}}",
@@ -1730,6 +1879,7 @@ impl PendingHttpFetch {
             range,
             handle,
             receiver,
+            host_epoch,
         }
     }
 
@@ -1869,6 +2019,8 @@ impl HttpLiveStreamSource {
                     active_host: String::new(),
                     active_idx: 0,
                     candidate_count: 0,
+                    demux_cache_end: self.offset,
+                    host_epoch: 0,
                 };
             }
         }
@@ -3247,6 +3399,7 @@ mod tests {
             range,
             handle,
             receiver,
+            host_epoch: 0,
         }
     }
 
@@ -3373,10 +3526,12 @@ mod tests {
         // 低于 1bps 地板（与 refresh_bandwidth 零供给地板一致）：视为未知
         source.est_bps = 0.001;
         assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(5));
-        // 有限但荒谬小的带宽（10bps）：needed ~4915s → 钳到 30s 上限，
-        // 最多等 30s 就放弃慢段退化同步 fetch，而不是冻结 demux 半小时
+        // 有限但荒谬小的带宽（10bps）：needed ~4915s → 钳到 8s 上界
+        // （2026-09-02 K2 收紧：原 30s 上界把 host 死连放大成半分钟 demux
+        // 冻结；慢网要更快放弃慢段、走同步小段 fetch，见
+        // prefetch_join_timeout 注释）
         source.est_bps = 10.0;
-        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(30));
+        assert_eq!(source.prefetch_join_timeout(), Duration::from_secs(8));
     }
 
     #[test]
@@ -3752,6 +3907,7 @@ mod tests {
             Vec::new(),
             range,
             Arc::new(AtomicU64::new(0)),
+            0,
         )];
         assert_eq!(source.read_range(range).unwrap(), body);
         let _ = recv_request_head(&requests);
@@ -3778,6 +3934,7 @@ mod tests {
             Vec::new(),
             range,
             Arc::new(AtomicU64::new(0)),
+            0,
         )];
         // A short prefetch must trigger the synchronous fallback, not an
         // empty (fake-EOF) read.
@@ -3949,5 +4106,132 @@ mod tests {
             redacted_uri("https://example.invalid/video.mkv?AccessToken=secret"),
             "https://example.invalid/video.mkv?AccessToken=REDACTED"
         );
+    }
+
+    // ============ 多 host 无缝换源（2026-09-02 无感化改造 K1~K4） ============
+
+    #[test]
+    fn join_timeout_is_bounded_regardless_of_bandwidth() {
+        let (uri, _requests) = spawn_mock_http_server(vec![]);
+        let mut source = HttpRangeSource::new(uri);
+        // 冷启动（est_bps 未知）→ 基础 5s
+        assert_eq!(
+            source.prefetch_join_timeout(),
+            HttpRangeSource::PREFETCH_JOIN_TIMEOUT
+        );
+        // 极慢链路（原实现会随 est_bps 反向放大到 ~24-30s）→ 钳在 8s 上界
+        source.est_bps = 2.0 * 1024.0;
+        let slow = source.prefetch_join_timeout();
+        assert!(slow >= HttpRangeSource::PREFETCH_JOIN_TIMEOUT);
+        assert!(slow <= HttpRangeSource::PREFETCH_JOIN_TIMEOUT_MAX);
+        // 正常带宽 → 同样在界内
+        source.est_bps = 1024.0 * 1024.0;
+        let fast = source.prefetch_join_timeout();
+        assert!(fast >= HttpRangeSource::PREFETCH_JOIN_TIMEOUT);
+        assert!(fast <= HttpRangeSource::PREFETCH_JOIN_TIMEOUT_MAX);
+    }
+
+    #[test]
+    fn host_switch_abandons_inflight_segments_and_respawns_on_new_host() {
+        // A：响应极慢（模拟死连，在飞段挂在它上面）；B：立即响应。
+        // mock 服务器串行 accept：A 的延迟响应会阻塞后续连接上报，
+        // 因此 A 只放一个响应、只消费一个请求头（第二个在飞段照样连接 A，
+        // 只是其头部在延迟期内不会出现在通道里）。
+        let (uri_a, requests_a) = spawn_mock_http_server(vec![MockResponse::delayed(
+            Duration::from_secs(60),
+            http_206_response(0, 1024 * 1024, &vec![0u8; 256 * 1024]),
+        )]);
+        let (uri_b, requests_b) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(
+                0,
+                1024 * 1024,
+                &vec![0u8; 256 * 1024],
+            )),
+            MockResponse::immediate(http_206_response(
+                0,
+                1024 * 1024,
+                &vec![0u8; 256 * 1024],
+            )),
+        ]);
+        let mut source =
+            HttpRangeSource::with_http_headers_and_diag_slot(uri_a.clone(), Vec::new(), 0);
+        source.content_length = Some(1024 * 1024);
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.5)]);
+        assert_eq!(source.active_idx, 0);
+        // 在 A 上铺在飞预取段（并行度 2，线程真实连接 A，60s 内不会完成）
+        source.spawn_prefetch_window(0, 256 * 1024);
+        assert_eq!(source.prefetch.len(), 2);
+        let _ = recv_request_head(&requests_a);
+        // 模拟死连：久无字节但 demux 仍在读
+        source.last_byte_ms = now_ms().saturating_sub(10_000);
+        source.last_read_call_ms = now_ms();
+        source.maybe_switch_host();
+        assert_eq!(source.active_idx, 1);
+        assert_eq!(source.host_epoch, 1);
+        // 旧段被作废、按新 host 重发：B 收到请求，且新段携带新 epoch
+        assert!(!source.prefetch.is_empty());
+        assert!(source.prefetch.iter().all(|p| p.host_epoch == 1));
+        let head_b = recv_request_head(&requests_b);
+        assert!(head_b.contains("range: bytes=0-"));
+        // A 不再收到任何新请求（被作废的段不会重试）
+        assert!(requests_a.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn take_prefetch_abandons_segment_after_host_switch() {
+        // 段落在旧 host（epoch 0），源已切到新代（epoch 1）→ 等待首个分片
+        //（250ms）后立即作废返回 None，read_range 将走同步 fetch 打新 host。
+        let (uri_slow, _requests) = spawn_mock_http_server(vec![MockResponse::delayed(
+            Duration::from_secs(60),
+            http_206_response(0, 65536, &vec![0u8; 65536]),
+        )]);
+        let mut source = HttpRangeSource::new("http://new-host.invalid/video.mkv");
+        source.host_epoch = 1;
+        let range = ByteRange {
+            start: 0,
+            length: Some(65536),
+        };
+        source.prefetch.push(PendingHttpFetch::spawn(
+            uri_slow,
+            Vec::new(),
+            range,
+            Arc::new(AtomicU64::new(0)),
+            0, // spawn 于旧 epoch
+        ));
+        let started = Instant::now();
+        let result = source.take_prefetch(range);
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn request_host_switch_forces_switch_and_respects_cooldown() {
+        let (uri_a, _requests_a) = spawn_mock_http_server(vec![]);
+        let (uri_b, _requests_b) = spawn_mock_http_server(vec![]);
+        // 用槽位 1（音频槽），避免与其它并行测试对槽 0 的全局请求互相干扰
+        let mut source =
+            HttpRangeSource::with_http_headers_and_diag_slot(uri_a.clone(), Vec::new(), 1);
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.5)]);
+        assert!(request_host_switch(1));
+        source.maybe_switch_host();
+        assert_eq!(source.active_idx, 1);
+        // 强制冷却（2s）内不切
+        source.maybe_switch_host();
+        assert_eq!(source.active_idx, 1);
+        // 冷却过期后，非强制且非死连/慢速 → 仍不切
+        source.switch_cooldown_until = Instant::now();
+        source.last_byte_ms = now_ms();
+        source.maybe_switch_host();
+        assert_eq!(source.active_idx, 1);
+    }
+
+    #[test]
+    fn full_preload_in_flight_is_zero_while_demux_active() {
+        let state = FullPreloadState::new();
+        // 尚无 demux 读（last=0 → 不活跃）→ 桶在飞记 1
+        assert_eq!(state.in_flight_segments(), 1);
+        state.mark_demux_read();
+        // demux 活跃（播放中）→ 桶让路，无在飞
+        assert_eq!(state.in_flight_segments(), 0);
     }
 }
