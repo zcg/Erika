@@ -14,6 +14,15 @@ provides an `XComponent` surface id through `attachSurface()` and drives
 ohpm install erika
 ```
 
+## Player configuration
+
+`ErikaPlayerConfig` accepts `outputMode`, `edrHeadroom`, `upscaler`, and
+`videoAlphaMode`. The alpha mode defaults to `0` (opaque); `1` decodes a frame
+with color in the left half and alpha in the right half. The host surface must
+support transparent composition for the background to remain visible.
+The alpha option requires the updated ArkTS wrapper and N-API bridge together;
+the published 0.1.8 OHPM wrapper does not forward it.
+
 ## Usage
 
 The package owns the native presenter, while the ArkTS host owns the
@@ -107,6 +116,26 @@ struct VideoPage {
 `renderTick()` returns an `ErikaNativeResponse` for diagnostics and frame
 status. For audio-only playback, use `audioOnlyTick()` instead of rendering a
 surface.
+
+## HTTP options
+
+For HTTP(S) playback, `open` accepts per-request headers and a read-ahead
+window:
+
+```ts
+this.player.open('https://example.com/video.mp4', {
+  httpHeaders: {
+    'Authorization': 'Bearer token',
+    'Referer': 'https://example.com/',
+  },
+  httpReadAheadBytes: 16 * 1024 * 1024,
+});
+```
+
+Headers are used for HEAD, Range GET, and prefetch requests. A positive
+`httpReadAheadBytes` overrides `ERIKA_HTTP_READAHEAD_BYTES`; zero or omission
+uses that environment variable when set, otherwise the 2 MiB default. These
+options are ignored for local files.
 
 The package is licensed under MPL-2.0. See `THIRD_PARTY_NOTICES.md` for the
 licenses of the bundled native dependencies.

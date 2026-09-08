@@ -2,9 +2,9 @@ use std::ffi::c_void;
 use std::time::Duration;
 
 use crate::core::{
-    ColorPrimaries, LumaUpscalerBackendStatus, PlatformSurface, PlayerError, PlayerVideoFrame,
-    RenderFrameContext, RendererBackend, RendererFrameCapture, RendererResourceStats,
-    RendererRuntimeStats, Result, SurfaceMetrics, TransferFunction,
+    ColorPrimaries, FlutterTextureKind, LumaUpscalerBackendStatus, PlatformSurface, PlayerError,
+    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererFrameCapture,
+    RendererResourceStats, RendererRuntimeStats, Result, SurfaceMetrics, TransferFunction,
 };
 use crate::danmaku::DanmakuRenderPlan;
 use crate::ffmpeg::{Frame, PlanarFrame};
@@ -68,12 +68,51 @@ pub struct MetalRenderer {
     upload_counter: u64,
     software_upload_counter: u64,
     output_mode: MetalOutputMode,
+    /// Presents skipped because the drawable pool was drained (nil
+    /// `nextDrawable`). Obtaining nil can still take up to one second with
+    /// `allowsNextDrawableTimeout` enabled. Count skips without changing C stats.
+    present_backpressure_skips: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetalRendererConfig {
     pub output_mode: MetalOutputMode,
     pub luma_upscaler: LumaUpscalerMode,
+    pub video_alpha_mode: VideoAlphaMode,
+}
+
+/// Describes how a decoded video frame carries transparency.
+///
+/// `PackedAlphaRight` expects a side-by-side frame: the left half contains
+/// colour and the right half contains a grayscale alpha mask. Renderers expose
+/// the left half as the logical video size and reconstruct premultiplied alpha
+/// in the presentation shader.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VideoAlphaMode {
+    #[default]
+    Opaque = 0,
+    PackedAlphaRight = 1,
+}
+
+impl VideoAlphaMode {
+    pub fn from_raw(value: i32) -> Self {
+        match value {
+            1 => Self::PackedAlphaRight,
+            _ => Self::Opaque,
+        }
+    }
+
+    pub fn has_alpha(self) -> bool {
+        matches!(self, Self::PackedAlphaRight)
+    }
+
+    pub fn logical_width(self, encoded_width: u32) -> u32 {
+        match self {
+            Self::Opaque => encoded_width,
+            Self::PackedAlphaRight => (encoded_width / 2).max(1),
+        }
+    }
 }
 
 impl Default for MetalRendererConfig {
@@ -81,6 +120,7 @@ impl Default for MetalRendererConfig {
         Self {
             output_mode: MetalOutputMode::default(),
             luma_upscaler: LumaUpscalerMode::default(),
+            video_alpha_mode: VideoAlphaMode::default(),
         }
     }
 }
@@ -374,6 +414,13 @@ impl MetalRenderer {
         Self::with_config(MetalRendererConfig::default())
     }
 
+    /// Presents skipped because no drawable was available. Rust-internal
+    /// observability for the `allowsNextDrawableTimeout` skip path; never
+    /// surfaced through the C stats layout.
+    pub fn present_backpressure_skips(&self) -> u64 {
+        self.present_backpressure_skips
+    }
+
     pub fn with_config(_config: MetalRendererConfig) -> Result<Self> {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         {
@@ -386,6 +433,7 @@ impl MetalRenderer {
                 upload_counter: 0,
                 software_upload_counter: 0,
                 output_mode: _config.output_mode,
+                present_backpressure_skips: 0,
             })
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -648,6 +696,38 @@ fn inspect_overlay_frame(frame: &OverlayFrame) -> Result<PreparedOverlayFrameInf
     })
 }
 
+/// Turns a drained-drawable-pool failure into a skipped frame.
+///
+/// Every `CAMetalLayer.nextDrawable()` path reports a nil drawable as
+/// [`PlayerError::RendererBackpressure`]. Clear and test-pattern frames carry
+/// no decoded content, so dropping one is always cheaper than pushing a
+/// transient lifecycle race across the C ABI as a terminal renderer error.
+/// `skips` accumulates across every skipped present (video, clear, test) so
+/// the behavior stays observable; see [`should_report_present_skip`].
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn skip_on_backpressure(stage: &str, result: Result<()>, skips: &mut u64) -> Result<()> {
+    match result {
+        Err(PlayerError::RendererBackpressure(reason)) => {
+            *skips = skips.saturating_add(1);
+            if should_report_present_skip(*skips) {
+                trace::diagnostic(format!(
+                    "[erika-render-trace] stage={stage} skipped reason={reason} count={skips}"
+                ));
+            }
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Report cadence for drained-drawable-pool skips: the first occurrence plus
+/// every power-of-two count. A fullscreen Space transition can burn through
+/// dozens of ticks while the compositor holds the pool; this keeps the
+/// diagnostic visible without spamming a stall timeline.
+pub(crate) fn should_report_present_skip(count: u64) -> bool {
+    count == 1 || count.is_power_of_two()
+}
+
 pub fn fourcc_string(value: u32) -> String {
     let bytes = value.to_be_bytes();
     if bytes
@@ -669,9 +749,30 @@ impl RendererBackend for MetalRenderer {
             PlatformSurface::Wgpu(_) => Err(crate::core::PlayerError::Renderer(
                 "wgpu surface cannot be attached to MetalRenderer".to_string(),
             )),
-            PlatformSurface::FlutterTexture(_) => Err(crate::core::PlayerError::Renderer(
-                "Flutter texture cannot be attached to MetalRenderer".to_string(),
-            )),
+            PlatformSurface::FlutterTexture(handle)
+                if matches!(
+                    handle.kind,
+                    FlutterTextureKind::MacOsTextureRegistrar
+                        | FlutterTextureKind::IosTextureRegistrar
+                ) =>
+            {
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+                {
+                    self.inner.attach_flutter_texture(handle.metrics);
+                    Ok(())
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+                {
+                    let _ = handle;
+                    Err(PlayerError::Renderer(
+                        "Apple Flutter textures require an Apple Metal renderer".to_string(),
+                    ))
+                }
+            }
+            PlatformSurface::FlutterTexture(handle) => Err(PlayerError::Renderer(format!(
+                "Flutter texture kind {:?} cannot be attached to MetalRenderer",
+                handle.kind
+            ))),
         }
     }
 
@@ -703,7 +804,11 @@ impl RendererBackend for MetalRenderer {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         {
             if self.inner.has_surface() {
-                self.inner.render_clear(ClearColor::black())?;
+                skip_on_backpressure(
+                    "clear_current_frame",
+                    self.inner.render_clear(ClearColor::black()),
+                    &mut self.present_backpressure_skips,
+                )?;
             }
         }
         Ok(())
@@ -717,17 +822,21 @@ impl RendererBackend for MetalRenderer {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         {
             let started = std::time::Instant::now();
-            self.inner.render_clear(ClearColor::animated(time_seconds))
-                .map(|result| {
-                    if trace::enabled() {
-                        trace::log(format!(
-                            "[erika-render-trace] stage=test_frame time_seconds={:.3} elapsed_ms={:.3}",
-                            time_seconds,
-                            started.elapsed().as_secs_f64() * 1000.0,
-                        ));
-                    }
-                    result
-                })
+            skip_on_backpressure(
+                "test_frame",
+                self.inner.render_clear(ClearColor::animated(time_seconds)),
+                &mut self.present_backpressure_skips,
+            )
+            .map(|result| {
+                if trace::enabled() {
+                    trace::log(format!(
+                        "[erika-render-trace] stage=test_frame time_seconds={:.3} elapsed_ms={:.3}",
+                        time_seconds,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    ));
+                }
+                result
+            })
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         {
@@ -804,6 +913,25 @@ impl RendererBackend for MetalRenderer {
             danmaku.map(DanmakuRenderFrame::new),
         );
         self.current_frame = Some(frame);
+        let rendered = match result {
+            Ok(()) => Ok(true),
+            Err(PlayerError::RendererBackpressure(reason)) => {
+                self.present_backpressure_skips = self.present_backpressure_skips.saturating_add(1);
+                if should_report_present_skip(self.present_backpressure_skips) {
+                    trace::diagnostic(format!(
+                        "[erika-render-trace] stage=render_current_frame skipped reason={reason} count={}",
+                        self.present_backpressure_skips
+                    ));
+                }
+                if trace::enabled() {
+                    trace::log(format!(
+                        "[erika-render-trace] stage=render_current_frame skipped reason={reason}"
+                    ));
+                }
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        };
         if trace::enabled() {
             trace::log(format!(
                 "[erika-render-trace] stage=render_current_frame gen={} media={} output={}x{} danmaku={} elapsed_ms={:.3} result={}",
@@ -813,10 +941,32 @@ impl RendererBackend for MetalRenderer {
                 context.output_height,
                 danmaku.as_ref().map_or(0, |plan| plan.items.len()),
                 started.elapsed().as_secs_f64() * 1000.0,
-                result.is_ok(),
+                rendered.as_ref().is_ok_and(|rendered| *rendered),
             ));
         }
-        result.map(|()| true)
+        rendered
+    }
+
+    fn set_flutter_texture_buffer(
+        &mut self,
+        raw_texture: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            unsafe {
+                self.inner
+                    .set_flutter_texture_buffer(raw_texture as *mut c_void, width, height)
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            let _ = (raw_texture, width, height);
+            Err(PlayerError::Renderer(
+                "Metal Flutter textures are only available on Apple platforms".to_string(),
+            ))
+        }
     }
 
     fn capture_current_frame(
@@ -979,6 +1129,16 @@ mod tests {
     use crate::overlay::OverlayViewport;
     use crate::renderer::pipeline::{MatrixCoefficients, SourceColorState};
     use crate::subtitle::SubtitleBitmapPlane;
+
+    #[test]
+    fn present_skip_report_fires_once_then_on_power_of_two() {
+        assert!(should_report_present_skip(1));
+        assert!(!should_report_present_skip(3));
+        assert!(should_report_present_skip(2));
+        assert!(!should_report_present_skip(255));
+        assert!(should_report_present_skip(256));
+        assert!(should_report_present_skip(4096));
+    }
 
     fn test_imported_frame(
         import_range: ColorRange,

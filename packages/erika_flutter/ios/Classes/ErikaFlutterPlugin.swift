@@ -196,6 +196,8 @@ private struct ErikaTrackInfoC {
 private struct ErikaPresenterConfigC {
   var outputMode: Int32 = 0
   var edrHeadroom: Float = 1.0
+  var lumaUpscaler: Int32 = 0
+  var videoAlphaMode: Int32 = 0
 
   static let sdr = ErikaPresenterConfigC()
 
@@ -235,6 +237,15 @@ private struct ErikaSubtitleStyleC {
 private struct ErikaHttpHeader {
   var name: UnsafeMutablePointer<CChar>?
   var value: UnsafeMutablePointer<CChar>?
+}
+
+/// Mirrors the C `ErikaOpenOptions`: headers plus per-request tuning.
+/// `httpReadAheadBytes` of 0 uses the environment override, then 2 MiB.
+private struct ErikaOpenOptions {
+  var headers: UnsafeRawPointer?
+  var headerCount: UInt = 0
+  var httpReadAheadBytes: UInt64 = 0
+  var reserved: (UInt64, UInt64, UInt64) = (0, 0, 0)
 }
 
 private struct ErikaEventC {
@@ -375,6 +386,7 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
   case libraryNotFound([String])
   case symbolMissing(String)
   case httpHeadersUnsupported
+  case openOptionsUnsupported
   case invalidArguments(String)
   case playerNotFound(Int64)
   case viewNotFound(Int64)
@@ -391,6 +403,8 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
       return "Missing Erika C ABI symbol: \(symbol)"
     case .httpHeadersUnsupported:
       return "The loaded Erika native library does not export erika_presenter_open_with_headers, so httpHeaders cannot be applied. Update the bundled native library (a prebuilt from 0.1.3 or earlier predates HTTP header support)."
+    case .openOptionsUnsupported:
+      return "The loaded Erika native library does not export erika_presenter_open_with_options, so httpReadAheadBytes cannot be applied. Update the bundled native library (a prebuilt from 0.1.7 or earlier predates open options support)."
     case .invalidArguments(let message):
       return message
     case .playerNotFound(let playerId):
@@ -418,6 +432,7 @@ private final class ErikaNativeLibrary {
   typealias DestroyFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
   typealias OpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
   typealias OpenWithHeadersFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?, UInt) -> Int32
+  typealias OpenWithOptionsFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?) -> Int32
   typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
   typealias SetPlaybackRateFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
@@ -495,6 +510,7 @@ private final class ErikaNativeLibrary {
   let destroy: DestroyFn
   let open: OpenFn
   let openWithHeaders: OpenWithHeadersFn?
+  let openWithOptions: OpenWithOptionsFn?
   let play: CommandFn
   let pause: CommandFn
   let stop: CommandFn
@@ -565,6 +581,7 @@ private final class ErikaNativeLibrary {
     destroy = try Self.load("erika_presenter_destroy", from: libraryHandle, as: DestroyFn.self)
     open = try Self.load("erika_presenter_open", from: libraryHandle, as: OpenFn.self)
     openWithHeaders = Self.loadOptional("erika_presenter_open_with_headers", from: libraryHandle, as: OpenWithHeadersFn.self)
+    openWithOptions = Self.loadOptional("erika_presenter_open_with_options", from: libraryHandle, as: OpenWithOptionsFn.self)
     play = try Self.load("erika_presenter_play", from: libraryHandle, as: CommandFn.self)
     pause = try Self.load("erika_presenter_pause", from: libraryHandle, as: CommandFn.self)
     stop = try Self.load("erika_presenter_stop", from: libraryHandle, as: CommandFn.self)
@@ -763,7 +780,7 @@ private final class ErikaPlayerHost {
     return try operation()
   }
 
-  func open(uri: String, httpHeaders: [String: String]) throws {
+  func open(uri: String, httpHeaders: [String: String], httpReadAheadBytes: UInt64 = 0) throws {
     nativeCallLock.lock()
     defer { nativeCallLock.unlock() }
     isPlaying = false
@@ -775,9 +792,36 @@ private final class ErikaPlayerHost {
       nowPlayingTitle = fallbackTitle.isEmpty ? "Erika" : fallbackTitle
     }
     try uri.withCString { cString in
-      guard !httpHeaders.isEmpty else {
+      guard !httpHeaders.isEmpty || httpReadAheadBytes > 0 else {
         try check(library.open(handle, cString), operation: "open")
         return
+      }
+      // Never silently drop the headers or the read-ahead request: falling
+      // back to the headerless entry point turns an authenticated stream
+      // into an opaque 403, and swallowing readAhead hides a stale kernel.
+      if let openWithOptions = library.openWithOptions {
+        let names = httpHeaders.keys.map { strdup($0) }
+        let values = httpHeaders.values.map { strdup($0) }
+        defer {
+          names.forEach { free($0) }
+          values.forEach { free($0) }
+        }
+        let headers = zip(names, values).map { ErikaHttpHeader(name: $0.0, value: $0.1) }
+        try headers.withUnsafeBufferPointer { buffer in
+          var options = ErikaOpenOptions(
+            headers: buffer.baseAddress.map(UnsafeRawPointer.init),
+            headerCount: UInt(headers.count),
+            httpReadAheadBytes: httpReadAheadBytes
+          )
+          try withUnsafePointer(to: &options) { optionsPtr in
+            try check(openWithOptions(handle, cString, UnsafeRawPointer(optionsPtr)), operation: "open")
+          }
+        }
+        notifyNowPlayingChanged()
+        return
+      }
+      if httpReadAheadBytes > 0 {
+        throw ErikaPluginError.openOptionsUnsupported
       }
       // Never fall back to the headerless entry point here: silently dropping
       // the headers turns an authenticated stream into an opaque 403.
@@ -1986,11 +2030,13 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   private var pollTimer: Timer?
   private var activePlayerId: Int64?
   private var interruptedPlayerId: Int64?
+  private var interruptionResumeWorkItem: DispatchWorkItem?
   private var notificationObservers: [NSObjectProtocol] = []
   private var remoteCommandTargets: [(MPRemoteCommand, Any)] = []
   private var systemMediaNavigation: [Int64: (previousEnabled: Bool, nextEnabled: Bool)] = [:]
 
   deinit {
+    interruptionResumeWorkItem?.cancel()
     notificationObservers.forEach(NotificationCenter.default.removeObserver)
     remoteCommandTargets.forEach { command, target in
       command.removeTarget(target)
@@ -2017,6 +2063,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let playerId = try requiredInt64(args["playerId"], name: "playerId")
         players.removeValue(forKey: playerId)
         systemMediaNavigation.removeValue(forKey: playerId)
+        cancelPendingInterruptionResume(ifPlayer: playerId)
         if activePlayerId == playerId {
           activePlayerId = nil
           clearNowPlayingInfo()
@@ -2030,12 +2077,13 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
           throw ErikaPluginError.invalidArguments("uri is required.")
         }
         let headers = (args["httpHeaders"] as? [String: String]) ?? [:]
+        let readAhead = try optionalReadAheadBytes(args["httpReadAheadBytes"])
         if let metadata = args["metadata"] as? [String: Any] {
           try applyMediaMetadata(metadata, to: host)
         } else {
           host.clearMediaMetadata()
         }
-        try host.open(uri: uri, httpHeaders: headers)
+        try host.open(uri: uri, httpHeaders: headers, httpReadAheadBytes: readAhead)
         result(nil)
       case "play":
         let host = try playerHost(from: try dictionaryArgs(call.arguments))
@@ -2045,13 +2093,21 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         updateNowPlayingInfo(for: host)
         result(nil)
       case "pause":
-        try playerHost(from: try dictionaryArgs(call.arguments)).pause()
+        let host = try playerHost(from: try dictionaryArgs(call.arguments))
+        // Drop a pending interruption resume first: it is scheduled on the main
+        // queue and would otherwise fire after this pause and play again.
+        cancelPendingInterruptionResume(ifPlayer: host.id)
+        try host.pause()
         result(nil)
       case "stop":
-        try playerHost(from: try dictionaryArgs(call.arguments)).stop()
+        let host = try playerHost(from: try dictionaryArgs(call.arguments))
+        cancelPendingInterruptionResume(ifPlayer: host.id)
+        try host.stop()
         result(nil)
       case "close":
-        try playerHost(from: try dictionaryArgs(call.arguments)).close()
+        let host = try playerHost(from: try dictionaryArgs(call.arguments))
+        cancelPendingInterruptionResume(ifPlayer: host.id)
+        try host.close()
         result(nil)
       case "seek":
         let args = try dictionaryArgs(call.arguments)
@@ -2678,6 +2734,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
 
   private func performRemotePause() -> MPRemoteCommandHandlerStatus {
     guard let host = activePlayerId.flatMap({ players[$0] }) else { return .noSuchContent }
+    cancelPendingInterruptionResume(ifPlayer: host.id)
     do {
       try host.pause()
       return .success
@@ -2744,20 +2801,74 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
           let type = AVAudioSession.InterruptionType(rawValue: rawType),
           let host = activePlayerId.flatMap({ players[$0] }) else { return }
     if type == .began {
-      interruptedPlayerId = host.isPlaying ? host.id : nil
-      if host.isPlaying {
-        try? host.pause()
+      let wasPlaying = host.isPlaying
+      cancelPendingInterruptionResume()
+      interruptedPlayerId = wasPlaying ? host.id : nil
+      if wasPlaying {
+        do {
+          try host.pause()
+        } catch {
+          NSLog("ErikaFlutterPlugin: audio interruption pause failed: \(error)")
+        }
       }
       return
     }
     guard let rawOptions = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt,
           AVAudioSession.InterruptionOptions(rawValue: rawOptions).contains(.shouldResume),
           interruptedPlayerId == host.id else {
-      interruptedPlayerId = nil
+      cancelPendingInterruptionResume()
       return
     }
+    resumeInterruptedPlayback(host, attempt: 0)
+  }
+
+  /// Drops a scheduled interruption resume, whichever player it targets.
+  private func cancelPendingInterruptionResume() {
+    interruptionResumeWorkItem?.cancel()
+    interruptionResumeWorkItem = nil
     interruptedPlayerId = nil
-    try? host.play()
+  }
+
+  /// Drops a scheduled interruption resume only when it targets `playerId`, so
+  /// an explicit pause/stop/close on one player leaves another player's
+  /// pending resume alone.
+  private func cancelPendingInterruptionResume(ifPlayer playerId: Int64) {
+    guard interruptedPlayerId == playerId else { return }
+    cancelPendingInterruptionResume()
+  }
+
+  private func resumeInterruptedPlayback(_ host: ErikaPlayerHost, attempt: Int) {
+    // A retry can fire after the active player changed. Drop the recovery
+    // instead of returning with `interruptedPlayerId` still set, which would
+    // leave a resume owed to a player that will never be resumed.
+    guard interruptedPlayerId == host.id, activePlayerId == host.id else {
+      cancelPendingInterruptionResume(ifPlayer: host.id)
+      return
+    }
+    do {
+      // ErikaPlayerHost.play() configures the playback category and calls
+      // setActive(true) before sending the native play command.
+      try host.play()
+      cancelPendingInterruptionResume()
+    } catch {
+      let maxAttempts = 3
+      guard attempt < maxAttempts else {
+        cancelPendingInterruptionResume()
+        NSLog("ErikaFlutterPlugin: audio interruption resume failed after \(maxAttempts + 1) attempts: \(error)")
+        return
+      }
+      NSLog("ErikaFlutterPlugin: audio interruption resume attempt \(attempt + 1) failed: \(error)")
+      let workItem = DispatchWorkItem { [weak self, weak host] in
+        guard let self, let host else { return }
+        self.interruptionResumeWorkItem = nil
+        self.resumeInterruptedPlayback(host, attempt: attempt + 1)
+      }
+      interruptionResumeWorkItem = workItem
+      DispatchQueue.main.asyncAfter(
+        deadline: .now() + .milliseconds(100),
+        execute: workItem
+      )
+    }
   }
 
   private func presenterConfigForNewPlayer(arguments: Any?, hdrDebug: Bool) -> ErikaPresenterConfigC {
@@ -2875,6 +2986,21 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       throw ErikaPluginError.invalidArguments("trackId must be an integer or null.")
     }
     return trackId >= 0 ? trackId : nil
+  }
+
+  private func optionalReadAheadBytes(_ value: Any?) throws -> UInt64 {
+    if value == nil || value is NSNull { return 0 }
+    guard let number = value as? NSNumber else {
+      throw ErikaPluginError.invalidArguments("httpReadAheadBytes must be a non-negative integer.")
+    }
+    let numericValue = number.doubleValue
+    guard numericValue.isFinite,
+          numericValue >= 0,
+          numericValue.rounded(.towardZero) == numericValue,
+          numericValue <= Double(Int64.max) else {
+      throw ErikaPluginError.invalidArguments("httpReadAheadBytes must be a non-negative integer.")
+    }
+    return number.uint64Value
   }
 
   private func danmakuConfig(

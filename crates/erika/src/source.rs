@@ -1188,6 +1188,27 @@ impl HttpRangeSource {
         http_headers: Vec<(String, String)>,
         diag_slot: usize,
     ) -> Self {
+        Self::with_http_headers_and_options(uri, http_headers, diag_slot, None)
+    }
+
+    /// `read_ahead`: explicit read-ahead window in bytes; `None` (or `Some(0)`)
+    /// falls back to the `ERIKA_HTTP_READAHEAD_BYTES` env override, then the
+    /// engine default (video slot 4 MiB, see `DEFAULT_READ_AHEAD_BYTES`).
+    pub fn with_http_headers_and_read_ahead(
+        uri: impl Into<String>,
+        http_headers: Vec<(String, String)>,
+        read_ahead: Option<u64>,
+    ) -> Self {
+        Self::with_http_headers_and_options(uri, http_headers, 0, read_ahead)
+    }
+
+    /// 诊断槽位 + per-request read-ahead 的完整构造器，其余入口均委托至此。
+    fn with_http_headers_and_options(
+        uri: impl Into<String>,
+        http_headers: Vec<(String, String)>,
+        diag_slot: usize,
+        read_ahead: Option<u64>,
+    ) -> Self {
         let agent = http_agent();
         let rx = Arc::new(AtomicU64::new(0));
         // 登记到本槽的实时计数器集合：宿主 poll（`source_diag_snapshot_slot`）
@@ -1209,7 +1230,9 @@ impl HttpRangeSource {
             cache_start: 0,
             cache_bytes: Vec::new(),
             back_bytes: http_back_bytes(diag_slot),
-            read_ahead_bytes: http_read_ahead_bytes(diag_slot),
+            read_ahead_bytes: read_ahead
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or_else(|| http_read_ahead_bytes(diag_slot)),
             est_bps: 0.0,
             last_est_at: Instant::now(),
             est_window_bytes: 0,
@@ -2994,15 +3017,61 @@ pub(crate) fn source_from_uri_with_hint_and_headers_slot(
     diag_slot: usize,
     candidates: Vec<(String, f64)>,
 ) -> Result<Box<dyn MediaSource>> {
+    source_from_uri_with_hint_and_headers_slot_and_read_ahead(
+        uri,
+        source_hint,
+        http_headers,
+        diag_slot,
+        candidates,
+        None,
+    )
+}
+
+/// `http_read_ahead_bytes` only applies to HTTP(S) sources and overrides the
+/// per-request read-ahead window; `None` keeps the default resolution
+/// (env override, then the engine default).
+pub fn source_from_uri_with_options(
+    uri: &str,
+    source_hint: MediaSourceHint,
+    http_headers: Vec<(String, String)>,
+    http_read_ahead_bytes: Option<u64>,
+) -> Result<Box<dyn MediaSource>> {
+    source_from_uri_with_hint_and_headers_slot_and_read_ahead(
+        uri,
+        source_hint,
+        http_headers,
+        0,
+        Vec::new(),
+        http_read_ahead_bytes,
+    )
+}
+
+/// 诊断槽位 + 多 host 候选 + per-request read-ahead 的完整工厂，其余入口均委托至此。
+pub(crate) fn source_from_uri_with_hint_and_headers_slot_and_read_ahead(
+    uri: &str,
+    source_hint: MediaSourceHint,
+    http_headers: Vec<(String, String)>,
+    diag_slot: usize,
+    candidates: Vec<(String, f64)>,
+    http_read_ahead_bytes: Option<u64>,
+) -> Result<Box<dyn MediaSource>> {
     match source_hint {
-        MediaSourceHint::Auto => {
-            source_from_auto_uri_with_slot(uri, http_headers, diag_slot, candidates)
-        }
+        MediaSourceHint::Auto => source_from_auto_uri_with_slot(
+            uri,
+            http_headers,
+            diag_slot,
+            candidates,
+            http_read_ahead_bytes,
+        ),
         MediaSourceHint::LocalFile => source_from_local_uri(uri),
         MediaSourceHint::Http => {
             if uri.starts_with("http://") || uri.starts_with("https://") {
-                let mut s =
-                    HttpRangeSource::with_http_headers_and_diag_slot(uri, http_headers, diag_slot);
+                let mut s = HttpRangeSource::with_http_headers_and_options(
+                    uri,
+                    http_headers,
+                    diag_slot,
+                    http_read_ahead_bytes,
+                );
                 s.set_candidates(candidates);
                 Ok(Box::new(s.enable_full_preload()))
             } else {
@@ -3030,6 +3099,7 @@ fn source_from_auto_uri_with_slot(
     http_headers: Vec<(String, String)>,
     diag_slot: usize,
     candidates: Vec<(String, f64)>,
+    http_read_ahead_bytes: Option<u64>,
 ) -> Result<Box<dyn MediaSource>> {
     if uri.starts_with("fd://") {
         return source_from_local_uri(uri);
@@ -3038,8 +3108,12 @@ fn source_from_auto_uri_with_slot(
         return Ok(Box::new(LocalFileSource::open(path)?));
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        let mut s =
-            HttpRangeSource::with_http_headers_and_diag_slot(uri, http_headers, diag_slot);
+        let mut s = HttpRangeSource::with_http_headers_and_options(
+            uri,
+            http_headers,
+            diag_slot,
+            http_read_ahead_bytes,
+        );
         s.set_candidates(candidates);
         return Ok(Box::new(s.enable_full_preload()));
     }
@@ -3725,6 +3799,17 @@ mod tests {
                 ("X-Playback-Session".to_string(), "session-123".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn http_source_constructor_preserves_explicit_read_ahead() {
+        let source = HttpRangeSource::with_http_headers_and_read_ahead(
+            "https://example.invalid/video.mp4",
+            Vec::new(),
+            Some(16 * 1024 * 1024),
+        );
+
+        assert_eq!(source.read_ahead_bytes, 16 * 1024 * 1024);
     }
 
     #[test]

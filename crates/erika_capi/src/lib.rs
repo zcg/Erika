@@ -58,7 +58,7 @@ use erika::presenter::{
     target_os = "android",
     target_env = "ohos"
 ))]
-use erika::renderer::metal::{MetalOutputMode, MetalRendererConfig};
+use erika::renderer::metal::{MetalOutputMode, MetalRendererConfig, VideoAlphaMode};
 use erika::renderer::output::{
     ActiveOutputEncoding, OutputFallbackReason, OutputMode, OutputRuntimeStatus,
     OutputSurfaceFormat,
@@ -102,6 +102,18 @@ pub enum ErikaStatus {
 pub struct ErikaHttpHeader {
     pub name: *const c_char,
     pub value: *const c_char,
+}
+
+/// Extended open parameters mirroring the C header's `ErikaOpenOptions`.
+/// `http_read_ahead_bytes` of 0 uses the environment override when set,
+/// otherwise the 2 MiB default.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ErikaOpenOptions {
+    pub headers: *const ErikaHttpHeader,
+    pub header_count: usize,
+    pub http_read_ahead_bytes: u64,
+    pub reserved: [u64; 3],
 }
 
 thread_local! {
@@ -429,6 +441,7 @@ pub struct ErikaPresenterConfig {
     pub output_mode: i32,
     pub edr_headroom: f32,
     pub luma_upscaler: i32,
+    pub video_alpha_mode: i32,
 }
 
 #[repr(C)]
@@ -580,6 +593,7 @@ impl Default for ErikaPresenterConfig {
             output_mode: ErikaPresenterOutputMode::Sdr as i32,
             edr_headroom: 1.0,
             luma_upscaler: ErikaLumaUpscalerMode::Off as i32,
+            video_alpha_mode: VideoAlphaMode::Opaque as i32,
         }
     }
 }
@@ -807,6 +821,16 @@ pub unsafe extern "C" fn erika_open_with_headers(
     headers: *const ErikaHttpHeader,
     header_count: usize,
 ) -> ErikaStatus {
+    let options = open_options_raw(headers, header_count);
+    unsafe { erika_open_with_options(handle, uri, &options) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_open_with_options(
+    handle: *mut ErikaHandle,
+    uri: *const c_char,
+    options: *const ErikaOpenOptions,
+) -> ErikaStatus {
     with_handle_mut(handle, |handle| {
         let uri = match c_string(uri) {
             Ok(uri) => uri,
@@ -816,15 +840,14 @@ pub unsafe extern "C" fn erika_open_with_headers(
             "fn=erika_open handle={handle:p} uri={}",
             redacted_uri(&uri)
         ));
-        let headers = match c_http_headers(headers, header_count) {
-            Ok(headers) => headers,
+        let (headers, http_read_ahead_bytes) = match c_open_options(options) {
+            Ok(parsed) => parsed,
             Err(status) => return status,
         };
-        let status = status_from_player_result(
-            handle
-                .player
-                .open(MediaRequest::new(uri).with_http_headers(headers)),
-        );
+        let request = MediaRequest::new(uri)
+            .with_http_headers(headers)
+            .map_http_read_ahead_bytes(http_read_ahead_bytes);
+        let status = status_from_player_result(handle.player.open(request));
         capi_trace(format!(
             "fn=erika_open.done handle={handle:p} status={status:?}"
         ));
@@ -1197,6 +1220,27 @@ pub extern "C" fn erika_presenter_create_with_output_mode(
     }))
 }
 
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_presenter_create_with_output_mode_and_alpha(
+    output_mode: i32,
+    edr_headroom: f32,
+    video_alpha_mode: i32,
+) -> *mut ErikaPresenterHandle {
+    create_presenter_handle(presenter_config_from_c(ErikaPresenterConfig {
+        output_mode,
+        edr_headroom,
+        video_alpha_mode,
+        ..ErikaPresenterConfig::default()
+    }))
+}
+
 #[cfg(not(any(
     target_os = "macos",
     any(target_os = "ios", target_os = "tvos"),
@@ -1239,6 +1283,22 @@ pub unsafe extern "C" fn erika_presenter_open_with_headers(
     _uri: *const c_char,
     _headers: *const ErikaHttpHeader,
     _header_count: usize,
+) -> ErikaStatus {
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_env = "ohos"
+)))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_open_with_options(
+    _handle: *mut std::ffi::c_void,
+    _uri: *const c_char,
+    _options: *const ErikaOpenOptions,
 ) -> ErikaStatus {
     ErikaStatus::PlayerError
 }
@@ -1370,6 +1430,7 @@ fn presenter_config_from_c(config: ErikaPresenterConfig) -> PresenterConfig {
         renderer: MetalRendererConfig {
             output_mode,
             luma_upscaler: luma_upscaler_mode_from_c(config.luma_upscaler),
+            video_alpha_mode: VideoAlphaMode::from_raw(config.video_alpha_mode),
             ..MetalRendererConfig::default()
         },
         ..PresenterConfig::default()
@@ -1752,6 +1813,23 @@ pub unsafe extern "C" fn erika_presenter_open_with_headers(
     headers: *const ErikaHttpHeader,
     header_count: usize,
 ) -> ErikaStatus {
+    let options = open_options_raw(headers, header_count);
+    unsafe { erika_presenter_open_with_options(handle, uri, &options) }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_open_with_options(
+    handle: *mut ErikaPresenterHandle,
+    uri: *const c_char,
+    options: *const ErikaOpenOptions,
+) -> ErikaStatus {
     with_presenter_mut(handle, |handle| {
         let uri = match c_string(uri) {
             Ok(uri) => uri,
@@ -1761,15 +1839,14 @@ pub unsafe extern "C" fn erika_presenter_open_with_headers(
             "fn=erika_presenter_open handle={handle:p} uri={}",
             redacted_uri(&uri)
         ));
-        let headers = match c_http_headers(headers, header_count) {
-            Ok(headers) => headers,
+        let (headers, http_read_ahead_bytes) = match c_open_options(options) {
+            Ok(parsed) => parsed,
             Err(status) => return status,
         };
-        let status = status_from_player_result(
-            handle
-                .presenter
-                .open(MediaRequest::new(uri).with_http_headers(headers)),
-        );
+        let request = MediaRequest::new(uri)
+            .with_http_headers(headers)
+            .map_http_read_ahead_bytes(http_read_ahead_bytes);
+        let status = status_from_player_result(handle.presenter.open(request));
         retain_presenter_events_from_latest_open(handle);
         capi_trace(format!(
             "fn=erika_presenter_open.done handle={handle:p} status={status:?}"
@@ -3367,6 +3444,66 @@ pub unsafe extern "C" fn erika_presenter_attach_metal_layer(
     target_env = "ohos"
 ))]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_attach_flutter_texture(
+    handle: *mut ErikaPresenterHandle,
+    kind: ErikaFlutterTextureKind,
+    texture_id: i64,
+    width: u32,
+    height: u32,
+    scale: f64,
+) -> ErikaStatus {
+    if texture_id < 0 || width == 0 || height == 0 {
+        return ErikaStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        status_from_player_result(
+            handle
+                .presenter
+                .attach_surface(PlatformSurface::FlutterTexture(FlutterTextureHandle::new(
+                    flutter_texture_kind_from_c(kind),
+                    texture_id,
+                    width,
+                    height,
+                    scale,
+                ))),
+        )
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_flutter_texture_buffer(
+    handle: *mut ErikaPresenterHandle,
+    raw_texture: u64,
+    width: u32,
+    height: u32,
+) -> ErikaStatus {
+    if raw_texture == 0 || width == 0 || height == 0 {
+        return ErikaStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        status_from_player_result(handle.presenter.set_flutter_texture_buffer(
+            raw_texture,
+            width,
+            height,
+        ))
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn erika_presenter_attach_wgpu_surface(
     handle: *mut ErikaPresenterHandle,
     kind: ErikaWgpuSurfaceKind,
@@ -3448,6 +3585,52 @@ pub unsafe extern "C" fn erika_presenter_attach_windows_hwnd(
             scale,
         )
     }
+}
+
+/// Returns an AddRef'd IUnknown for the presenter's DirectComposition swap
+/// chain. The caller owns the returned COM reference and must Release it.
+#[cfg(target_os = "windows")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_windows_composition_swapchain_iunknown(
+    handle: *mut ErikaPresenterHandle,
+    out_swapchain: *mut *mut std::ffi::c_void,
+) -> ErikaStatus {
+    if out_swapchain.is_null() {
+        set_last_error("DirectComposition swap chain output pointer is null");
+        return ErikaStatus::NullPointer;
+    }
+    unsafe { *out_swapchain = std::ptr::null_mut() };
+    with_presenter_mut(handle, |handle| {
+        let Some(swapchain) = handle.presenter.composition_swapchain_iunknown() else {
+            set_last_error("presenter does not own a DirectComposition swap chain");
+            return ErikaStatus::PlayerError;
+        };
+        unsafe { *out_swapchain = swapchain };
+        ErikaStatus::Ok
+    })
+}
+
+/// Returns an AddRef'd IUnknown for the latest completed, immutable Windows
+/// Flutter SDR frame. The caller owns the COM reference and must Release it.
+#[cfg(target_os = "windows")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_windows_flutter_texture_iunknown(
+    handle: *mut ErikaPresenterHandle,
+    out_texture: *mut *mut std::ffi::c_void,
+) -> ErikaStatus {
+    if out_texture.is_null() {
+        set_last_error("Windows Flutter texture output pointer is null");
+        return ErikaStatus::NullPointer;
+    }
+    unsafe { *out_texture = std::ptr::null_mut() };
+    with_presenter_mut(handle, |handle| {
+        let Some(texture) = handle.presenter.windows_flutter_texture_iunknown() else {
+            set_last_error("presenter does not own a Windows Flutter texture");
+            return ErikaStatus::PlayerError;
+        };
+        unsafe { *out_texture = texture };
+        ErikaStatus::Ok
+    })
 }
 
 #[cfg(any(
@@ -3800,6 +3983,41 @@ fn c_http_headers(
             Ok((name, value))
         })
         .collect()
+}
+
+/// Packs the legacy (headers, header_count) pair into an `ErikaOpenOptions`
+/// so `erika_open_with_headers` can delegate to `erika_open_with_options`.
+/// Returned by value: the struct must live on the caller's stack for as long
+/// as the delegated call reads it.
+fn open_options_raw(headers: *const ErikaHttpHeader, header_count: usize) -> ErikaOpenOptions {
+    ErikaOpenOptions {
+        headers,
+        header_count,
+        http_read_ahead_bytes: 0,
+        reserved: [0; 3],
+    }
+}
+
+/// Validates an `ErikaOpenOptions` at the ABI boundary. A NULL options pointer
+/// means "defaults" (no headers, default read-ahead). `http_read_ahead_bytes`
+/// of 0 also means default; reserved fields must stay zero for forward
+/// compatibility.
+fn c_open_options(
+    options: *const ErikaOpenOptions,
+) -> Result<(Vec<(String, String)>, Option<u64>), ErikaStatus> {
+    if options.is_null() {
+        return Ok((Vec::new(), None));
+    }
+    let options = unsafe { &*options };
+    for field in options.reserved {
+        if field != 0 {
+            set_last_error("ErikaOpenOptions.reserved must be zero");
+            return Err(ErikaStatus::PlayerError);
+        }
+    }
+    let headers = c_http_headers(options.headers, options.header_count)?;
+    let read_ahead = (options.http_read_ahead_bytes > 0).then_some(options.http_read_ahead_bytes);
+    Ok((headers, read_ahead))
 }
 
 /// Headers Erika derives itself for every request. Accepting a caller override
@@ -4634,6 +4852,101 @@ mod tests {
     }
 
     #[test]
+    fn c_open_options_accepts_null_and_defaults() {
+        assert_eq!(c_open_options(std::ptr::null()), Ok((Vec::new(), None)));
+    }
+
+    #[test]
+    fn c_open_options_parses_headers_and_read_ahead() {
+        let name = CString::new("Accept").unwrap();
+        let value = CString::new("video/mp4").unwrap();
+        let headers = [ErikaHttpHeader {
+            name: name.as_ptr(),
+            value: value.as_ptr(),
+        }];
+        let options = ErikaOpenOptions {
+            headers: headers.as_ptr(),
+            header_count: headers.len(),
+            http_read_ahead_bytes: 16 * 1024 * 1024,
+            reserved: [0; 3],
+        };
+        assert_eq!(
+            c_open_options(&options),
+            Ok((
+                vec![("Accept".to_string(), "video/mp4".to_string())],
+                Some(16 * 1024 * 1024)
+            ))
+        );
+
+        let default_read_ahead = ErikaOpenOptions {
+            headers: std::ptr::null(),
+            header_count: 0,
+            http_read_ahead_bytes: 0,
+            reserved: [0; 3],
+        };
+        assert_eq!(c_open_options(&default_read_ahead), Ok((Vec::new(), None)));
+    }
+
+    #[test]
+    fn c_open_options_rejects_nonzero_reserved() {
+        let options = ErikaOpenOptions {
+            headers: std::ptr::null(),
+            header_count: 0,
+            http_read_ahead_bytes: 0,
+            reserved: [1, 0, 0],
+        };
+        assert_eq!(c_open_options(&options), Err(ErikaStatus::PlayerError));
+        assert!(
+            LAST_ERROR
+                .with(|slot| slot.borrow().clone())
+                .unwrap_or_default()
+                .contains("reserved")
+        );
+    }
+
+    #[test]
+    fn open_options_raw_matches_legacy_pair() {
+        let empty = open_options_raw(std::ptr::null(), 0);
+        assert_eq!(empty.header_count, 0);
+
+        let name = CString::new("Accept").unwrap();
+        let value = CString::new("video/mp4").unwrap();
+        let headers = [ErikaHttpHeader {
+            name: name.as_ptr(),
+            value: value.as_ptr(),
+        }];
+        let options = open_options_raw(headers.as_ptr(), headers.len());
+        assert_eq!(options.headers, headers.as_ptr());
+        assert_eq!(options.header_count, headers.len());
+        assert_eq!(options.http_read_ahead_bytes, 0);
+        assert_eq!(options.reserved, [0; 3]);
+        assert_eq!(
+            c_open_options(&options),
+            Ok((vec![("Accept".to_string(), "video/mp4".to_string())], None))
+        );
+    }
+
+    #[test]
+    fn erika_open_with_options_rejects_null_pointer_arguments() {
+        let handle = erika_create();
+        assert!(!handle.is_null());
+        let uri = CString::new("/tmp/erika-missing.mp4").unwrap();
+
+        assert_eq!(
+            unsafe {
+                erika_open_with_options(std::ptr::null_mut(), uri.as_ptr(), std::ptr::null())
+            },
+            ErikaStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe { erika_open_with_options(handle, std::ptr::null(), std::ptr::null()) },
+            ErikaStatus::NullPointer
+        );
+
+        unsafe { erika_destroy(handle) };
+    }
+
+    #[test]
     fn c_surface_attach_emits_events() {
         let handle = erika_create();
         assert!(!handle.is_null());
@@ -5070,8 +5383,8 @@ mod tests {
         let expected_backend = if cfg!(all(target_os = "android", feature = "wgpu")) {
             ErikaUpscalerBackendStatus::Scalar
         } else if cfg!(target_os = "windows") {
-            // Windows D3D11 ArtCNN：已请求上采样模式但设备未 attach 时，
-            // 报告 Building（设备就绪后才会真正构建）。
+            // D3D11 initializes the requested GPU upscaler after attaching a
+            // device; before attachment the existing backend reports Building.
             ErikaUpscalerBackendStatus::Building
         } else {
             ErikaUpscalerBackendStatus::Inactive

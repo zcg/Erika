@@ -32,6 +32,17 @@ video stays outside Flutter's platform-view compositor.
 On Windows `ErikaWindowOverlayVideoView` hosts a window-level Direct3D 11
 swapchain as a sibling surface, following the same overlay model.
 
+Windows `ErikaVideoView` uses that native path too, including for default
+opaque `srcOver` playback. It preserves HDR10 negotiation outside Flutter's
+texture compositor. `ErikaTextureVideoView` is an explicit **SDR-only** option
+for content that needs Flutter opacity, clipping or color filters. Its default
+`srcOver` uses BGRA8 GPU snapshots; `overlay` uses native Windows Composition.
+Other Windows blend modes are rejected explicitly.
+
+Windows texture output requires the matching v0.1.8 or newer native runtime.
+The package pins its native version and checksums in `native_artifacts.properties`.
+Older runtimes lack the optional texture API but can still create native players.
+
 Use `ErikaVideoView` when a standard Flutter platform view is required for a
 small embedder, compatibility path, or diagnostics.
 
@@ -61,7 +72,7 @@ points the build phase at an explicit dylib to bundle instead of building.
 
 ## Native binaries
 
-The plugin downloads the matching `v0.1.7` native runtime by default on macOS,
+The plugin downloads its version-pinned native runtime by default on macOS,
 Windows, iOS, tvOS, Android, and OpenHarmony. Every archive is pinned by SHA-256;
 a missing or invalid archive fails with an explicit error instead of silently
 requiring a Rust, FFmpeg, or NDK toolchain. See the
@@ -308,6 +319,23 @@ than silently dropping them.
 
 Headers apply to the media source only — external subtitle tracks and danmaku
 sidecar files are still fetched without them.
+
+## HTTP read-ahead
+
+Use `httpReadAheadBytes` to tune the HTTP(S) read-ahead window for one open:
+
+```dart
+await player.open(
+  'https://example.com/video.mp4',
+  httpReadAheadBytes: 16 * 1024 * 1024,
+);
+```
+
+A positive value overrides `ERIKA_HTTP_READAHEAD_BYTES`. Null or zero uses that
+environment variable when set, otherwise the native 2 MiB default. Local files
+ignore this option. A native library from 0.1.7 or earlier does not export the
+options entry point, so requesting read-ahead with one throws a descriptive
+error instead of silently dropping the setting.
 
 ## Output Mode
 

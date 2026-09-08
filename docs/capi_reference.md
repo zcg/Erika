@@ -145,6 +145,8 @@ no-op. Destroying a handle stops playback and releases all resources.
 ErikaStatus erika_open(ErikaHandle *handle, const char *uri);   // file path or URL
 ErikaStatus erika_open_with_headers(ErikaHandle *handle, const char *uri,
                                     const ErikaHttpHeader *headers, uintptr_t header_count);
+ErikaStatus erika_open_with_options(ErikaHandle *handle, const char *uri,
+                                    const ErikaOpenOptions *options);
 ErikaStatus erika_play(ErikaHandle *handle);
 ErikaStatus erika_pause(ErikaHandle *handle);
 ErikaStatus erika_stop(ErikaHandle *handle);
@@ -158,9 +160,30 @@ may be released after it returns. When `header_count` is nonzero, `headers`
 must not be `NULL`. Headers are used for HEAD, Range GET, and prefetch requests.
 Authentication information and cookies are not written to Erika logs. `seek`
 takes microseconds.
-`open` and `play` enqueue work asynchronously. Watch for `StateChanged`,
-`DurationChanged`, and `Error` events for the authoritative result instead of
-blocking the host UI thread.
+
+`erika_open_with_options` supersedes `erika_open_with_headers`: it takes an
+`ErikaOpenOptions` struct that bundles the header array with per-request
+tuning. A `NULL` `options` pointer means defaults. `http_read_ahead_bytes`
+overrides the HTTP(S) read-ahead window in bytes for this request. `0` uses the
+process-wide `ERIKA_HTTP_READAHEAD_BYTES` override when it is set, otherwise
+the 2 MiB default; an explicit non-zero value supersedes the environment.
+Non-zero values in `reserved` are rejected so future fields can be added
+without silently changing behavior for older hosts. Read-ahead only affects
+HTTP(S) playback; local files ignore it.
+
+```c
+typedef struct ErikaOpenOptions {
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t http_read_ahead_bytes;   /* 0 = environment override, then 2 MiB */
+  uint64_t reserved[3];             /* must be zero */
+} ErikaOpenOptions;
+```
+
+`open` synchronously probes streams and transitions to `Ready`; `play` enqueues
+work asynchronously. Run blocking opens off the host UI thread and serialize
+all calls on the same handle. Observe `StateChanged`, `DurationChanged`, and
+`Error` events for subsequent playback changes.
 
 ### Tracks and subtitles
 
@@ -236,16 +259,25 @@ Erika owns the full stack; the host supplies a surface and calls `render_tick`.
 ErikaPresenterHandle *erika_presenter_create(void);
 ErikaPresenterHandle *erika_presenter_create_with_config(ErikaPresenterConfig config);
 ErikaPresenterHandle *erika_presenter_create_with_output_mode(int32_t output_mode, float edr_headroom);
+ErikaPresenterHandle *erika_presenter_create_with_output_mode_and_alpha(int32_t output_mode, float edr_headroom,
+                                                                        int32_t video_alpha_mode);
 void                  erika_presenter_destroy(ErikaPresenterHandle *handle);
 ```
 
+Since v0.1.8, `ErikaPresenterConfig` has four fields (16 bytes); v0.1.7 used
+three fields (12 bytes). This by-value structure is not binary-compatible
+across those versions. Rebuild C/C++ callers and manual Swift/FFI mirrors
+with the matching header and native library, and initialize `video_alpha_mode`
+to `0` for opaque video.
+
 `ErikaPresenterConfig` selects the output mode (`Sdr`, Apple `AppleEdr`, or
 Android `ExtendedLinear`), the requested EDR/scRGB content-headroom ceiling,
-and the initial
-luma upscaler. Android `ExtendedLinear` means FP16 extended-linear scRGB, not
-HDR10/PQ. `create_with_output_mode` is a shorthand; `create` uses defaults
-(SDR, no upscaler). A `NULL` return means creation failed — check
-`erika_last_error_message`.
+the initial luma upscaler, and the `video_alpha_mode`
+(`ErikaVideoAlphaMode`). Android `ExtendedLinear` means FP16 extended-linear
+scRGB, not HDR10/PQ. `create_with_output_mode` and
+`create_with_output_mode_and_alpha` are shorthands; `create` uses defaults
+(SDR, opaque video, no upscaler). A `NULL` return means creation failed —
+check `erika_last_error_message`.
 
 ### Playback and runtime parameters
 
@@ -254,6 +286,8 @@ ErikaStatus erika_presenter_open(ErikaPresenterHandle *, const char *uri);
 ErikaStatus erika_presenter_open_with_headers(ErikaPresenterHandle *, const char *uri,
                                               const ErikaHttpHeader *headers,
                                               uintptr_t header_count);
+ErikaStatus erika_presenter_open_with_options(ErikaPresenterHandle *, const char *uri,
+                                              const ErikaOpenOptions *options);
 ErikaStatus erika_presenter_play(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_pause(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_stop(ErikaPresenterHandle *);
@@ -268,7 +302,10 @@ ErikaStatus erika_presenter_set_subtitle_style(ErikaPresenterHandle *, ErikaSubt
 ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float headroom, bool known);
 ```
 
-`set_playback_rate(1.0)` is normal speed. `set_upscaler` switches the neural
+`set_playback_rate(1.0)` is normal speed. `erika_presenter_open_with_options`
+is the push-model counterpart of `erika_open_with_options` and accepts the same
+`ErikaOpenOptions` (headers plus `http_read_ahead_bytes`; see
+[`erika_open_with_options`](#erikahandle--pull-model)). `set_upscaler` switches the neural
 luma upscaler at runtime (see [`erika_presenter_get_upscaler_status`](#diagnostics-and-capture));
 Metal, D3D11 feature level 11+, and compute-capable wgpu renderers execute
 ArtCNN, while backends without compute retain native luma sampling and report
@@ -444,6 +481,25 @@ tracks. `set_danmaku_config` / `_ptr` apply the full `ErikaDanmakuConfig` (the
 it back. See [danmaku_architecture.md](danmaku_architecture.md) for the layout
 engine. `set_danmaku_block_words_json` takes a JSON array of strings to filter.
 
+Inline JSON may be an item array or an object containing a `comments`,
+`danmaku`, or `items` array. Each item accepts these fields (aliases in
+parentheses):
+
+- `content` (`text`, `c`): text; an item with missing or blank text is skipped.
+- `time` (`t`): presentation time in seconds, defaulting to `0`.
+- `type` (`mode`, `y`): `scroll`/`1`, `bottom`/`4`, `top`/`5`, `reverse`/`6`,
+  or `special`/`7`. Numeric `type_code` / `mode_code` are also accepted.
+- `color` (`r`): decimal RGB, `#RRGGBB`, or `rgb(r,g,b)`.
+- `font_size` (`fontSize`, `size`, `s`), `opacity` (`alpha`, `a`), and `is_me`
+  (`isMe`, `self`, `mine`): optional style and self-danmaku metadata.
+- `id`: an optional unsigned 64-bit integer or decimal string. When omitted,
+  Erika assigns the item's position in the complete input. The session creates
+  a separate internal layout identity, so hosts do not need to synthesize a
+  business ID to keep tracks stable across planner windows.
+
+Unknown fields are ignored, so standard maps carrying source fields such as
+`cid` or `danmakuId` may be passed through unchanged.
+
 `set_debug_hud_enabled` is off by default. When enabled, the Presenter draws a
 native diagnostic HUD in the video composition. It shows track
 technical metadata, playback state, decoded/rendered FPS, decode and zero-copy
@@ -479,6 +535,48 @@ auto; a positive value is a surface ceiling and is suitable for API 35
 per-`SurfaceView` `setDesiredHdrHeadroom`. Erika still verifies Vulkan,
 `Rgba16Float`, and `ADATASPACE_SCRGB_LINEAR` itself; failure of any condition
 falls back to SDR and remains queryable.
+
+### Flutter texture surfaces
+
+```c
+ErikaStatus erika_presenter_attach_flutter_texture(ErikaPresenterHandle *, ErikaFlutterTextureKind kind,
+                                                   int64_t texture_id, uint32_t w, uint32_t h, double scale);
+ErikaStatus erika_presenter_set_flutter_texture_buffer(ErikaPresenterHandle *, uint64_t raw_texture,
+                                                       uint32_t w, uint32_t h);
+```
+
+`attach_flutter_texture` binds the presenter to a texture-registrar surface
+identified by `texture_id` (Apple `MacOsTextureRegistrar`/`IosTextureRegistrar`
+today). The host owns the pixel buffers; before **every** `render_tick` it
+selects the GPU target for the next frame with
+`set_flutter_texture_buffer`, passing an `id<MTLTexture>` pointer cast to
+`uint64_t` that must use `BGRA8Unorm` and match the declared `w`×`h`. The
+texture is only borrowed for the duration of the frame — the host keeps
+ownership and may reuse or free it once `render_tick` returns. This is the
+surface the Flutter plugin's `ErikaTextureVideoView` uses on macOS.
+
+### Windows DirectComposition swap chain
+
+```c
+ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(ErikaPresenterHandle *, void **out_swapchain);
+```
+
+Windows only. When the presenter was attached through
+`attach_wgpu_surface_with_output_capabilities` with `direct_composition = true`
+(and the presenter plays with a transparent video alpha mode or an overlay
+blend), Erika creates a premultiplied-alpha composition swap chain for the
+target HWND. This getter returns it as an **AddRef'd `IUnknown*`**: the caller
+owns the returned COM reference and must `Release` it. Re-fetch it after
+decoder/device loss — Erika recreates the swap chain and exposes the new
+object; the same pointer means nothing was rebuilt.
+
+### Windows Flutter texture
+
+```c
+ErikaStatus erika_presenter_windows_flutter_texture_iunknown(ErikaPresenterHandle *, void **out_texture);
+```
+
+Windows only; this symbol is not exported on other platforms. Returns the latest completed, immutable SDR Flutter GPU frame as an **AddRef'd `IUnknown*`**. The caller owns the reference and must `Release` it. Keep the reference while consuming the frame; its texture contents remain unchanged throughout its lifetime. A null output pointer returns `NullPointer`. With a valid presenter but no completed Flutter texture, it returns `PlayerError` and clears the output pointer. Drive rendering before requesting a frame.
 
 ### Render loop and events
 
@@ -634,6 +732,7 @@ snapshots from the same runtime state as `get_output_status`.
 | `ErikaTrackSource` | `Embedded` `External` |
 | `ErikaWgpuSurfaceKind` | `Unknown` `MacOsNsView` `MacOsCaMetalLayer` `IosUiView` `WindowsHwnd` `XlibWindow` `WaylandSurface` `AndroidNativeWindow` `OhosNativeWindow` |
 | `ErikaFlutterTextureKind` | `Unknown` `MacOsTextureRegistrar` `IosTextureRegistrar` `AndroidSurfaceTexture` `WindowsTextureRegistrar` `LinuxTextureRegistrar` |
+| `ErikaVideoAlphaMode` | `Opaque` `PackedAlphaRight` |
 | `ErikaPresenterOutputMode` | `Sdr` `AppleEdr` `ExtendedLinear` `Auto` |
 | `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` |
 | `ErikaOutputSurfaceFormat` | `EightBitUnorm` `TenBitUnorm` `SixteenBitFloat` |
@@ -643,8 +742,10 @@ snapshots from the same runtime state as `get_output_status`.
 
 ## Structs
 
-- **`ErikaPresenterConfig`** `{ int32 output_mode; float edr_headroom; int32 luma_upscaler; }` —
-  passed by value to `create_with_config`.
+- **`ErikaPresenterConfig`** `{ int32 output_mode; float edr_headroom; int32 luma_upscaler; int32 video_alpha_mode; }` —
+  passed by value to `create_with_config`; `video_alpha_mode` is an
+  `ErikaVideoAlphaMode` (`Opaque` default, `PackedAlphaRight` for side-by-side
+  colour/alpha assets).
 - **`ErikaSurfaceOutputCapabilities`** `{ bool extended_linear; bool direct_composition; float desired_headroom; int32 fallback_reason; }` — host-side Android display/surface probe supplied at attach time; `desired_headroom == 0` selects system auto.
 - **`ErikaUpscalerStatus`** — requested mode, active backend, fallback count,
   upscaled frames, last encode/GPU micros.

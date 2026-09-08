@@ -172,6 +172,11 @@ pub struct MediaRequest {
     pub video_candidates: Vec<(String, f64)>,
     /// 音频流多 host 候选。语义同 `video_candidates`。
     pub audio_candidates: Vec<(String, f64)>,
+    /// HTTP read-ahead window in bytes for HTTP(S) playback. `None` honors the
+    /// `ERIKA_HTTP_READAHEAD_BYTES` env override, then uses the engine default
+    /// (see `HttpRangeSource::DEFAULT_READ_AHEAD_BYTES`; 4 MiB in this tree,
+    /// aligned with PiliPlus mpv `demuxer-max-bytes`).
+    pub http_read_ahead_bytes: Option<u64>,
 }
 
 /// Hand-written so that credentials carried by custom headers (`Authorization`,
@@ -191,6 +196,7 @@ impl std::fmt::Debug for MediaRequest {
                     .map(|(name, _)| (name.as_str(), "REDACTED"))
                     .collect::<Vec<_>>(),
             )
+            .field("http_read_ahead_bytes", &self.http_read_ahead_bytes)
             .finish()
     }
 }
@@ -204,6 +210,7 @@ impl MediaRequest {
             audio_uri: None,
             video_candidates: Vec::new(),
             audio_candidates: Vec::new(),
+            http_read_ahead_bytes: None,
         }
     }
 
@@ -234,6 +241,19 @@ impl MediaRequest {
     /// 注入音频流多 host 候选（按快→慢排序的 `(uri, score)`）。
     pub fn with_audio_candidates(mut self, candidates: Vec<(String, f64)>) -> Self {
         self.audio_candidates = candidates;
+        self
+    }
+
+    /// Overrides the HTTP read-ahead window in bytes. Only meaningful for
+    /// HTTP(S) sources; other source kinds ignore it. `0` is treated as `None`.
+    pub fn with_http_read_ahead_bytes(self, read_ahead_bytes: u64) -> Self {
+        self.map_http_read_ahead_bytes(Some(read_ahead_bytes))
+    }
+
+    /// Same as [`Self::with_http_read_ahead_bytes`] but `None` keeps the
+    /// default resolution; `Some(0)` is normalized to `None`.
+    pub fn map_http_read_ahead_bytes(mut self, read_ahead_bytes: Option<u64>) -> Self {
+        self.http_read_ahead_bytes = read_ahead_bytes.filter(|bytes| *bytes > 0);
         self
     }
 }
@@ -731,8 +751,12 @@ impl WgpuSurfaceHandle {
 pub struct SurfaceOutputCapabilities {
     /// The display/window host is eligible for an extended-linear signal.
     pub extended_linear: bool,
-    /// The native surface bypasses Flutter texture-layer composition (for
-    /// Android this means a SurfaceView hosted with Hybrid Composition).
+    /// The native surface bypasses Flutter texture-layer composition.
+    ///
+    /// Android: a SurfaceView hosted with Hybrid Composition (extended-linear HDR).
+    /// Windows D3D11: create an `IDXGISwapChain1` with
+    /// `CreateSwapChainForComposition` instead of `CreateSwapChainForHwnd`.
+    /// Default `false` leaves the HWND swap-chain path unchanged.
     pub direct_composition: bool,
     /// Requested display headroom ratio relative to SDR reference white.
     pub desired_headroom: f32,
@@ -826,6 +850,20 @@ pub trait RendererBackend: Send {
     /// caller fall back to a test frame.
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool>;
 
+    /// Selects the native GPU texture that receives the next Flutter texture
+    /// frame. Apple embedders pass an `id<MTLTexture>` pointer as `raw_texture`.
+    /// Backends without an external Flutter texture path reject the request.
+    fn set_flutter_texture_buffer(
+        &mut self,
+        _raw_texture: u64,
+        _width: u32,
+        _height: u32,
+    ) -> Result<()> {
+        Err(PlayerError::Renderer(
+            "external Flutter texture buffers are not supported by this renderer".to_string(),
+        ))
+    }
+
     /// Render the retained current frame into an offscreen RGBA buffer.
     fn capture_current_frame(
         &mut self,
@@ -878,6 +916,34 @@ pub trait RendererBackend: Send {
     /// this for queryable runtime status; renderers that do not expose dynamic
     /// display headroom may ignore the update.
     fn set_output_headroom(&mut self, _headroom: f32, _known: bool) {}
+
+    /// Borrowed COM identity of a DirectComposition swap chain. No `AddRef`.
+    ///
+    /// Compare this pointer across frames. Only call
+    /// [`Self::composition_swapchain_iunknown`] when transferring a reference
+    /// into `IDCompositionVisual::SetContent`. `None` unless this renderer
+    /// currently owns a composition swap chain.
+    fn composition_swapchain_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+
+    /// AddRef'd `IUnknown` for a DirectComposition `SetContent` swap chain.
+    ///
+    /// Null-free raw pointer; the caller owns the reference and must `Release`
+    /// it (for example by wrapping it in a host `DcompContent`). `None` unless
+    /// this renderer currently owns a composition swap chain.
+    fn composition_swapchain_iunknown(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+
+    /// AddRef'd `IUnknown` for the latest completed Windows Flutter SDR frame.
+    ///
+    /// The caller owns the reference and must `Release` it. This lets the
+    /// Windows embedder expose a shareable D3D11 snapshot to Flutter. Published
+    /// resources are immutable, even after the renderer produces another frame.
+    fn windows_flutter_texture_iunknown(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -958,6 +1024,7 @@ struct PlayerInner {
     playback_generation: u64,
     playback_command_sequence: u64,
     pending_play_sequence: Option<u64>,
+    audio_output_epoch: u64,
     surface: Option<PlatformSurface>,
     tracks: Vec<TrackInfo>,
     track_selection: TrackSelection,
@@ -981,6 +1048,55 @@ struct PlayerInner {
 struct PlayerLifecycle {
     epoch: u64,
     playback: Option<PlaybackRuntime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AudioClockContext {
+    generation: u64,
+    command_sequence: u64,
+    output_epoch: u64,
+}
+
+impl AudioClockContext {
+    fn from_inner(inner: &PlayerInner) -> Self {
+        Self {
+            generation: inner.playback_generation,
+            command_sequence: inner.playback_command_sequence,
+            output_epoch: inner.audio_output_epoch,
+        }
+    }
+}
+
+/// An audio measurement captured together with its playback/output identity.
+/// Construct with [`Player::capture_audio_clock`] before queuing feedback.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioClockObservation {
+    player_id: PlayerId,
+    snapshot: AudioClockSnapshot,
+    captured_at: Instant,
+    context: AudioClockContext,
+}
+
+impl AudioClockObservation {
+    pub fn snapshot(&self) -> AudioClockSnapshot {
+        self.snapshot
+    }
+
+    fn is_current(
+        &self,
+        inner: &PlayerInner,
+        worker_generation: u64,
+        worker_command_sequence: u64,
+        now: Instant,
+    ) -> bool {
+        inner.state == PlayerState::Playing
+            && self.context == AudioClockContext::from_inner(inner)
+            && self.context.generation == worker_generation
+            && self.context.command_sequence == worker_command_sequence
+            && now
+                .checked_duration_since(self.captured_at)
+                .is_some_and(|age| age < AUDIO_CLOCK_SNAPSHOT_STALE_AFTER)
+    }
 }
 
 enum PlaybackCommand {
@@ -1009,7 +1125,7 @@ enum PlaybackCommand {
         sequence: u64,
         generation: u64,
     },
-    AudioClock(AudioClockSnapshot),
+    AudioClock(AudioClockObservation),
     VideoFrameImportFailed(VideoFrameImportFailure),
     AddExternalSubtitle {
         config: SubtitleTrackConfig,
@@ -1113,6 +1229,7 @@ impl Player {
                 playback_generation: 1,
                 playback_command_sequence: 0,
                 pending_play_sequence: None,
+                audio_output_epoch: 1,
                 surface: None,
                 tracks: Vec::new(),
                 track_selection: TrackSelection::default(),
@@ -1733,10 +1850,54 @@ impl Player {
         Ok(())
     }
 
+    /// Submit a snapshot read synchronously on the current playback timeline.
+    /// For delayed or concurrent measurements, use [`Self::capture_audio_clock`]
+    /// and [`Self::update_audio_clock_observation`] to retain capture identity.
     pub fn update_audio_clock(&self, snapshot: AudioClockSnapshot) -> Result<()> {
+        let context =
+            AudioClockContext::from_inner(&self.inner.lock().expect("player mutex poisoned"));
+        self.update_audio_clock_observation(AudioClockObservation {
+            player_id: self.id,
+            snapshot,
+            captured_at: Instant::now(),
+            context,
+        })
+    }
+
+    /// Capture identity and time before reading the backend, without holding a
+    /// player lock across backend work. A concurrent seek/reset invalidates the
+    /// resulting observation instead of relabelling old PCM as the new timeline.
+    /// Read the backend synchronously here; do not return a previously cached
+    /// snapshot. The output owner must serialize reads with output reconfiguration.
+    pub fn capture_audio_clock(
+        &self,
+        read: impl FnOnce() -> Option<AudioClockSnapshot>,
+    ) -> Option<AudioClockObservation> {
+        let context =
+            AudioClockContext::from_inner(&self.inner.lock().expect("player mutex poisoned"));
+        let captured_at = Instant::now();
+        Some(AudioClockObservation {
+            player_id: self.id,
+            snapshot: read()?,
+            captured_at,
+            context,
+        })
+    }
+
+    pub(crate) fn invalidate_audio_clock(&self) {
+        let mut inner = self.inner.lock().expect("player mutex poisoned");
+        inner.audio_output_epoch = inner.audio_output_epoch.saturating_add(1);
+    }
+
+    pub fn update_audio_clock_observation(&self, observation: AudioClockObservation) -> Result<()> {
         self.ensure_not_closed()?;
+        if observation.player_id != self.id {
+            return Err(PlayerError::Playback(
+                "audio observation belongs to another player".into(),
+            ));
+        }
         let commands = self.playback_commands()?;
-        match commands.try_send(PlaybackCommand::AudioClock(snapshot)) {
+        match commands.try_send(PlaybackCommand::AudioClock(observation)) {
             Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
             Err(TrySendError::Disconnected(_)) => Err(PlayerError::Playback(
                 "playback worker is not running".to_string(),
@@ -2041,8 +2202,7 @@ fn run_playback_worker(
     let mut frame_output_quiesced = false;
     let mut last_executed_playback_command_sequence = 0u64;
     let mut last_worker_clock = None;
-    let mut last_audio_snapshot = None;
-    let mut last_audio_snapshot_at = None;
+    let mut last_audio_observation = None;
     let mut audio_output_backpressure = AudioOutputBackpressureState::default();
     let mut buffering = PlaybackBufferingTracker::default();
     let mut eof_published = false;
@@ -2073,12 +2233,7 @@ fn run_playback_worker(
         match commands.recv_timeout(poll) {
             Ok(command) => {
                 command_count += 1;
-                observe_audio_pump_command(
-                    engine.state(),
-                    &mut last_audio_snapshot,
-                    &mut last_audio_snapshot_at,
-                    &command,
-                );
+                observe_audio_pump_command(engine.state(), &mut last_audio_observation, &command);
                 if !handle_playback_command(
                     engine,
                     &inner,
@@ -2096,12 +2251,7 @@ fn run_playback_worker(
 
         while let Ok(command) = commands.try_recv() {
             command_count += 1;
-            observe_audio_pump_command(
-                engine.state(),
-                &mut last_audio_snapshot,
-                &mut last_audio_snapshot_at,
-                &command,
-            );
+            observe_audio_pump_command(engine.state(), &mut last_audio_observation, &command);
             if !handle_playback_command(
                 engine,
                 &inner,
@@ -2117,6 +2267,17 @@ fn run_playback_worker(
             eof_published = false;
         }
         let after_commands = std::time::Instant::now();
+
+        let audio_observation = last_audio_observation.filter(|observation| {
+            observation.is_current(
+                &inner.lock().expect("player mutex poisoned"),
+                playback_generation,
+                last_executed_playback_command_sequence,
+                after_commands,
+            )
+        });
+        let last_audio_snapshot = audio_observation.map(|observation| observation.snapshot);
+        let last_audio_snapshot_at = audio_observation.map(|observation| observation.captured_at);
 
         engine.set_audio_output_active(audio_frame_output_is_active(&inner));
         if engine.state() != PlaybackRunState::Playing || frame_output_quiesced {
@@ -2558,6 +2719,11 @@ fn pump_audio_from_worker(
             AUDIO_PREFILL_TIME_BUDGET.saturating_sub(elapsed),
         ) {
             Ok(Some(frame)) => {
+                let output_end = frame.pts.map(|pts| {
+                    pts.saturating_add(Duration::from_secs_f64(
+                        frame.frame.frames as f64 / f64::from(frame.frame.format.sample_rate),
+                    ))
+                });
                 match try_emit_audio_frame_from_worker(
                     inner,
                     PlayerAudioFrame {
@@ -2566,6 +2732,7 @@ fn pump_audio_from_worker(
                     },
                 ) {
                     AudioFrameEmitResult::Sent => {
+                        engine.record_audio_output_end(output_end);
                         backpressure.reset();
                         emitted += 1;
                     }
@@ -2625,14 +2792,15 @@ fn should_prefill_audio_from_worker(
 
 fn observe_audio_pump_command(
     engine_state: PlaybackRunState,
-    last_audio_snapshot: &mut Option<AudioClockSnapshot>,
-    last_audio_snapshot_at: &mut Option<Instant>,
+    last_audio_observation: &mut Option<AudioClockObservation>,
     command: &PlaybackCommand,
 ) {
     match command {
-        PlaybackCommand::AudioClock(snapshot) => {
-            *last_audio_snapshot = Some(*snapshot);
-            *last_audio_snapshot_at = Some(Instant::now());
+        PlaybackCommand::AudioClock(observation) => {
+            if last_audio_observation.is_none_or(|last| observation.captured_at > last.captured_at)
+            {
+                *last_audio_observation = Some(*observation);
+            }
         }
         PlaybackCommand::Play { .. }
             if matches!(
@@ -2640,14 +2808,14 @@ fn observe_audio_pump_command(
                 PlaybackRunState::Stopped | PlaybackRunState::Ended
             ) =>
         {
-            *last_audio_snapshot = None;
-            *last_audio_snapshot_at = None;
+            *last_audio_observation = None;
         }
         PlaybackCommand::Seek { .. }
         | PlaybackCommand::Stop { .. }
+        | PlaybackCommand::SetPlaybackRate(_)
+        | PlaybackCommand::SelectSubtitleTrack(_)
         | PlaybackCommand::SelectAudioTrack(_) => {
-            *last_audio_snapshot = None;
-            *last_audio_snapshot_at = None;
+            *last_audio_observation = None;
         }
         _ => {}
     }
@@ -2873,7 +3041,27 @@ fn handle_playback_command(
                 }
             }
         }
-        PlaybackCommand::AudioClock(snapshot) => {
+        PlaybackCommand::AudioClock(observation) => {
+            let shared = inner.lock().expect("player mutex poisoned");
+            if !observation.is_current(
+                &shared,
+                *playback_generation,
+                *last_executed_playback_command_sequence,
+                Instant::now(),
+            ) {
+                trace::log(format!(
+                    "[erika-clock-trace] stage=worker_audio_clock_skip observed={:?} current={:?} worker_gen={} worker_sequence={} age_ms={} state={:?}",
+                    observation.context,
+                    AudioClockContext::from_inner(&shared),
+                    *playback_generation,
+                    *last_executed_playback_command_sequence,
+                    observation.captured_at.elapsed().as_millis(),
+                    shared.state,
+                ));
+                return true;
+            }
+            drop(shared);
+            let snapshot = observation.snapshot;
             trace::log(format!(
                 "[erika-clock-trace] stage=worker_command_audio_clock media={} queued={} queued_frames={} read={} written={} underflow={} gen={}",
                 trace::duration_label(snapshot.media_time),
@@ -2884,7 +3072,11 @@ fn handle_playback_command(
                 snapshot.underflow_frames,
                 *playback_generation,
             ));
-            let _ = engine.sync_to_audio_clock(snapshot);
+            let _ = engine.sync_to_audio_clock_observed(
+                snapshot,
+                observation.captured_at,
+                observation.context.output_epoch,
+            );
         }
         PlaybackCommand::VideoFrameImportFailed(failure) => {
             trace::diagnostic(failure.structured_message());
@@ -3583,6 +3775,22 @@ fn emit_subtitle_frame_from_worker(inner: &Arc<Mutex<PlayerInner>>, frame: Playe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_request_normalizes_http_read_ahead_defaults() {
+        assert_eq!(
+            MediaRequest::new("https://example.invalid/video.mp4")
+                .with_http_read_ahead_bytes(8 * 1024 * 1024)
+                .http_read_ahead_bytes,
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(
+            MediaRequest::new("https://example.invalid/video.mp4")
+                .with_http_read_ahead_bytes(0)
+                .http_read_ahead_bytes,
+            None
+        );
+    }
 
     #[test]
     fn surface_metrics_keep_exact_physical_extent() {
@@ -4515,6 +4723,7 @@ mod tests {
             audio_uri: None,
             video_candidates: Vec::new(),
             audio_candidates: Vec::new(),
+            http_read_ahead_bytes: None,
         };
         let mut engine = VideoPlaybackEngine::open(
             &request,
@@ -5066,29 +5275,165 @@ mod tests {
 
     #[test]
     fn ended_play_clears_stale_audio_snapshot_before_restart() {
-        let mut snapshot = Some(AudioClockSnapshot {
-            media_time: Some(Duration::from_secs(8)),
-            queued_duration: Some(Duration::from_millis(100)),
-            queued_frames: 4_800,
-            read_frames: 48_000,
-            written_frames: 52_800,
-            underflow_frames: 0,
+        let player = Player::new(PlayerConfig::default());
+        let mut observation = player.capture_audio_clock(|| {
+            Some(AudioClockSnapshot {
+                media_time: Some(Duration::from_secs(8)),
+                queued_duration: Some(Duration::from_millis(100)),
+                queued_frames: 4_800,
+                read_frames: 48_000,
+                written_frames: 52_800,
+                underflow_frames: 0,
+            })
         });
-        let mut snapshot_at = Some(Instant::now());
         let command = PlaybackCommand::Play {
             sequence: 1,
             generation: 1,
         };
 
-        observe_audio_pump_command(
-            PlaybackRunState::Ended,
-            &mut snapshot,
-            &mut snapshot_at,
-            &command,
-        );
+        observe_audio_pump_command(PlaybackRunState::Ended, &mut observation, &command);
 
-        assert!(snapshot.is_none());
-        assert!(snapshot_at.is_none());
+        assert!(observation.is_none());
+    }
+
+    fn audio_observation_test_sample() -> AudioClockSnapshot {
+        AudioClockSnapshot {
+            media_time: Some(Duration::from_millis(200)),
+            queued_duration: Some(Duration::from_millis(100)),
+            queued_frames: 4_800,
+            read_frames: 9_600,
+            written_frames: 14_400,
+            underflow_frames: 0,
+        }
+    }
+
+    #[test]
+    fn audio_observation_keeps_capture_generation_across_seek() {
+        let player = Player::new(PlayerConfig::default());
+        player.inner.lock().unwrap().state = PlayerState::Playing;
+        let observation = player
+            .capture_audio_clock(|| Some(audio_observation_test_sample()))
+            .unwrap();
+        let mut inner = player.inner.lock().unwrap();
+        assert!(observation.is_current(
+            &inner,
+            inner.playback_generation,
+            inner.playback_command_sequence,
+            Instant::now()
+        ));
+        // Seek publishes the new timeline before the worker commits its clock.
+        inner.playback_generation += 1;
+        inner.playback_command_sequence += 1;
+        inner.playback_clock = PlaybackClock::paused_at(Duration::from_secs(3));
+        assert!(!observation.is_current(
+            &inner,
+            inner.playback_generation,
+            inner.playback_command_sequence,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn audio_observation_ages_from_capture_not_delivery() {
+        let player = Player::new(PlayerConfig::default());
+        player.inner.lock().unwrap().state = PlayerState::Playing;
+        let observation = player
+            .capture_audio_clock(|| Some(audio_observation_test_sample()))
+            .unwrap();
+        let inner = player.inner.lock().unwrap();
+        assert!(!observation.is_current(
+            &inner,
+            inner.playback_generation,
+            inner.playback_command_sequence,
+            observation.captured_at + AUDIO_CLOCK_SNAPSHOT_STALE_AFTER
+        ));
+        assert!(!observation.is_current(
+            &inner,
+            inner.playback_generation,
+            inner.playback_command_sequence,
+            observation.captured_at - Duration::from_millis(1)
+        ));
+        let mut cached = None;
+        observe_audio_pump_command(
+            PlaybackRunState::Playing,
+            &mut cached,
+            &PlaybackCommand::AudioClock(observation),
+        );
+        assert_eq!(cached.unwrap().captured_at, observation.captured_at);
+    }
+
+    #[test]
+    fn audio_capture_does_not_relabel_a_reset_during_backend_read() {
+        let player = Player::new(PlayerConfig::default());
+        player.inner.lock().unwrap().state = PlayerState::Playing;
+        let observation = player
+            .capture_audio_clock(|| {
+                // Also proves no player lock is held across a backend read.
+                player.invalidate_audio_clock();
+                Some(audio_observation_test_sample())
+            })
+            .unwrap();
+        let inner = player.inner.lock().unwrap();
+        assert!(!observation.is_current(
+            &inner,
+            inner.playback_generation,
+            inner.playback_command_sequence,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn audio_observation_rejects_old_pause_resume_intent() {
+        let player = Player::new(PlayerConfig::default());
+        player.inner.lock().unwrap().state = PlayerState::Playing;
+        let observation = player
+            .capture_audio_clock(|| Some(audio_observation_test_sample()))
+            .unwrap();
+        let mut inner = player.inner.lock().unwrap();
+        inner.state = PlayerState::Paused;
+        assert!(!observation.is_current(
+            &inner,
+            inner.playback_generation,
+            inner.playback_command_sequence,
+            Instant::now()
+        ));
+        inner.playback_command_sequence += 2;
+        inner.state = PlayerState::Playing;
+        assert!(!observation.is_current(
+            &inner,
+            inner.playback_generation,
+            inner.playback_command_sequence,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn audio_observation_waits_for_worker_to_execute_capture_intent() {
+        let player = Player::new(PlayerConfig::default());
+        {
+            let mut inner = player.inner.lock().unwrap();
+            inner.state = PlayerState::Playing;
+            inner.playback_command_sequence = 2;
+        }
+        let observation = player
+            .capture_audio_clock(|| Some(audio_observation_test_sample()))
+            .unwrap();
+        let inner = player.inner.lock().unwrap();
+        assert!(!observation.is_current(&inner, inner.playback_generation, 1, Instant::now()));
+        assert!(observation.is_current(&inner, inner.playback_generation, 2, Instant::now()));
+    }
+
+    #[test]
+    fn audio_observation_cannot_be_submitted_to_another_player() {
+        let first = Player::new(PlayerConfig::default());
+        let second = Player::new(PlayerConfig::default());
+        let observation = first
+            .capture_audio_clock(|| Some(audio_observation_test_sample()))
+            .unwrap();
+        let error = second
+            .update_audio_clock_observation(observation)
+            .unwrap_err();
+        assert!(error.to_string().contains("another player"));
     }
 
     #[test]

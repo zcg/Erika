@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+## 0.1.8 - 2026-09-07
+
+### Compatibility
+
+- The presenter configuration ABI now includes packed-alpha video and native
+  compositing options. Native embedders must rebuild against the matching
+  `erika.h` and runtime; do not mix configuration structs from older releases
+  with the 0.1.8 binaries. Flutter packages pin matching native artifacts.
+
+### C API
+
+- Added `ErikaOpenOptions` and `erika_open_with_options` /
+  `erika_presenter_open_with_options`, superseding the `_with_headers` pair.
+  The options struct bundles the header array with per-request tuning, starting
+  with `http_read_ahead_bytes` to override the HTTP(S) read-ahead window
+  (0 uses `ERIKA_HTTP_READAHEAD_BYTES` when set, otherwise the 2 MiB default;
+  an explicit value supersedes the environment variable). Reserved fields must
+  be zero and are validated so future fields cannot silently change behavior.
+
+### Flutter and OpenHarmony
+
+- Added `httpReadAheadBytes` to Flutter `ErikaPlayer.open` on Android, Apple
+  platforms, Windows, and OpenHarmony, and exposed matching open options in the
+  standalone OpenHarmony SDK.
+
+### Danmaku
+
+- Kept both accepted and rejected placement decisions stable across sliding
+  planner windows, preventing dropped comments from reappearing mid-flight or
+  forcing visible comments onto another lane.
+- Decoupled host-provided danmaku IDs from internal layout identity and parse
+  optional JSON IDs as exact `u64` values without floating-point rounding.
+
+### Playback
+
+- Host-provided Metal layers explicitly retain the finite drawable timeout
+  (up to one second before returning nil); skipped presents are counted with
+  throttled diagnostics.
+- Recover audio-master clock drift after a blocked render tick without increasing
+  audio queue depth. Presenter feedback retains its capture time, playback intent,
+  generation, and output epoch; stale feedback and silence-only callbacks cannot
+  drive clock correction. Each new output first establishes a progress baseline.
+- Avoid replaying already queued audio when video decoding resumes in the
+  foreground, and defer iOS foreground resume until the host is ready while
+  recovering audio interruptions.
+- Smooth playback-rate changes with a bounded old-rate audio bridge while
+  preserving audio-master synchronization at non-default rates.
+- When the first audio stream cannot be decoded, try the remaining audio
+  streams in container order and report all decoder failures if none can be
+  opened.
+- Added packed-alpha video presentation with premultiplied GPU output on
+  Windows and macOS, including native backdrop-aware overlay composition.
+- Raised the playback-rate ceiling to 16x.
+
+### Windows rendering
+
+- Fixed DWM crashes and striped video caused by unsafe D3D11 frame reuse, kept
+  native opaque playback on its HDR-capable path, and corrected fill sizing.
+- Added an explicit SDR Flutter texture path and synchronized GPU texture
+  handoff. Player shutdown now joins the danmaku worker before unloading its DLL.
+
+### SDK distribution
+
+- Added a Swift SDK binary archive and unified native, Flutter, OpenHarmony,
+  and Swift package releases behind the native version tag.
+
 ## 0.1.7 - 2026-08-16
 
 ### Flutter package distribution

@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use ::windows::Win32::Foundation::{HANDLE, HMODULE, HWND};
 use ::windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -10,17 +11,18 @@ use ::windows::Win32::Graphics::Direct3D::{
     D3D_SRV_DIMENSION_TEXTURE2DARRAY, ID3DBlob,
 };
 use ::windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD,
-    D3D11_BLEND_SRC_ALPHA, D3D11_BOX, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_VERTEX_DATA,
-    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
-    D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEX2D_ARRAY_SRV, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_VIEWPORT, D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer, ID3D11Device,
-    ID3D11DeviceContext, ID3D11InputLayout, ID3D11Multithread, ID3D11PixelShader,
-    ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState, ID3D11ShaderResourceView,
-    ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE,
+    D3D11_BLEND_OP_ADD, D3D11_BLEND_SRC_ALPHA, D3D11_BOX, D3D11_BUFFER_DESC,
+    D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_INPUT_ELEMENT_DESC,
+    D3D11_INPUT_PER_VERTEX_DATA, D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
+    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_RESOURCE_MISC_SHARED, D3D11_SAMPLER_DESC,
+    D3D11_SDK_VERSION, D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_ARRAY_SRV, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer,
+    ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout, ID3D11Multithread, ID3D11PixelShader,
+    ID3D11Query, ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState,
+    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
@@ -34,16 +36,16 @@ use ::windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_WAS_STILL_DRAWING, DXGI_HDR_METADATA_HDR10, DXGI_HDR_METADATA_TYPE_HDR10,
     DXGI_HDR_METADATA_TYPE_NONE, DXGI_PRESENT_DO_NOT_WAIT, DXGI_PRESENT_PARAMETERS,
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIResource,
     IDXGISwapChain1, IDXGISwapChain3, IDXGISwapChain4,
 };
-use ::windows::core::{Interface, PCSTR};
+use ::windows::core::{BOOL, IUnknown, Interface, PCSTR};
 
 use crate::core::{
-    ColorPrimaries, LumaUpscalerBackendStatus, PlatformSurface, PlayerError, PlayerVideoFrame,
-    RenderFrameContext, RendererBackend, RendererRuntimeStats, Result, SurfaceMetrics,
-    TransferFunction, WgpuSurfaceKind,
+    ColorPrimaries, FlutterTextureKind, LumaUpscalerBackendStatus, PlatformSurface, PlayerError,
+    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererRuntimeStats, Result,
+    SurfaceMetrics, TransferFunction, WgpuSurfaceKind,
 };
 use crate::danmaku::{
     DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan,
@@ -51,7 +53,7 @@ use crate::danmaku::{
 use crate::ffmpeg::Frame;
 use crate::overlay::OverlayFrame;
 use crate::renderer::d3d11_artcnn::D3d11ArtCnn;
-use crate::renderer::metal::MetalRendererConfig;
+use crate::renderer::metal::{MetalRendererConfig, VideoAlphaMode};
 use crate::renderer::output::{
     ActiveOutputEncoding, OutputFallbackReason, OutputRuntimeStatus, OutputSurfaceFormat,
 };
@@ -240,18 +242,23 @@ float3 target_reference_linear_to_output(float3 rgb) {
     return rgb;
 }
 
-float4 final_output(float3 rgb) {
+float4 final_output(float3 rgb, float alpha) {
+    float3 output_rgb;
     if (scene_linear != 0u) {
-        return float4(max(rgb, float3(0.0, 0.0, 0.0)), 1.0);
+        output_rgb = max(rgb, float3(0.0, 0.0, 0.0)) * alpha;
+        return float4(output_rgb, alpha);
     }
     if (target_transfer == 3u) {
-        return float4(clamp(rgb, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0)), 1.0);
+        output_rgb = clamp(rgb, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0)) * alpha;
+        return float4(output_rgb, alpha);
     }
     if (edr_output != 0u) {
         float headroom = max(target_peak_nits() / target_reference_white_nits(), 1.0);
-        return float4(clamp(rgb, float3(0.0, 0.0, 0.0), float3(headroom, headroom, headroom)), 1.0);
+        output_rgb = clamp(rgb, float3(0.0, 0.0, 0.0), float3(headroom, headroom, headroom)) * alpha;
+        return float4(output_rgb, alpha);
     }
-    return float4(clamp(rgb, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0)), 1.0);
+    output_rgb = clamp(rgb, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0)) * alpha;
+    return float4(output_rgb, alpha);
 }
 
 void expand_ycbcr_range(float y_in, float2 cbcr_in, out float y, out float2 cbcr) {
@@ -317,9 +324,15 @@ float sample_packed_luma(float2 texcoord) {
 }
 
 float4 ps_main(VsOut input) : SV_Target {
-    float2 luma_coord = input.texcoord * texture_scales.xy;
-    float2 chroma_coord = input.texcoord * texture_scales.zw;
-    float y_sample = input_mode == 2u
+    uint base_input_mode = input_mode & 255u;
+    bool packed_alpha = (input_mode & 256u) != 0u;
+    float2 color_coord = packed_alpha
+        ? float2(input.texcoord.x * 0.5, input.texcoord.y)
+        : input.texcoord;
+    float2 alpha_coord = float2(0.5 + input.texcoord.x * 0.5, input.texcoord.y);
+    float2 luma_coord = color_coord * texture_scales.xy;
+    float2 chroma_coord = color_coord * texture_scales.zw;
+    float y_sample = base_input_mode == 2u
         ? sample_packed_luma(luma_coord)
         : lumaTex.Sample(videoSampler, luma_coord).r;
     float2 cbcr_sample = chromaTex.Sample(videoSampler, chroma_coord).rg;
@@ -340,13 +353,24 @@ float4 ps_main(VsOut input) : SV_Target {
     rgb = tone_map_nits(rgb);
     rgb = target_nits_to_reference_linear(rgb);
     rgb = target_reference_linear_to_output(rgb);
-    return final_output(rgb);
+    float alpha = 1.0;
+    if (packed_alpha) {
+        float alpha_sample = lumaTex.Sample(
+            videoSampler,
+            alpha_coord * texture_scales.xy
+        ).r;
+        float unused_y;
+        float2 unused_cbcr;
+        expand_ycbcr_range(alpha_sample, float2(0.5, 0.5), unused_y, unused_cbcr);
+        alpha = saturate(unused_y);
+    }
+    return final_output(rgb, alpha);
 }
 
 float4 encode_ps_main(VsOut input) : SV_Target {
     float3 rgb = lumaTex.Sample(videoSampler, input.texcoord).rgb;
     rgb = target_reference_linear_to_output(rgb);
-    return final_output(rgb);
+    return final_output(rgb, 1.0);
 }
 "#;
 
@@ -588,9 +612,15 @@ struct AttachedSurface {
     /// 渲染进 XAML 树（`raw_window` 传入 `ISwapChainPanelNative*`）。
     /// 裸指针：接口由宿主（SwapChainPanel）持有，生命周期长于渲染器。
     panel: Option<*mut c_void>,
+    composition: bool,
+    flutter_texture: bool,
     metrics: SurfaceMetrics,
     output_mode: D3d11OutputMode,
     swapchain: Option<IDXGISwapChain1>,
+    output_texture: Option<ID3D11Texture2D>,
+    // Immutable, GPU-complete snapshot exported to Flutter. Never render into
+    // this resource again: opening its handle is not GPU consumer completion.
+    published_texture: Option<ID3D11Texture2D>,
     render_target: Option<ID3D11RenderTargetView>,
     linear_render_target: Option<ID3D11RenderTargetView>,
     linear_shader_resource: Option<ID3D11ShaderResourceView>,
@@ -598,8 +628,11 @@ struct AttachedSurface {
 
 impl AttachedSurface {
     fn targets_ready(&self) -> bool {
-        self.swapchain.is_some()
-            && self.render_target.is_some()
+        (if self.flutter_texture {
+            self.output_texture.is_some()
+        } else {
+            self.swapchain.is_some()
+        }) && self.render_target.is_some()
             && (!matches!(self.output_mode, D3d11OutputMode::Hdr10)
                 || (self.linear_render_target.is_some() && self.linear_shader_resource.is_some()))
     }
@@ -616,6 +649,81 @@ struct ImportedVideoFrame {
     _array_index: u32,
     frame_token: u64,
     constants: VideoUniforms,
+}
+
+struct FlutterTextureScene {
+    frame_token: u64,
+    generation: u64,
+    upscaler: LumaUpscalerMode,
+    overlay: Option<OverlayFrame>,
+    danmaku: Option<DanmakuRenderPlan>,
+}
+
+impl FlutterTextureScene {
+    fn new(frame_token: u64, upscaler: LumaUpscalerMode, context: RenderFrameContext<'_>) -> Self {
+        Self {
+            frame_token,
+            generation: context.generation,
+            upscaler,
+            overlay: context.overlay.cloned(),
+            danmaku: context.danmaku.cloned(),
+        }
+    }
+
+    fn matches(
+        &self,
+        frame_token: u64,
+        upscaler: LumaUpscalerMode,
+        context: RenderFrameContext<'_>,
+    ) -> bool {
+        self.frame_token == frame_token
+            && self.generation == context.generation
+            && self.upscaler == upscaler
+            && self.overlay_matches(context.overlay)
+            && self.danmaku_matches(context.danmaku)
+    }
+
+    fn overlay_matches(&self, overlay: Option<&OverlayFrame>) -> bool {
+        match (self.overlay.as_ref(), overlay) {
+            (Some(a), Some(b)) => {
+                a.viewport == b.viewport
+                    && a.subtitle_planes == b.subtitle_planes
+                    && a.subtitle_alpha_planes == b.subtitle_alpha_planes
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn danmaku_matches(&self, danmaku: Option<&DanmakuRenderPlan>) -> bool {
+        match (self.danmaku.as_ref(), danmaku) {
+            (Some(a), Some(b)) => {
+                a.viewport == b.viewport && a.atlas == b.atlas && a.items == b.items
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn update(
+        &mut self,
+        frame_token: u64,
+        upscaler: LumaUpscalerMode,
+        context: RenderFrameContext<'_>,
+    ) {
+        // A new video frame need not copy unchanged subtitle/HUD pixels or
+        // danmaku instances. Retain each cached buffer until its own content
+        // changes; keep exact comparisons rather than lossy fingerprints.
+        if !self.overlay_matches(context.overlay) {
+            self.overlay = context.overlay.cloned();
+        }
+        if !self.danmaku_matches(context.danmaku) {
+            self.danmaku = context.danmaku.cloned();
+        }
+        self.frame_token = frame_token;
+        self.generation = context.generation;
+        self.upscaler = upscaler;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -735,8 +843,10 @@ pub struct D3d11Renderer {
     state: Option<D3d11DeviceState>,
     surface: Option<AttachedSurface>,
     current_video: Option<ImportedVideoFrame>,
+    flutter_scene: Option<FlutterTextureScene>,
     danmaku_atlas_cache: Option<D3d11DanmakuAtlasCache>,
     requested_output_mode: crate::renderer::output::OutputMode,
+    video_alpha_mode: VideoAlphaMode,
     upscaler_mode: LumaUpscalerMode,
     upscaler: D3d11ArtCnn,
     next_frame_token: u64,
@@ -765,8 +875,10 @@ impl D3d11Renderer {
             state: None,
             surface: None,
             current_video: None,
+            flutter_scene: None,
             danmaku_atlas_cache: None,
             requested_output_mode: config.output_mode,
+            video_alpha_mode: config.video_alpha_mode,
             upscaler_mode: config.luma_upscaler,
             upscaler: D3d11ArtCnn::default(),
             next_frame_token: 0,
@@ -779,6 +891,44 @@ impl D3d11Renderer {
 
     pub fn stats(&self) -> D3d11RendererStats {
         self.stats
+    }
+
+    fn retire_current_video(&mut self) -> Result<()> {
+        // Preserve main's HWND playback policy. Only compositor-owned surfaces
+        // need this additional handoff barrier. Do not grow the decoder pool or
+        // accumulate an unbounded queue of AVFrames on delayed/failed fences.
+        if self.current_video.is_some()
+            && self
+                .surface
+                .as_ref()
+                .is_some_and(|s| s.composition || s.flutter_texture)
+        {
+            if let Some(state) = self.state.as_ref() {
+                wait_for_gpu(&state.device, &state.context)?;
+            }
+        }
+        self.current_video = None;
+        Ok(())
+    }
+
+    fn publish_flutter_texture(&mut self) -> Result<()> {
+        let surface = self.surface.as_mut().expect("surface ensured");
+        if !surface.flutter_texture {
+            return Ok(());
+        }
+        let state = self.state.as_ref().expect("device ensured");
+        let source = surface.output_texture.as_ref().expect("texture ensured");
+        let extent = surface.metrics.physical_extent;
+        let (snapshot, _) =
+            create_flutter_texture_target(&state.device, extent.width, extent.height)?;
+        unsafe {
+            state.context.CopyResource(&snapshot, source);
+        }
+        // Flush only submits work. Complete the copy before another D3D device
+        // opens this immutable snapshot. The extra GPU copy is texture-only.
+        wait_for_gpu(&state.device, &state.context)?;
+        surface.published_texture = Some(snapshot);
+        Ok(())
     }
 
     fn ensure_default_device(&mut self) -> Result<()> {
@@ -801,7 +951,7 @@ impl D3d11Renderer {
         }
         let context = unsafe { frame_device.GetImmediateContext() }
             .map_err(|error| d3d_error("ID3D11Device::GetImmediateContext", error))?;
-        self.current_video = None;
+        self.retire_current_video()?;
         self.danmaku_atlas_cache = None;
         self.set_device(frame_device, context)
     }
@@ -827,6 +977,16 @@ impl D3d11Renderer {
         {
             report_upscaler_failure("pipeline_build", self.upscaler_mode, &error);
         }
+        // The existing swap chain belongs to the previous device; ResizeBuffers
+        // cannot migrate it. Drop it so recreate_surface_targets creates a new
+        // one — COM identity changes, which the host must rebind.
+        if let Some(old) = self.state.as_ref() {
+            if let Some(surface) = self.surface.as_mut() {
+                release_backbuffer_views(&old.context, surface);
+                surface.swapchain = None;
+                surface.output_texture = None;
+            }
+        }
         self.state = Some(state);
         self.recreate_surface_targets()?;
         Ok(())
@@ -839,47 +999,79 @@ impl D3d11Renderer {
         let Some(state) = self.state.as_ref() else {
             return Ok(());
         };
-        trace("recreate_surface_targets: reset");
-        surface.render_target = None;
-        surface.linear_render_target = None;
-        surface.linear_shader_resource = None;
-        // 摘掉旧 swapchain 再释放（见 panel_clear_swap_chain 注释）：resize/换源/
-        // HDR 切换都会走到这里重建 swapchain，不先摘除就 drop 会与在飞的异步
-        // present 竞态 → use-after-free。clear 失败也继续释放——最坏情况是 panel
-        // 已失效（无人在消费旧 swapchain），直接释放反而安全。
-        if let (Some(panel), true) = (surface.panel, surface.swapchain.is_some()) {
-            let _ = panel_clear_swap_chain(panel);
-        }
-        surface.swapchain = None;
+        trace("recreate_surface_targets: reset views");
+        release_backbuffer_views(&state.context, surface);
         let output_mode = surface.output_mode;
-        trace("recreate_surface_targets: create_swapchain");
-        surface.swapchain = Some(create_swapchain(
-            &state.device,
-            surface.hwnd,
-            surface.panel,
-            surface.metrics.physical_extent.width,
-            surface.metrics.physical_extent.height,
-            output_mode.swapchain_format(),
-        )?);
-        configure_swapchain_color_space(
-            surface.swapchain.as_ref().expect("swapchain just created"),
-            output_mode,
-        )?;
+        let width = surface.metrics.physical_extent.width.max(1);
+        let height = surface.metrics.physical_extent.height.max(1);
+        let format = output_mode.swapchain_format();
+        let hwnd = surface.hwnd;
+        let panel = surface.panel;
+        let composition = surface.composition;
+
+        if surface.flutter_texture {
+            surface.swapchain = None;
+            let (texture, render_target) =
+                create_flutter_texture_target(&state.device, width, height)?;
+            surface.output_texture = Some(texture);
+            surface.render_target = Some(render_target);
+            surface.output_mode = D3d11OutputMode::Sdr;
+            self.stats.surface_width = surface.metrics.physical_extent.width;
+            self.stats.surface_height = surface.metrics.physical_extent.height;
+            self.stats.hdr10_output_active = false;
+            return Ok(());
+        }
+        surface.output_texture = None;
+
+        // Size and SDR↔HDR format changes keep the same IDXGISwapChain1 so a
+        // DirectComposition visual's SetContent stays valid. Device changes
+        // drop the chain in set_device before reaching here.
+        let reused = if let Some(swapchain) = surface.swapchain.as_ref() {
+            trace("recreate_surface_targets: ResizeBuffers");
+            unsafe {
+                swapchain
+                    .ResizeBuffers(0, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .is_ok()
+            }
+        } else {
+            false
+        };
+        if !reused {
+            if surface.swapchain.is_some() {
+                trace("recreate_surface_targets: ResizeBuffers failed, creating new swapchain");
+            } else {
+                trace("recreate_surface_targets: create_swapchain");
+            }
+            // 摘掉旧 swapchain 再释放（见 panel_clear_swap_chain 注释）：换源/
+            // HDR 切换/ResizeBuffers 失败重建都会走到这里，不先摘除就 drop 会与
+            // 在飞的异步 present 竞态 → use-after-free。clear 失败也继续释放——
+            // 最坏情况是 panel 已失效（无人在消费旧 swapchain），直接释放反而安全。
+            if let (Some(panel), true) = (panel, surface.swapchain.is_some()) {
+                let _ = panel_clear_swap_chain(panel);
+            }
+            surface.swapchain = None;
+            surface.swapchain = Some(create_swapchain(
+                &state.device,
+                hwnd,
+                panel,
+                width,
+                height,
+                format,
+                composition,
+                composition && self.video_alpha_mode.has_alpha(),
+            )?);
+        }
+        let swapchain = surface.swapchain.as_ref().expect("swapchain ensured");
+        configure_swapchain_color_space(swapchain, output_mode)?;
         if matches!(output_mode, D3d11OutputMode::Sdr) {
-            let _ = clear_hdr_metadata(surface.swapchain.as_ref().expect("swapchain just created"));
+            let _ = clear_hdr_metadata(swapchain);
         }
         trace("recreate_surface_targets: create_render_target");
-        surface.render_target = Some(create_render_target(
-            &state.device,
-            surface.swapchain.as_ref().expect("swapchain just created"),
-        )?);
+        surface.render_target = Some(create_render_target(&state.device, swapchain)?);
         if matches!(output_mode, D3d11OutputMode::Hdr10) {
             trace("recreate_surface_targets: create_linear_render_target");
-            let (render_target, shader_resource) = create_linear_render_target(
-                &state.device,
-                surface.metrics.physical_extent.width,
-                surface.metrics.physical_extent.height,
-            )?;
+            let (render_target, shader_resource) =
+                create_linear_render_target(&state.device, width, height)?;
             surface.linear_render_target = Some(render_target);
             surface.linear_shader_resource = Some(shader_resource);
         }
@@ -897,17 +1089,30 @@ impl D3d11Renderer {
         Ok(())
     }
 
+    fn composition_swapchain(&self) -> Option<&IDXGISwapChain1> {
+        let surface = self.surface.as_ref()?;
+        if !surface.composition {
+            return None;
+        }
+        surface.swapchain.as_ref()
+    }
+
     fn set_output_mode(&mut self, output_mode: D3d11OutputMode) -> Result<()> {
         let Some(surface) = self.surface.as_mut() else {
             self.stats.hdr10_output_active = false;
             return Ok(());
+        };
+        let output_mode = if surface.flutter_texture {
+            D3d11OutputMode::Sdr
+        } else {
+            output_mode
         };
         if surface.output_mode == output_mode && surface.targets_ready() {
             self.stats.hdr10_output_active = matches!(output_mode, D3d11OutputMode::Hdr10);
             return Ok(());
         }
         surface.output_mode = output_mode;
-        self.current_video = None;
+        self.retire_current_video()?;
         self.recreate_surface_targets()
     }
 
@@ -918,6 +1123,22 @@ impl D3d11Renderer {
         let source_is_hdr = source.is_hdr();
         if source_is_hdr {
             self.stats.hdr_source_frames += 1;
+        }
+        // DirectComposition transparency is defined on the SDR premultiplied
+        // swap-chain path. Packed-alpha assets are effects/UI content rather
+        // than an HDR presentation plane, so keep their color and alpha in one
+        // stable BGRA8 composition space.
+        if self.video_alpha_mode.has_alpha()
+            || self
+                .surface
+                .as_ref()
+                .is_some_and(|surface| surface.flutter_texture)
+        {
+            self.set_output_mode(D3d11OutputMode::Sdr)?;
+            if source_is_hdr {
+                self.stats.sdr_tonemap_frames += 1;
+            }
+            return Ok(D3d11OutputMode::Sdr);
         }
         if matches!(source.transfer, TransferFunction::Pq)
             && self.try_enable_hdr10_output(source)?
@@ -1024,7 +1245,7 @@ impl D3d11Renderer {
         self.stats.hardware_video_frames += 1;
         self.stats.zero_copy_video_frames += 1;
         self.stats.direct_zero_copy_video_frames += 1;
-        self.current_video = Some(ImportedVideoFrame {
+        let imported = ImportedVideoFrame {
             _frame: retained_frame,
             _texture: texture,
             luma,
@@ -1039,8 +1260,11 @@ impl D3d11Renderer {
             ),
             _array_index: array_index,
             frame_token,
-            constants: constants_for_frame(source_color, texture_format, target_color),
-        });
+            constants: constants_for_frame(source_color, texture_format, target_color)
+                .packed_alpha_right(self.video_alpha_mode.has_alpha()),
+        };
+        self.retire_current_video()?;
+        self.current_video = Some(imported);
         Ok(())
     }
 
@@ -1417,6 +1641,25 @@ impl D3d11Renderer {
         }
         self.ensure_default_device()?;
         self.ensure_surface_ready()?;
+        let flutter_texture = self
+            .surface
+            .as_ref()
+            .expect("surface ensured")
+            .flutter_texture;
+        let frame_token = self
+            .current_video
+            .as_ref()
+            .expect("video checked")
+            .frame_token;
+        if flutter_texture
+            && self.surface.as_ref().unwrap().published_texture.is_some()
+            && self
+                .flutter_scene
+                .as_ref()
+                .is_some_and(|scene| scene.matches(frame_token, self.upscaler_mode, context))
+        {
+            return Ok(true);
+        }
         let overlay_draws = self.prepare_overlay_draws(context.overlay)?;
         let danmaku_draws = self.prepare_danmaku_draws(context.danmaku)?;
         let (video_width, video_height, frame_token, native_luma) = {
@@ -1434,8 +1677,13 @@ impl D3d11Renderer {
             .expect("surface ensured")
             .metrics
             .physical_extent;
-        let target_rect =
-            aspect_fit_rect(video_width, video_height, physical.width, physical.height);
+        let logical_video_width = self.video_alpha_mode.logical_width(video_width);
+        let target_rect = aspect_fit_rect(
+            logical_video_width,
+            video_height,
+            physical.width,
+            physical.height,
+        );
         // 尺寸诊断（变化节流）：对比「视频画面实际占用」与「播放区域
         // （backbuffer）」。fill≈1.0 表示占满；<1.0 表示画面缩小（等比例
         // 缩小 → 从左上角出现 L 型空白）。配合 surface rebuilt 打点定位触发源。
@@ -1462,7 +1710,7 @@ impl D3d11Renderer {
                 0.0
             };
             eprintln!(
-                "[size-diag] video={video_width}x{video_height} backbuffer={}x{} target_rect=({:.0},{:.0} {:.0}x{:.0}) fill={fill_w:.3}x{fill_h:.3}",
+                "[size-diag] video={video_width}x{video_height} logical_w={logical_video_width} backbuffer={}x{} target_rect=({:.0},{:.0} {:.0}x{:.0}) fill={fill_w:.3}x{fill_h:.3}",
                 physical.width,
                 physical.height,
                 target_rect.x,
@@ -1471,7 +1719,8 @@ impl D3d11Renderer {
                 target_rect.height,
             );
         }
-        let upscale_requested = self.upscaler_mode.is_enabled()
+        let upscale_requested = !self.video_alpha_mode.has_alpha()
+            && self.upscaler_mode.is_enabled()
             && self.upscaler.status() == LumaUpscalerBackendStatus::Scalar
             && target_rect.width > video_width as f32;
         let upscaled_luma = if upscale_requested {
@@ -1517,14 +1766,20 @@ impl D3d11Renderer {
             None
         };
         let scene_rtv = linear_target.map_or(rtv, |(linear_rtv, _)| linear_rtv);
-        let swapchain = surface
-            .swapchain
-            .as_ref()
-            .ok_or_else(|| PlayerError::Renderer("d3d11: no swapchain attached".to_string()))?;
         unsafe {
-            state
-                .context
-                .ClearRenderTargetView(scene_rtv, &[0.0, 0.0, 0.0, 1.0]);
+            state.context.ClearRenderTargetView(
+                scene_rtv,
+                &[
+                    0.0,
+                    0.0,
+                    0.0,
+                    if self.video_alpha_mode.has_alpha() {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                ],
+            );
         }
         state.draw_video(video, upscaled_luma.as_ref(), scene_rtv, target_rect)?;
         if !overlay_draws.is_empty() {
@@ -1554,7 +1809,21 @@ impl D3d11Renderer {
                 video.constants,
             )?;
         }
-        present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
+        if let Some(swapchain) = surface.swapchain.as_ref() {
+            present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
+        }
+        if flutter_texture {
+            self.publish_flutter_texture()?;
+            if let Some(scene) = self.flutter_scene.as_mut() {
+                scene.update(frame_token, self.upscaler_mode, context);
+            } else {
+                self.flutter_scene = Some(FlutterTextureScene::new(
+                    frame_token,
+                    self.upscaler_mode,
+                    context,
+                ));
+            }
+        }
         self.stats.rendered_frames += 1;
         if !danmaku_draws.is_empty() {
             self.stats.danmaku_passes += 1;
@@ -1566,7 +1835,7 @@ impl D3d11Renderer {
     fn ensure_surface_ready(&mut self) -> Result<()> {
         if self.surface.is_none() {
             return Err(PlayerError::Renderer(
-                "d3d11: no HWND surface attached".to_string(),
+                "d3d11: no output surface attached".to_string(),
             ));
         }
         if self
@@ -1584,6 +1853,14 @@ impl D3d11Renderer {
         self.ensure_default_device()?;
         trace("render_clear: ensure_surface_ready");
         self.ensure_surface_ready()?;
+        if self
+            .surface
+            .as_ref()
+            .is_some_and(|surface| surface.flutter_texture && surface.published_texture.is_some())
+            && self.flutter_scene.is_none()
+        {
+            return Ok(());
+        }
         let state = self.state.as_ref().expect("device ensured");
         let surface = self.surface.as_ref().expect("surface ensured");
         let rtv = surface
@@ -1591,16 +1868,26 @@ impl D3d11Renderer {
             .as_ref()
             .ok_or_else(|| PlayerError::Renderer("d3d11: no render target attached".to_string()))?;
         let _ = time_seconds;
-        let color = [0.0, 0.0, 0.0, 1.0];
+        let color = [
+            0.0,
+            0.0,
+            0.0,
+            if self.video_alpha_mode.has_alpha() {
+                0.0
+            } else {
+                1.0
+            },
+        ];
         unsafe {
             trace("render_clear: clear");
             state.context.ClearRenderTargetView(rtv, &color);
             trace("render_clear: present");
-            present_swapchain(
-                surface.swapchain.as_ref().expect("swapchain ensured"),
-                "IDXGISwapChain1::Present1(clear)",
-            )?;
+            if let Some(swapchain) = surface.swapchain.as_ref() {
+                present_swapchain(swapchain, "IDXGISwapChain1::Present1(clear)")?;
+            }
         }
+        self.publish_flutter_texture()?;
+        self.flutter_scene = None;
         trace("render_clear: done");
         self.stats.rendered_frames += 1;
         Ok(())
@@ -1609,32 +1896,66 @@ impl D3d11Renderer {
 
 impl RendererBackend for D3d11Renderer {
     fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()> {
-        let PlatformSurface::Wgpu(handle) = surface else {
-            return Err(PlayerError::Renderer(
-                "d3d11: only Windows HWND or SwapChainPanel surfaces are supported".to_string(),
-            ));
-        };
-        if handle.raw_window == 0 {
-            return Err(PlayerError::Renderer(
-                "d3d11: Windows surface handle is null".to_string(),
-            ));
-        }
-        let panel = match handle.kind {
-            WgpuSurfaceKind::WindowsHwnd => None,
-            WgpuSurfaceKind::WindowsSwapChainPanel => Some(handle.raw_window as *mut c_void),
-            _ => {
+        let (hwnd, panel, composition, flutter_texture, metrics) = match surface {
+            PlatformSurface::Wgpu(handle) => {
+                let panel = match handle.kind {
+                    WgpuSurfaceKind::WindowsHwnd => None,
+                    WgpuSurfaceKind::WindowsSwapChainPanel => {
+                        if handle.raw_window == 0 {
+                            return Err(PlayerError::Renderer(
+                                "d3d11: WinUI SwapChainPanel pointer is null".to_string(),
+                            ));
+                        }
+                        Some(handle.raw_window as *mut c_void)
+                    }
+                    _ => {
+                        return Err(PlayerError::Renderer(format!(
+                            "d3d11: surface kind {:?} is not supported",
+                            handle.kind
+                        )));
+                    }
+                };
+                let composition = handle.output_capabilities.direct_composition;
+                if panel.is_none() && !composition && handle.raw_window == 0 {
+                    return Err(PlayerError::Renderer(
+                        "d3d11: Windows HWND surface handle is null".to_string(),
+                    ));
+                }
+                (
+                    HWND(handle.raw_window as *mut c_void),
+                    panel,
+                    composition,
+                    false,
+                    handle.metrics,
+                )
+            }
+            PlatformSurface::FlutterTexture(handle)
+                if handle.kind == FlutterTextureKind::WindowsTextureRegistrar =>
+            {
+                (HWND::default(), None, false, true, handle.metrics)
+            }
+            PlatformSurface::FlutterTexture(handle) => {
                 return Err(PlayerError::Renderer(format!(
-                    "d3d11: surface kind {:?} is not supported",
+                    "d3d11: Flutter texture kind {:?} is not supported",
                     handle.kind
                 )));
             }
+            PlatformSurface::Metal(_) => {
+                return Err(PlayerError::Renderer(
+                    "d3d11: Metal surfaces are not supported".to_string(),
+                ));
+            }
         };
         self.surface = Some(AttachedSurface {
-            hwnd: HWND(handle.raw_window as *mut c_void),
+            hwnd,
             panel,
-            metrics: handle.metrics,
+            composition,
+            flutter_texture,
+            metrics,
             output_mode: D3d11OutputMode::Sdr,
             swapchain: None,
+            output_texture: None,
+            published_texture: None,
             render_target: None,
             linear_render_target: None,
             linear_shader_resource: None,
@@ -1654,8 +1975,8 @@ impl RendererBackend for D3d11Renderer {
         if let Some(panel) = panel {
             let _ = panel_clear_swap_chain(panel);
         }
+        self.retire_current_video()?;
         self.surface = None;
-        self.current_video = None;
         self.danmaku_atlas_cache = None;
         self.stats.attached = false;
         self.stats.surface_width = 0;
@@ -1666,7 +1987,7 @@ impl RendererBackend for D3d11Renderer {
     fn resize_surface(&mut self, metrics: SurfaceMetrics) -> Result<()> {
         let Some(surface) = self.surface.as_mut() else {
             return Err(PlayerError::Renderer(
-                "d3d11: no HWND surface attached".to_string(),
+                "d3d11: no output surface attached".to_string(),
             ));
         };
         if surface.metrics.physical_extent == metrics.physical_extent {
@@ -1675,7 +1996,12 @@ impl RendererBackend for D3d11Renderer {
         }
         surface.metrics = metrics;
         self.hdr10_output_unavailable = false;
-        self.recreate_surface_targets()
+        let flutter_texture = surface.flutter_texture;
+        self.recreate_surface_targets()?;
+        if flutter_texture && self.current_video.is_none() {
+            self.render_clear(0.0)?;
+        }
+        Ok(())
     }
 
     fn render_test_frame(&mut self, time_seconds: f64) -> Result<()> {
@@ -1701,7 +2027,7 @@ impl RendererBackend for D3d11Renderer {
     }
 
     fn clear_current_frame(&mut self) -> Result<()> {
-        self.current_video = None;
+        self.retire_current_video()?;
         self.danmaku_atlas_cache = None;
         if self.surface.is_some() {
             self.render_clear(0.0)?;
@@ -1834,6 +2160,24 @@ impl RendererBackend for D3d11Renderer {
                 report_upscaler_failure("mode_switch", mode, &error);
             }
         }
+    }
+
+    fn composition_swapchain_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        Some(Interface::as_raw(self.composition_swapchain()?))
+    }
+
+    fn composition_swapchain_iunknown(&self) -> Option<*mut std::ffi::c_void> {
+        let unknown: IUnknown = self.composition_swapchain()?.cast().ok()?;
+        Some(unknown.into_raw())
+    }
+
+    fn windows_flutter_texture_iunknown(&self) -> Option<*mut std::ffi::c_void> {
+        let surface = self.surface.as_ref()?;
+        if !surface.flutter_texture {
+            return None;
+        }
+        let unknown: IUnknown = surface.published_texture.as_ref()?.cast().ok()?;
+        Some(unknown.into_raw())
     }
 }
 
@@ -2303,6 +2647,8 @@ fn create_swapchain(
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    composition: bool,
+    premultiplied_alpha: bool,
 ) -> Result<IDXGISwapChain1> {
     trace("create_swapchain: cast IDXGIDevice");
     let dxgi_device: IDXGIDevice = device
@@ -2328,27 +2674,33 @@ fn create_swapchain(
         BufferCount: 2,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        AlphaMode: if premultiplied_alpha {
+            DXGI_ALPHA_MODE_PREMULTIPLIED
+        } else {
+            DXGI_ALPHA_MODE_IGNORE
+        },
         Flags: 0,
     };
-
-    if let Some(panel) = panel {
-        // WinUI 3 SwapChainPanel 嵌入：composition swap chain，
-        // 要求 FLIP_SEQUENTIAL + PREMULTIPLIED alpha。
+    // WinUI 3 SwapChainPanel 必须是 composition swap chain，且要求
+    // FLIP_SEQUENTIAL + PREMULTIPLIED alpha；DirectComposition（透明视频）走
+    // composition 分支，alpha 模式由 premultiplied_alpha 决定。
+    if panel.is_some() {
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    }
+    let swapchain = if composition || panel.is_some() {
         trace("create_swapchain: CreateSwapChainForComposition");
-        let swapchain = unsafe { factory.CreateSwapChainForComposition(device, &desc, None) }
-            .map_err(|error| d3d_error("IDXGIFactory2::CreateSwapChainForComposition", error))?;
+        unsafe { factory.CreateSwapChainForComposition(device, &desc, None) }
+            .map_err(|error| d3d_error("IDXGIFactory2::CreateSwapChainForComposition", error))?
+    } else {
+        trace("create_swapchain: CreateSwapChainForHwnd");
+        unsafe { factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }
+            .map_err(|error| d3d_error("IDXGIFactory2::CreateSwapChainForHwnd", error))?
+    };
+    if let Some(panel) = panel {
         trace("create_swapchain: ISwapChainPanelNative::SetSwapChain");
         panel_set_swap_chain(panel, &swapchain)?;
-        trace("create_swapchain: done");
-        return Ok(swapchain);
     }
-
-    trace("create_swapchain: CreateSwapChainForHwnd");
-    let swapchain = unsafe { factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }
-        .map_err(|error| d3d_error("IDXGIFactory2::CreateSwapChainForHwnd", error))?;
     trace("create_swapchain: done");
     Ok(swapchain)
 }
@@ -2397,6 +2749,115 @@ fn clear_hdr_metadata(swapchain: &IDXGISwapChain1) -> Result<()> {
         .map_err(|error| d3d_error("IDXGISwapChain1::cast<IDXGISwapChain4>", error))?;
     unsafe { swapchain4.SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, None) }
         .map_err(|error| d3d_error("IDXGISwapChain4::SetHDRMetaData(None)", error))
+}
+
+fn release_backbuffer_views(context: &ID3D11DeviceContext, surface: &mut AttachedSurface) {
+    // ResizeBuffers / creating a new chain requires every RTV and SRV of the
+    // current back buffer to be gone, including those bound on the immediate
+    // context.
+    unsafe {
+        context.OMSetRenderTargets(None, None);
+        context.PSSetShaderResources(0, Some(&[None, None]));
+    }
+    surface.render_target = None;
+    surface.output_texture = None;
+    surface.published_texture = None;
+    surface.linear_render_target = None;
+    surface.linear_shader_resource = None;
+}
+
+fn create_d3d11_event_query(device: &ID3D11Device) -> Result<ID3D11Query> {
+    let desc = D3D11_QUERY_DESC {
+        Query: D3D11_QUERY_EVENT,
+        MiscFlags: 0,
+    };
+    let mut query = None;
+    unsafe {
+        device
+            .CreateQuery(&desc, Some(&mut query))
+            .map_err(|error| d3d_error("ID3D11Device::CreateQuery(video retirement)", error))?;
+    }
+    query.ok_or_else(|| PlayerError::Renderer("d3d11: video retirement query was null".to_string()))
+}
+
+fn d3d11_event_query_complete(context: &ID3D11DeviceContext, query: &ID3D11Query) -> Result<bool> {
+    let mut complete = BOOL::default();
+    unsafe {
+        context
+            .GetData(
+                query,
+                Some((&mut complete as *mut BOOL).cast::<c_void>()),
+                mem::size_of::<BOOL>() as u32,
+                D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+            )
+            .map_err(|error| d3d_error("ID3D11DeviceContext::GetData(video retirement)", error))?;
+    }
+    Ok(complete.as_bool())
+}
+
+fn wait_for_gpu(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<()> {
+    let query = create_d3d11_event_query(device)?;
+    unsafe {
+        context.End(&query);
+        context.Flush();
+    }
+    let started = Instant::now();
+    while !d3d11_event_query_complete(context, &query)? {
+        if started.elapsed() >= Duration::from_millis(100) {
+            return Err(PlayerError::Renderer(
+                "d3d11: compositor GPU handoff timed out; retaining the current decoder frame"
+                    .into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+fn create_flutter_texture_target(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(ID3D11Texture2D, ID3D11RenderTargetView)> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width.max(1),
+        Height: height.max(1),
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: SDR_SWAPCHAIN_FORMAT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32 | D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+    };
+    let mut texture = None;
+    unsafe {
+        device
+            .CreateTexture2D(&desc, None, Some(&mut texture))
+            .map_err(|error| d3d_error("ID3D11Device::CreateTexture2D(Flutter)", error))?;
+    }
+    let texture = texture.ok_or_else(|| {
+        PlayerError::Renderer("d3d11: Flutter output texture was null".to_string())
+    })?;
+    let resource: ID3D11Resource = texture
+        .cast()
+        .map_err(|error| d3d_error("ID3D11Texture2D::cast<ID3D11Resource>(Flutter)", error))?;
+    let mut render_target = None;
+    unsafe {
+        device
+            .CreateRenderTargetView(&resource, None, Some(&mut render_target))
+            .map_err(|error| d3d_error("ID3D11Device::CreateRenderTargetView(Flutter)", error))?;
+    }
+    Ok((
+        texture,
+        render_target.ok_or_else(|| {
+            PlayerError::Renderer("d3d11: Flutter render target view was null".to_string())
+        })?,
+    ))
 }
 
 fn create_render_target(
@@ -3074,6 +3535,359 @@ fn d3d_error(operation: &'static str, error: ::windows::core::Error) -> PlayerEr
 mod tests {
     use super::*;
 
+    #[test]
+    fn flutter_scene_ignores_clock_ticks_but_detects_output_changes() {
+        use crate::overlay::OverlayViewport;
+        use crate::subtitle::SubtitleBitmapPlane;
+        let mut overlay = OverlayFrame {
+            pts: Duration::ZERO,
+            viewport: OverlayViewport::new(8, 8),
+            subtitle_planes: vec![SubtitleBitmapPlane::new(0, 0, 1, 1, vec![255; 4])],
+            subtitle_alpha_planes: vec![],
+            subtitle_changed: true,
+        };
+        let scene = FlutterTextureScene::new(
+            7,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay)),
+        );
+        overlay.pts = Duration::from_secs(2);
+        overlay.subtitle_changed = false;
+        let context = RenderFrameContext::new(Duration::from_secs(2), 1).overlay(Some(&overlay));
+        assert!(scene.matches(7, LumaUpscalerMode::Off, context));
+        assert!(!scene.matches(8, LumaUpscalerMode::Off, context));
+        assert!(!scene.matches(7, LumaUpscalerMode::ArtCnnC4F16, context));
+        assert!(!scene.matches(
+            7,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 2).overlay(Some(&overlay))
+        ));
+        overlay.subtitle_planes[0].rgba[0] = 0; // Includes HUD pixel changes.
+        assert!(!scene.matches(
+            7,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay))
+        ));
+        assert!(!scene.matches(
+            7,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 1)
+        ));
+    }
+
+    #[test]
+    fn flutter_scene_reuses_unchanged_cpu_buffers_across_video_frames() {
+        use crate::danmaku::DanmakuViewport;
+        use crate::overlay::OverlayViewport;
+        use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
+        let mut overlay = OverlayFrame {
+            pts: Duration::ZERO,
+            viewport: OverlayViewport::new(128, 64),
+            subtitle_planes: vec![SubtitleBitmapPlane::new(
+                0,
+                0,
+                128,
+                64,
+                vec![255; 128 * 64 * 4],
+            )],
+            subtitle_alpha_planes: vec![SubtitleAlphaBitmap::new(
+                SubtitleBitmapPlacement::new(0, 0, 128, 64),
+                128,
+                0xffffffff,
+                vec![255; 128 * 64],
+            )],
+            subtitle_changed: true,
+        };
+        let mut plan = DanmakuRenderPlan::empty(Duration::ZERO, 1, DanmakuViewport::new(128, 64));
+        plan.items.push(DanmakuGlyphInstance {
+            item_id: 1,
+            rect: [0.0, 0.0, 1.0, 1.0],
+            tex_rect: [0.0, 0.0, 1.0, 1.0],
+            color_rgba: [1.0; 4],
+            outline_rgba: [0.0; 4],
+            shadow_rgba: [0.0; 4],
+            shadow_offset: [0.0; 2],
+        });
+        let mut scene = FlutterTextureScene::new(
+            1,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 1)
+                .overlay(Some(&overlay))
+                .danmaku(Some(&plan)),
+        );
+        let rgba = scene.overlay.as_ref().unwrap().subtitle_planes[0]
+            .rgba
+            .as_ptr();
+        let alpha = scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0]
+            .alpha
+            .as_ptr();
+        let items = scene.danmaku.as_ref().unwrap().items.as_ptr();
+        for token in 2..=121 {
+            overlay.pts = Duration::from_millis(token * 10);
+            overlay.subtitle_changed = false;
+            plan.media_time = overlay.pts;
+            let context = RenderFrameContext::new(overlay.pts, 1)
+                .overlay(Some(&overlay))
+                .danmaku(Some(&plan));
+            assert!(!scene.matches(token, LumaUpscalerMode::Off, context));
+            scene.update(token, LumaUpscalerMode::Off, context);
+            assert!(scene.matches(token, LumaUpscalerMode::Off, context));
+            assert_eq!(
+                scene.overlay.as_ref().unwrap().subtitle_planes[0]
+                    .rgba
+                    .as_ptr(),
+                rgba
+            );
+            assert_eq!(
+                scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0]
+                    .alpha
+                    .as_ptr(),
+                alpha
+            );
+            assert_eq!(scene.danmaku.as_ref().unwrap().items.as_ptr(), items);
+        }
+
+        // A real subtitle/HUD change still replaces the cached pixels even
+        // when the video frame is paused and subtitle_changed is false.
+        overlay.subtitle_planes[0].rgba[0] = 17;
+        overlay.subtitle_alpha_planes[0].alpha[0] = 23;
+        let context = RenderFrameContext::new(overlay.pts, 1)
+            .overlay(Some(&overlay))
+            .danmaku(Some(&plan));
+        assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
+        scene.update(121, LumaUpscalerMode::Off, context);
+        assert!(scene.matches(121, LumaUpscalerMode::Off, context));
+        assert_eq!(
+            scene.overlay.as_ref().unwrap().subtitle_planes[0].rgba[0],
+            17
+        );
+        assert_eq!(
+            scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0].alpha[0],
+            23
+        );
+        assert_eq!(scene.danmaku.as_ref().unwrap().items.as_ptr(), items);
+
+        let rgba = scene.overlay.as_ref().unwrap().subtitle_planes[0]
+            .rgba
+            .as_ptr();
+        plan.items[0].rect[0] = 2.0;
+        let context = RenderFrameContext::new(overlay.pts, 1)
+            .overlay(Some(&overlay))
+            .danmaku(Some(&plan));
+        assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
+        scene.update(121, LumaUpscalerMode::Off, context);
+        assert!(scene.matches(121, LumaUpscalerMode::Off, context));
+        assert_eq!(
+            scene.overlay.as_ref().unwrap().subtitle_planes[0]
+                .rgba
+                .as_ptr(),
+            rgba
+        );
+        assert_eq!(scene.danmaku.as_ref().unwrap().items[0].rect[0], 2.0);
+
+        scene.update(
+            121,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 2),
+        );
+        assert!(scene.overlay.is_none() && scene.danmaku.is_none());
+        assert!(scene.matches(
+            121,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 2)
+        ));
+    }
+
+    #[test]
+    fn flutter_publication_is_sdr_immutable_and_stable_while_idle() {
+        use crate::core::FlutterTextureHandle;
+        let mut renderer = D3d11Renderer::new().unwrap();
+        // WARP keeps this GPU/API contract test runnable on headless CI too.
+        let mut device = None;
+        let mut device_context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut device_context),
+            )
+            .unwrap();
+        }
+        renderer
+            .set_device(device.unwrap(), device_context.unwrap())
+            .unwrap();
+        renderer
+            .attach_surface(PlatformSurface::FlutterTexture(FlutterTextureHandle::new(
+                FlutterTextureKind::WindowsTextureRegistrar,
+                1,
+                4,
+                4,
+                1.0,
+            )))
+            .unwrap();
+        let first = renderer
+            .surface
+            .as_ref()
+            .unwrap()
+            .published_texture
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            first.GetDesc(&mut desc);
+        }
+        assert_eq!(desc.Format, SDR_SWAPCHAIN_FORMAT);
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+        assert!(matches!(
+            renderer.select_output_mode_for_source(source).unwrap(),
+            D3d11OutputMode::Sdr
+        ));
+        assert_eq!(renderer.stats.hdr10_metadata_failures, 0);
+        renderer.render_clear(1.0).unwrap();
+        assert_eq!(
+            first.as_raw(),
+            renderer
+                .surface
+                .as_ref()
+                .unwrap()
+                .published_texture
+                .as_ref()
+                .unwrap()
+                .as_raw()
+        );
+
+        let state = renderer.state.as_ref().unwrap();
+        unsafe {
+            state.context.ClearRenderTargetView(
+                renderer
+                    .surface
+                    .as_ref()
+                    .unwrap()
+                    .render_target
+                    .as_ref()
+                    .unwrap(),
+                &[1.0, 0.0, 0.0, 1.0],
+            );
+        }
+        renderer.publish_flutter_texture().unwrap();
+        let next = renderer
+            .surface
+            .as_ref()
+            .unwrap()
+            .published_texture
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_ne!(first.as_raw(), next.as_raw());
+        assert_eq!(
+            read_bgra_pixel(renderer.state.as_ref().unwrap(), &first),
+            [0, 0, 0, 255]
+        );
+        assert_eq!(
+            read_bgra_pixel(renderer.state.as_ref().unwrap(), &next),
+            [0, 0, 255, 255]
+        );
+        renderer
+            .resize_surface(SurfaceMetrics::new(8, 6, 1.0))
+            .unwrap();
+        unsafe {
+            first.GetDesc(&mut desc);
+        }
+        assert_eq!((desc.Width, desc.Height), (4, 4));
+        let mut resized = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            renderer
+                .surface
+                .as_ref()
+                .unwrap()
+                .published_texture
+                .as_ref()
+                .unwrap()
+                .GetDesc(&mut resized);
+        }
+        assert_eq!((resized.Width, resized.Height), (8, 6));
+    }
+
+    fn read_bgra_pixel(state: &D3d11DeviceState, texture: &ID3D11Texture2D) -> [u8; 4] {
+        use ::windows::Win32::Graphics::Direct3D11::{
+            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING,
+        };
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            texture.GetDesc(&mut desc);
+        }
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.MiscFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging = None;
+        unsafe {
+            state
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .unwrap();
+        }
+        let staging = staging.unwrap();
+        unsafe {
+            state.context.CopyResource(&staging, texture);
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            state
+                .context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .unwrap();
+            let bytes = *(mapped.pData as *const [u8; 4]);
+            state.context.Unmap(&staging, 0);
+            bytes
+        }
+    }
+
+    #[test]
+    fn flutter_scene_detects_danmaku_motion_and_visibility_changes() {
+        use crate::danmaku::DanmakuViewport;
+        let mut plan = DanmakuRenderPlan::empty(Duration::ZERO, 1, DanmakuViewport::new(8, 8));
+        plan.items.push(DanmakuGlyphInstance {
+            item_id: 1,
+            rect: [0.0, 0.0, 1.0, 1.0],
+            tex_rect: [0.0, 0.0, 1.0, 1.0],
+            color_rgba: [1.0; 4],
+            outline_rgba: [0.0; 4],
+            shadow_rgba: [0.0; 4],
+            shadow_offset: [0.0; 2],
+        });
+        let scene = FlutterTextureScene::new(
+            1,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan)),
+        );
+        plan.media_time = Duration::from_secs(1);
+        assert!(scene.matches(
+            1,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
+        ));
+        plan.items[0].rect[0] = 2.0;
+        assert!(!scene.matches(
+            1,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
+        ));
+        plan.items.clear();
+        assert!(!scene.matches(
+            1,
+            LumaUpscalerMode::Off,
+            RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
+        ));
+    }
+
     fn assert_close(actual: f32, expected: f32) {
         assert!(
             (actual - expected).abs() < 0.0001,
@@ -3121,6 +3935,7 @@ mod tests {
         let renderer = D3d11Renderer::with_config(MetalRendererConfig {
             output_mode: crate::renderer::metal::MetalOutputMode::Sdr,
             luma_upscaler: LumaUpscalerMode::ArtCnnC4F16,
+            video_alpha_mode: VideoAlphaMode::Opaque,
         })
         .unwrap();
 

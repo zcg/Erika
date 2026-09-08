@@ -18,6 +18,13 @@ export interface ErikaPlayerConfig {
   outputMode?: number;
   edrHeadroom?: number;
   upscaler?: number;
+  /** 0 = opaque (default), 1 = packed alpha in the right half of the frame. */
+  videoAlphaMode?: number;
+}
+
+export interface ErikaOpenOptions {
+  httpHeaders?: ESObject;
+  httpReadAheadBytes?: number;
 }
 
 /**
@@ -34,7 +41,8 @@ export class ErikaPlayer {
     const outputMode: number = config.outputMode ?? 0;
     const edrHeadroom: number = config.edrHeadroom ?? 1.0;
     const upscaler: number = config.upscaler ?? 0;
-    this.nativeId = erikaNative.nativeCreate(outputMode, edrHeadroom, upscaler) as number;
+    const videoAlphaMode: number = config.videoAlphaMode ?? 0;
+    this.nativeId = erikaNative.nativeCreate(outputMode, edrHeadroom, upscaler, videoAlphaMode) as number;
     if (this.nativeId <= 0) {
       throw new Error('Erika player creation failed: ' + (erikaNative.nativeLastError() as string));
     }
@@ -44,8 +52,16 @@ export class ErikaPlayer {
     return this.nativeId;
   }
 
-  open(uri: string): ESObject | null {
-    return this.invokeOrThrow('open', { uri: uri });
+  open(uri: string, options: ErikaOpenOptions = {}): ESObject | null {
+    const readAhead: number = options.httpReadAheadBytes ?? 0;
+    if (!Number.isSafeInteger(readAhead) || readAhead < 0) {
+      throw new Error('httpReadAheadBytes must be a non-negative safe integer');
+    }
+    return this.invokeOrThrow('open', {
+      uri: uri,
+      httpHeaders: options.httpHeaders,
+      httpReadAheadBytes: readAhead > 0 ? readAhead : undefined,
+    });
   }
 
   play(): ESObject | null {

@@ -59,6 +59,40 @@ sibling `NSView`/`CAMetalLayer`.
 Touch events pass through both native video strategies, so Flutter controls can
 remain above or around the video surface.
 
+### ErikaTextureVideoView (Flutter Texture)
+
+`ErikaTextureVideoView` renders through Flutter's texture registrar instead of a
+platform view. On macOS the plugin allocates an IOSurface-backed
+`CVPixelBuffer` pool, renders into its Metal texture directly (no per-frame CPU
+readback), and publishes frames to Flutter, so regular Flutter effects —
+`Opacity`, clipping, transforms, and color filters — apply to the video. On
+OpenHarmony it reuses the registered external texture. On Windows it offers
+explicit SDR BGRA8 output (see below). On other platforms it
+falls back to `ErikaVideoView`.
+
+When `blendMode` is not `srcOver` on macOS, the widget routes back to the native
+platform view so Core Animation can blend the video against the real backdrop
+(see Transparent Video and Blend Modes below).
+
+Windows `ErikaVideoView` keeps the native HWND/swapchain path and HDR10
+negotiation for ordinary opaque playback. Only explicitly selecting
+`ErikaTextureVideoView` opts into SDR texture composition. `srcOver` supports
+Flutter opacity/clipping/filters; `overlay` uses native Windows Composition;
+other Windows blend modes are rejected.
+
+Each changed texture frame is copied on the GPU into a completed, immutable
+shared snapshot, without CPU pixel readback. Paused output is reused until the
+video, subtitles, danmaku, HUD, seek generation or surface size changes. The
+plugin holds only the latest and raster-acquired snapshots. Opening a shared
+handle does not signal GPU sampling completion, so published textures are never
+overwritten. These extra copies and GPU handoff barriers do not apply to native
+opaque HWND playback, and the decoder pool retains main's existing size.
+
+The texture API requires a matching v0.1.8 or newer native runtime. The Flutter
+package pins its native version and checksums in `native_artifacts.properties`.
+Missing optional texture symbols in older runtimes do not prevent native player
+creation.
+
 ## Android Surface Strategies
 
 On Android, both video widgets use the same native-view selector. SDR uses a
@@ -95,6 +129,52 @@ events and presenter diagnostics instead of failing playback. The HarmonyOS
 path is validated on device; CI builds the OpenHarmony C ABI but has no
 device-side run verification.
 
+## Transparent Video and Blend Modes
+
+Erika can present alpha-bearing video assets while keeping Flutter layout and
+composition. Transparency is requested per player:
+
+```dart
+final player = ErikaPlayer(
+  videoAlphaMode: ErikaVideoAlphaMode.packedAlphaRight,
+);
+```
+
+`ErikaVideoAlphaMode.packedAlphaRight` expects a side-by-side encoded frame:
+the left half is colour and the right half is a grayscale alpha mask. The GPU
+presentation shaders (Metal, wgpu, D3D11) reconstruct a premultiplied-alpha
+frame, and the video is presented at half the encoded width. Players that do
+not request the mode interpret the frame as fully opaque, so existing content
+is unaffected.
+
+Blending and opacity are requested on the video widgets:
+
+```dart
+ErikaTextureVideoView(
+  player: player,
+  blendMode: BlendMode.overlay,
+  opacity: 0.8,
+)
+```
+
+Platform support differs:
+
+| Platform and path | `blendMode` | `opacity` |
+|-------------------|-------------|-----------|
+| macOS, `ErikaTextureVideoView` (Flutter texture) | `srcOver` only; other modes route to the native layer | Flutter `Opacity` |
+| macOS, native layer (`blendMode != srcOver`) | `overlay` supported; other values ignored | Native `CALayer` opacity |
+| Windows window overlay (DirectComposition) | `srcOver`, `overlay`; other values raise a plugin error | `IDCompositionEffectGroup` opacity |
+| Android / iOS / OpenHarmony | Accepted in creation parameters; not consumed | Flutter-side on texture paths |
+
+Overlay blending is backdrop-aware: the macOS native layer composites against
+the content behind the video inside the window, and the Windows blend effect
+samples the same HWND, so the underlying Flutter or game content stays visible.
+Transparent Windows overlay video uses an SDR BGRA8 premultiplied composition
+swap chain bound to the Flutter HWND; HDR sources are tone-mapped into that
+composition space inside Erika. Opaque Windows overlay video keeps the
+dedicated child-HWND path used previously, and the composition content is
+rebound automatically if the decoder or output device rebuilds the swap chain.
+
 ## iOS Build Path
 
 The iOS plugin links the Erika C ABI static library into the app through a
@@ -110,6 +190,17 @@ phase. Like iOS it downloads the prebuilt archive by default, with
 tvOS 13+, arm64 devices, and arm64/x86_64 simulators. See
 [`packages/erika_flutter/README.md`](../packages/erika_flutter/README.md) for
 nightly, prebuilt-bundle, and source-build options.
+
+## macOS Build Path
+
+The macOS pod uses the same script-phase build. Inside an Erika checkout (when
+`crates/erika_capi/Cargo.toml` exists above the package, or `ERIKA_REPO_ROOT`
+points at one) it builds the Rust `erika_capi` from source by default, so local
+renderer changes are picked up without a new prebuilt release. Published
+packages and isolated consumers — including git dependencies resolved into the
+pub cache, which keep the whole repository and therefore also build from
+source — need a Rust toolchain for that path; set `ERIKA_FORCE_PREBUILT=1` to
+always download the checksummed prebuilt archive instead.
 
 ## Minimal Presenter Flow
 
@@ -143,10 +234,17 @@ Flutter Texture is a lower-capability compatibility path.
 Useful for:
 - SDR fallback.
 - Platforms where native view composition is not ready.
+- Transparent video that should participate in Flutter's compositor
+  (`ErikaTextureVideoView` on macOS, Windows, and OpenHarmony).
 - Test surfaces or constrained embedding environments.
 
-Not the preferred HDR/EDR route because video enters Flutter's compositor. The
-C ABI reserves `erika_attach_flutter_texture` for this path.
+It is not the preferred HDR/EDR route because video enters Flutter's
+compositor. On Apple the surface is an IOSurface-backed `CVPixelBuffer`: the
+host registers a Flutter texture, selects the frame's Metal texture with
+`erika_presenter_attach_flutter_texture` and
+`erika_presenter_set_flutter_texture_buffer` before every render tick, and
+Flutter composites the same buffer without a CPU readback. The host keeps
+ownership of the pixel buffers.
 
 ## wgpu and Android
 
@@ -165,6 +263,8 @@ acceptance remains pending. Linux support remains planned.
 final player = ErikaPlayer(
   outputMode: ErikaOutputMode.appleEdr,  // optional: force EDR
   edrHeadroom: 4.0,                      // optional: EDR headroom
+  // optional: side-by-side colour/alpha assets presented with transparency
+  videoAlphaMode: ErikaVideoAlphaMode.packedAlphaRight,
 );
 
 await player.open(
@@ -173,11 +273,15 @@ await player.open(
     'Authorization': 'Bearer token',
     'Referer': 'https://example.com/',
   },
+  httpReadAheadBytes: 16 * 1024 * 1024,
 );
 await player.play();
 
 // Preferred for full-player UIs on macOS/iOS/tvOS:
 ErikaWindowOverlayVideoView(player: player)
+
+// Flutter-composited video with opacity/clipping/filters (macOS/Windows/OpenHarmony):
+ErikaTextureVideoView(player: player, opacity: 0.8)
 
 // Compatibility/diagnostic platform-view path:
 ErikaVideoView(player: player)

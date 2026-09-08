@@ -133,6 +133,8 @@ handle 会停止播放并释放全部资源。
 ErikaStatus erika_open(ErikaHandle *handle, const char *uri);   // 文件路径或 URL
 ErikaStatus erika_open_with_headers(ErikaHandle *handle, const char *uri,
                                     const ErikaHttpHeader *headers, uintptr_t header_count);
+ErikaStatus erika_open_with_options(ErikaHandle *handle, const char *uri,
+                                    const ErikaOpenOptions *options);
 ErikaStatus erika_play(ErikaHandle *handle);
 ErikaStatus erika_pause(ErikaHandle *handle);
 ErikaStatus erika_stop(ErikaHandle *handle);
@@ -143,9 +145,28 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 `uri` 是本地文件路径或 HTTP(S) URL。`erika_open_with_headers` 用于为 HTTP(S) 播放
 设置请求头；`headers` 只在调用期间读取，调用返回后即可释放。`header_count` 大于零时
 `headers` 不能为 NULL。请求头会用于 HEAD、Range GET 和预取请求。
-认证信息和 Cookie 不会写入 Erika 日志。`seek` 单位为微秒。`open` 和 `play` 都会
-异步入队；应观察 `StateChanged`、`DurationChanged` 和 `Error` 事件获取最终结果，
-不要阻塞宿主 UI 线程。
+认证信息和 Cookie 不会写入 Erika 日志。`seek` 单位为微秒。
+
+`erika_open_with_options` 是 `erika_open_with_headers` 的超集：通过 `ErikaOpenOptions`
+结构体把请求头数组与逐请求调参打包在一起。`options` 传 NULL 表示全部使用默认值。
+`http_read_ahead_bytes` 覆盖本次请求的 HTTP(S) 预读窗口（字节）。`0` 会优先采用进程级
+环境变量 `ERIKA_HTTP_READAHEAD_BYTES`，未设置时使用 2 MiB 默认值；显式非零值优先于
+该环境变量。
+`reserved` 中的非零值会被拒绝，以便未来增加字段时不改变旧宿主的行为。预读窗口只
+影响 HTTP(S) 播放，本地文件不受影响。
+
+```c
+typedef struct ErikaOpenOptions {
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t http_read_ahead_bytes;   /* 0 = 环境变量，否则 2 MiB */
+  uint64_t reserved[3];             /* 必须为零 */
+} ErikaOpenOptions;
+```
+
+`open` 会同步探测媒体流并转入 `Ready`；`play` 才是异步入队。
+应在宿主 UI 线程之外执行可能阻塞的 open，并串行调用同一 handle 的所有接口。
+通过 `StateChanged`、`DurationChanged` 和 `Error` 事件观察后续播放变化。
 
 ### 轨道与字幕
 
@@ -215,13 +236,22 @@ Erika 拥有完整栈；宿主提供 surface 并调用 `render_tick`。
 ErikaPresenterHandle *erika_presenter_create(void);
 ErikaPresenterHandle *erika_presenter_create_with_config(ErikaPresenterConfig config);
 ErikaPresenterHandle *erika_presenter_create_with_output_mode(int32_t output_mode, float edr_headroom);
+ErikaPresenterHandle *erika_presenter_create_with_output_mode_and_alpha(int32_t output_mode, float edr_headroom,
+                                                                        int32_t video_alpha_mode);
 void                  erika_presenter_destroy(ErikaPresenterHandle *handle);
 ```
 
+从 v0.1.8 起，`ErikaPresenterConfig` 为四字段、16 字节；v0.1.7 为三字段、
+12 字节。此结构体按值传递，两个版本不具备二进制兼容性。C/C++ 调用方及手写
+Swift/FFI 镜像必须使用配套头文件和原生库重新编译，不透明视频应将
+`video_alpha_mode` 初始化为 `0`。
+
 `ErikaPresenterConfig` 选择输出模式（`Sdr`、Apple `AppleEdr`、Android
-`ExtendedLinear`）、请求的 EDR/scRGB 内容 headroom 上限和初始亮度超分。Android
+`ExtendedLinear`）、请求的 EDR/scRGB 内容 headroom 上限、初始亮度超分，以及
+`video_alpha_mode`（`ErikaVideoAlphaMode`）。Android
 `ExtendedLinear` 是 FP16 extended-linear scRGB，不是 HDR10/PQ。
-`create_with_output_mode` 是简写；`create` 用默认值（SDR、无超分）。返回 `NULL` 表示
+`create_with_output_mode` 与 `create_with_output_mode_and_alpha` 是简写；`create` 用默认值
+（SDR、不透明视频、无超分）。返回 `NULL` 表示
 创建失败——检查 `erika_last_error_message`。
 
 ### 播放与运行时参数
@@ -231,6 +261,8 @@ ErikaStatus erika_presenter_open(ErikaPresenterHandle *, const char *uri);
 ErikaStatus erika_presenter_open_with_headers(ErikaPresenterHandle *, const char *uri,
                                               const ErikaHttpHeader *headers,
                                               uintptr_t header_count);
+ErikaStatus erika_presenter_open_with_options(ErikaPresenterHandle *, const char *uri,
+                                              const ErikaOpenOptions *options);
 ErikaStatus erika_presenter_play(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_pause(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_stop(ErikaPresenterHandle *);
@@ -245,7 +277,10 @@ ErikaStatus erika_presenter_set_subtitle_style(ErikaPresenterHandle *, ErikaSubt
 ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float headroom, bool known);
 ```
 
-`set_playback_rate(1.0)` 为正常速度。`set_upscaler` 在运行时切换神经亮度超分（见
+`set_playback_rate(1.0)` 为正常速度。`erika_presenter_open_with_options` 是
+`erika_open_with_options` 的推送模型对应版本，接受同样的
+`ErikaOpenOptions`（请求头加 `http_read_ahead_bytes`；见
+[`erika_open_with_options`](#erikahandle--拉取模型)）。`set_upscaler` 在运行时切换神经亮度超分（见
 [`erika_presenter_get_upscaler_status`](#诊断与截图)）。Metal 与具备 compute 能力的
 wgpu renderer，以及 feature level 11.0+ 的 D3D11 renderer 会执行 ArtCNN；其他后端保留原生 luma sampling，并明确报告
 `Inactive` 回退。
@@ -383,6 +418,21 @@ ErikaStatus erika_presenter_set_danmaku_block_words_json(ErikaPresenterHandle *,
 [danmaku_architecture.md](danmaku_architecture.md)。`set_danmaku_block_words_json`
 接受一个字符串 JSON 数组用于过滤。
 
+内联 JSON 的根可以是 item 数组，也可以是包含 `comments`、`danmaku` 或 `items`
+数组的对象。每个 item 使用以下字段；括号内是兼容别名：
+
+- `content`（`text`、`c`）：正文；缺失或空白的 item 会被跳过。
+- `time`（`t`）：出现时间，单位为秒，默认 `0`。
+- `type`（`mode`、`y`）：`scroll`/`1`、`bottom`/`4`、`top`/`5`、
+  `reverse`/`6` 或 `special`/`7`。也可使用数值 `type_code` / `mode_code`。
+- `color`（`r`）：十进制 RGB、`#RRGGBB` 或 `rgb(r,g,b)`。
+- `font_size`（`fontSize`、`size`、`s`）、`opacity`（`alpha`、`a`）、
+  `is_me`（`isMe`、`self`、`mine`）：可选样式和自发标记。
+- `id`：可选的无符号 64 位整数或十进制字符串。省略时按整份输入中的顺序分配；
+  session 会另外生成布局内部身份，因此调用方无需为了滑窗轨道稳定而合成业务 ID。
+
+未知字段会被忽略，因此包含 `cid`、`danmakuId` 等数据源字段的标准 map 可以直接传入。
+
 `set_debug_hud_enabled` 默认关闭。开启后 Presenter 在原生视频合成中绘制诊断 HUD，显示轨道
 技术信息、播放状态、实时解码/渲染 FPS、解码/零拷贝路径、渲染和音频状态、
 HDR 输出以及弹幕数量。HUD 只在已有视频帧时显示；其统计不要求调用方轮询，也不会写入
@@ -413,6 +463,45 @@ Android extended-linear 应把 Flutter Hybrid Composition `SurfaceView` 对应�
 `setDesiredHdrHeadroom`。Erika 仍会自行
 验证 Vulkan、`Rgba16Float` 和 `ADATASPACE_SCRGB_LINEAR`；任何一项失败都会回退 SDR，
 且原因可查询。
+
+### Flutter texture surface
+
+```c
+ErikaStatus erika_presenter_attach_flutter_texture(ErikaPresenterHandle *, ErikaFlutterTextureKind kind,
+                                                   int64_t texture_id, uint32_t w, uint32_t h, double scale);
+ErikaStatus erika_presenter_set_flutter_texture_buffer(ErikaPresenterHandle *, uint64_t raw_texture,
+                                                       uint32_t w, uint32_t h);
+```
+
+`attach_flutter_texture` 把 presenter 绑定到由 `texture_id` 标识的
+texture-registrar surface（目前为 Apple 的
+`MacOsTextureRegistrar`/`IosTextureRegistrar`）。pixel buffer 由宿主持有；在**每次**
+`render_tick` 之前，用 `set_flutter_texture_buffer` 选定下一帧的 GPU 目标，传入
+强制转换为 `uint64_t` 的 `id<MTLTexture>` 指针，且必须是 `BGRA8Unorm` 格式并与声明的
+`w`×`h` 一致。该纹理只在当帧内被借用——宿主保持所有权，可在 `render_tick`
+返回后复用或释放。Flutter 插件在 macOS 上的 `ErikaTextureVideoView`
+使用的就是这个 surface。
+
+### Windows DirectComposition swap chain
+
+```c
+ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(ErikaPresenterHandle *, void **out_swapchain);
+```
+
+仅限 Windows。当 presenter 通过
+`attach_wgpu_surface_with_output_capabilities`（`direct_composition = true`）attach，
+且以透明视频 alpha 模式或 overlay 混合播放时，Erika 会为目标 HWND 创建预乘 alpha 的
+composition swap chain。此 getter 以 **AddRef 后的 `IUnknown*`** 返回它：调用者拥有返回的
+COM 引用，必须自行 `Release`。解码器/设备丢失后应重新获取——Erika 会重建 swap chain
+并暴露新对象；指针未变说明没有重建。
+
+### Windows Flutter 纹理
+
+```c
+ErikaStatus erika_presenter_windows_flutter_texture_iunknown(ErikaPresenterHandle *, void **out_texture);
+```
+
+仅限 Windows，其他平台不导出此符号。返回最新已完成且不可变的 SDR Flutter GPU 帧，类型为 **已 AddRef 的 `IUnknown*`**。调用方拥有该引用，必须 `Release`；使用帧期间应保留引用，纹理内容在其整个生命周期内不会改变。输出指针为空时返回 `NullPointer`；presenter 有效但尚无已完成 Flutter 纹理时返回 `PlayerError`，并将输出置空。应先驱动渲染再请求帧。
 
 ### 渲染循环与事件
 
@@ -539,6 +628,7 @@ free(rgba);
 | `ErikaTrackSource` | `Embedded` `External` |
 | `ErikaWgpuSurfaceKind` | `Unknown` `MacOsNsView` `MacOsCaMetalLayer` `IosUiView` `WindowsHwnd` `XlibWindow` `WaylandSurface` `AndroidNativeWindow` `OhosNativeWindow` |
 | `ErikaFlutterTextureKind` | `Unknown` `MacOsTextureRegistrar` `IosTextureRegistrar` `AndroidSurfaceTexture` `WindowsTextureRegistrar` `LinuxTextureRegistrar` |
+| `ErikaVideoAlphaMode` | `Opaque` `PackedAlphaRight` |
 | `ErikaPresenterOutputMode` | `Auto` `Sdr` `AppleEdr` `ExtendedLinear` |
 | `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` |
 | `ErikaOutputSurfaceFormat` | `EightBitUnorm` `TenBitUnorm` `SixteenBitFloat` |
@@ -548,8 +638,9 @@ free(rgba);
 
 ## 结构体
 
-- **`ErikaPresenterConfig`** `{ int32 output_mode; float edr_headroom; int32 luma_upscaler; }` —
-  按值传给 `create_with_config`。
+- **`ErikaPresenterConfig`** `{ int32 output_mode; float edr_headroom; int32 luma_upscaler; int32 video_alpha_mode; }` —
+  按值传给 `create_with_config`；`video_alpha_mode` 是 `ErikaVideoAlphaMode`
+  （默认 `Opaque`，左右分区颜色/alpha 素材用 `PackedAlphaRight`）。
 - **`ErikaSurfaceOutputCapabilities`** `{ bool extended_linear; bool direct_composition; float desired_headroom; int32 fallback_reason; }` —— attach 时传入的 Android 宿主显示器/surface 探测结果；`desired_headroom == 0` 表示系统 auto。
 - **`ErikaUpscalerStatus`** —— 请求模式、当前后端、fallback 次数、超分帧数、最近
   encode/GPU 微秒。
