@@ -983,6 +983,13 @@ impl D3d11Renderer {
         if let Some(old) = self.state.as_ref() {
             if let Some(surface) = self.surface.as_mut() {
                 release_backbuffer_views(&old.context, surface);
+                // 设备切换同样要先摘掉 panel 上的旧 swapchain（见
+                // panel_clear_swap_chain 注释）：panel 仍持有对旧 swapchain 的
+                // 引用，直接 drop 会让合成器悬垂消费。clear 失败也继续——旧设备
+                // 已失效，此时摘除是尽力而为。
+                if let Some(panel) = surface.panel {
+                    let _ = panel_clear_swap_chain(panel);
+                }
                 surface.swapchain = None;
                 surface.output_texture = None;
             }

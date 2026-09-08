@@ -18,8 +18,7 @@ use crate::ffmpeg::{
     Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat, StreamSelection, SubtitleDecoder,
 };
 use crate::source::{
-    self, source_from_uri_with_hint, source_from_uri_with_hint_and_headers,
-    source_from_uri_with_hint_and_headers_slot,
+    self, source_from_uri_with_hint, source_from_uri_with_hint_and_headers_slot,
     source_from_uri_with_hint_and_headers_slot_and_read_ahead,
 };
 use crate::subtitle::{
