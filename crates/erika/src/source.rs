@@ -4406,8 +4406,17 @@ mod tests {
         // 旧段被作废、按新 host 重发：B 收到请求，且新段携带新 epoch
         assert!(!source.prefetch.is_empty());
         assert!(source.prefetch.iter().all(|p| p.host_epoch == 1));
-        let head_b = recv_request_head(&requests_b);
-        assert!(head_b.contains("range: bytes=0-"));
+        // 重发是并行的两段，B 收到两条请求的先后顺序不确定（原断言假定起点段
+        // 先到，实测约 1/3 概率失败 → flaky）。断言改为"窗口起点必须出现在这
+        // 两条请求之一"，语义不变、不依赖到达顺序。
+        let mut heads_b = vec![recv_request_head(&requests_b)];
+        if let Ok(second) = requests_b.recv_timeout(Duration::from_millis(500)) {
+            heads_b.push(second.to_lowercase());
+        }
+        assert!(
+            heads_b.iter().any(|head| head.contains("range: bytes=0-")),
+            "respawn must request the window from its start: {heads_b:?}"
+        );
         // A 不再收到任何新请求（被作废的段不会重试）
         assert!(requests_a.recv_timeout(Duration::from_millis(300)).is_err());
     }
