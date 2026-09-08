@@ -8,7 +8,6 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-#[cfg(target_os = "android")]
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -152,6 +151,80 @@ struct BandwidthSample {
 /// 每槽位上一窗口的采样点。宿主 poll 与 `publish_diag` 共用——先到者触发结算，
 /// 后到者读到缓存值（窗口未满时复用），保证「同一窗口内多次读取得到同一值」。
 static SOURCE_BW: Mutex<[Option<BandwidthSample>; SOURCE_DIAG_SLOTS]> = Mutex::new([None, None]);
+
+/// 音频优先缓冲协调器（2026-09-02）。
+///
+/// 播放 DASH 双流时，音频体积小（即便 192K 也仅数十 MB），应优先把它整条
+/// 拉完，从源头杜绝「音频饿死」（4K 弱网一卡一顿、声音卡住拖垮视频时钟的根因）。
+/// 音频源用**激进（不向 demux 让路）的整片预载桶**把音轨尽快拉完，并点亮本
+/// 协调器；视频源据此在音频未达标前压低自身并发（预取降到 1 段 + 整片桶让路），
+/// 把带宽完整让给音频。单流/直播不点亮协调器 → 无节流，行为不变。
+///
+/// 可用 `ERIKA_AUDIO_FIRST=0` 整体关闭（退回双段并行预取）；
+/// `ERIKA_AUDIO_FIRST_THRESHOLD_PERMILLE`（默认 500 = 50%）调相位阈值——
+/// 音频预载进度达到该千分比前视频保持节流，达到后视频恢复全速。
+struct AudioFirstCoord {
+    /// 音频优先是否激活（仅当音频源启用激进整片预载时点亮）。
+    enabled: AtomicBool,
+    /// 音频整片预载已覆盖进度（0..=1000，千分比）。
+    audio_permille: AtomicU64,
+    /// 音频总长是否已探测到（未探测到时视频同样节流，先让音频跑）。
+    audio_total_known: AtomicBool,
+    /// 点亮时刻（单调毫秒），用于防呆：点亮过久（如音频总长迟迟探测不到）
+    /// 则放弃节流，避免视频被永久压低。
+    enabled_at_ms: AtomicU64,
+}
+static AUDIO_FIRST: AudioFirstCoord = AudioFirstCoord {
+    enabled: AtomicBool::new(false),
+    audio_permille: AtomicU64::new(0),
+    audio_total_known: AtomicBool::new(false),
+    enabled_at_ms: AtomicU64::new(0),
+};
+static AUDIO_FIRST_START: OnceLock<Instant> = OnceLock::new();
+/// 音频优先最长节流时长：超过则放弃节流（兜底，避免音频异常时视频被永久压低）。
+const AUDIO_FIRST_MAX_THROTTLE_MS: u64 = 45_000;
+
+fn audio_first_now_ms() -> u64 {
+    AUDIO_FIRST_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// 是否启用音频优先策略（默认开，`ERIKA_AUDIO_FIRST=0/false` 关闭）。
+fn audio_first_env_enabled() -> bool {
+    std::env::var("ERIKA_AUDIO_FIRST")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true)
+}
+
+/// 相位阈值：音频预载进度达到该千分比后视频恢复全速（默认 50%）。
+fn audio_first_threshold_permille() -> u64 {
+    std::env::var("ERIKA_AUDIO_FIRST_THRESHOLD_PERMILLE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(500)
+}
+
+/// 视频源是否应被节流（把带宽让给尚未达标的音频）。
+fn audio_first_throttle_video() -> bool {
+    if !AUDIO_FIRST.enabled.load(Ordering::Relaxed) {
+        return false;
+    }
+    if !audio_first_env_enabled() {
+        return false;
+    }
+    // 防呆：点亮过久（如音频总长迟迟探测不到）则放弃节流。
+    let since = audio_first_now_ms().saturating_sub(AUDIO_FIRST.enabled_at_ms.load(Ordering::Relaxed));
+    if since > AUDIO_FIRST_MAX_THROTTLE_MS {
+        return false;
+    }
+    if !AUDIO_FIRST.audio_total_known.load(Ordering::Relaxed) {
+        // 音频总长还没探测到 → 先让音频跑，视频节流。
+        return true;
+    }
+    AUDIO_FIRST.audio_permille.load(Ordering::Relaxed) < audio_first_threshold_permille()
+}
 
 /// 带宽估算差分窗口：每 2s 用窗口内**实时到达**的字节更新一次 EMA。
 /// 太短（<1s）会被单次请求的突发抖动带偏；太长响应迟缓。
@@ -798,6 +871,13 @@ fn full_preload_loop(
     headers: &[(String, String)],
     state: &FullPreloadState,
     cap: u64,
+    // 激进模式（仅音频优先桶）：不向 demux 让路，必须抢在 demux 之前把整条
+    // 音轨拉完，从源头杜绝「音频饿死」。
+    eager: bool,
+    // 是否把预载进度上报到音频优先协调器（仅音频桶）。
+    report_audio_first: bool,
+    // 是否为视频桶：音频优先激活期间让路，把带宽让给音频。
+    video_bucket: bool,
 ) {
     const RETRY_BACKOFF: Duration = Duration::from_millis(200);
     let mut consecutive_failures: u32 = 0;
@@ -805,12 +885,18 @@ fn full_preload_loop(
         if state.stop.load(Ordering::Relaxed) {
             break;
         }
+        // 音频优先：视频桶在音频未达标前让路，带宽完整留给音频整片预载。
+        if video_bucket && audio_first_throttle_video() {
+            std::thread::sleep(PRELOAD_YIELD_SLEEP);
+            continue;
+        }
         // demux 正在消费（播放中）→ 让路：本轮不下载，把带宽完整留给 demux 的
         // 多段并行预取。两路同时下载同一区间会把有效供给砍半（实测 23KB/s 里
         // 一半是重复字节），而多段并行正是聚合被 CDN 限速的单连接带宽的手段
         // ——桶只有单段顺序，既抢不过也不该抢。暂停/缓冲充足后 demux 停止
         // read，桶自动接管并持续补到文件尾（用户定规：打开就应一直缓冲）。
-        if state.demux_active() {
+        // 激进音频桶（eager）除外：音频是优先下载目标，必须抢在 demux 之前拉完。
+        if !eager && state.demux_active() {
             std::thread::sleep(PRELOAD_YIELD_SLEEP);
             continue;
         }
@@ -818,6 +904,17 @@ fn full_preload_loop(
         // 每步取最新 host（换 host 时自动跟随，字节偏移缓存不变 → 无缝续下）。
         let uri_str = uri.lock().expect("uri poisoned").clone();
         let done = full_preload_step(state, agent, &uri_str, headers, cap);
+        // 音频桶把预载进度上报到协调器，供视频源判定相位。
+        if report_audio_first {
+            if let Some(total) = state.len() {
+                AUDIO_FIRST.audio_total_known.store(true, Ordering::Relaxed);
+                let covered = state.covered_until();
+                let permille = covered.saturating_mul(1000) / total.max(1);
+                AUDIO_FIRST
+                    .audio_permille
+                    .store(permille.min(1000), Ordering::Relaxed);
+            }
+        }
         if done {
             break;
         }
@@ -1040,7 +1137,16 @@ fn host_of(uri: &str) -> &str {
 }
 
 impl HttpRangeSource {
-    const DEFAULT_READ_AHEAD_BYTES: u64 = 2 * 1024 * 1024;
+    /// 视频/单流默认 read-ahead 窗口。**2MB → 4MB（2026-09-03）**：对齐
+    /// PiliPlus 的 mpv `demuxer-max-bytes` 默认 4 MiB
+    /// （`lib/utils/storage_pref.dart:825-841`，`Pref.bufferSize = 4.0`）。
+    /// 2MB 对 1080P（约 3 Mbps）只有约 5.3 秒缓冲，PiliPlus 有约 11 秒
+    /// ——**缓冲深度差一倍是它比我们能扛抖动的直接原因**（对照研究见
+    /// bili-rs `research_report_cdn_switch_vs_piliplus.md`）。4MB 让策略层
+    /// 的 2 秒饥饿线不再被常规 CDN 抖动顶到；`spawn_prefetch_window` 的
+    /// `window_cap` 会真正执行该上限，窗口不会无界增长。代价仅常驻 +2MB。
+    /// 可用 `ERIKA_HTTP_READAHEAD_BYTES` 覆盖。
+    const DEFAULT_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
     /// 后向缓冲默认大小（对齐 mpv `--demuxer-max-back-bytes` 默认 4MB，
     /// 与 PiliPlus `Pref.bufferSize` 默认一致）。可用环境变量
     /// `ERIKA_HTTP_BACK_BYTES` 覆盖。
@@ -1263,12 +1369,11 @@ impl HttpRangeSource {
         if self.full_preload.is_some() || self.preload_thread.is_some() {
             return self;
         }
-        // 音频流（diag_slot 1）不启用整片预载桶：音频体积小（数 MB 级），
-        // 单段预取足够覆盖；桶线程与预取段并跑会把双流稳态并发推到 8，
-        // 实测触发 B 站 CDN 单 IP 并发限流（段挂死/新连接被断，见
-        // `http_prefetch_parallel` 注释）。返回未启用状态的 self（桶字段
-        // 保持 None，`in_flight_segments()` 恒 0，诊断口径不变）。
-        if self.diag_slot == 1 {
+        // 音频优先策略：仅对音频流（diag_slot 1）且在环境变量允许时启用。
+        let audio_first = self.diag_slot == 1 && audio_first_env_enabled();
+        // 音频流但关闭音频优先：保持旧行为（不启用整片桶，退回双段并行预取，
+        // 见下方双段并行的说明），不点亮协调器 → 视频不被节流。
+        if self.diag_slot == 1 && !audio_first {
             return self;
         }
         let cap = full_preload_cap();
@@ -1281,13 +1386,37 @@ impl HttpRangeSource {
             }
         }
         self.full_preload = Some(state.clone());
+        // 音频优先点亮协调器：音频源用激进整片预载把整条音轨拉完，视频源据此
+        // 在音频达标前压低并发。每次启用都复位进度（上一场播放的残留值归零）。
+        if audio_first {
+            AUDIO_FIRST.enabled.store(true, Ordering::Relaxed);
+            AUDIO_FIRST.audio_permille.store(0, Ordering::Relaxed);
+            AUDIO_FIRST.audio_total_known.store(false, Ordering::Relaxed);
+            AUDIO_FIRST.enabled_at_ms.store(audio_first_now_ms(), Ordering::Relaxed);
+        }
+        let (eager, report, video_bucket) = if audio_first {
+            // 激进音频桶：不向 demux 让路，优先把整条音轨拉完；进度上报协调器。
+            (true, true, false)
+        } else {
+            // 普通视频桶：播放中向 demux 让路、不报音频优先。
+            (false, false, true)
+        };
         let uri = self.uri.clone(); // Arc<Mutex<String>>：换 host 时桶线程自动跟随
         let headers = self.http_headers.clone();
         let agent = self.agent.clone();
         let handle = std::thread::Builder::new()
             .name(format!("erika-full-preload-{}", self.diag_slot))
             .spawn(move || {
-                full_preload_loop(&agent, uri, &headers, &state, cap);
+                full_preload_loop(
+                    &agent,
+                    uri,
+                    &headers,
+                    &state,
+                    cap,
+                    eager,
+                    report,
+                    video_bucket,
+                );
             })
             .expect("failed to spawn full-preload thread");
         self.preload_thread = Some(handle);
@@ -1744,13 +1873,21 @@ impl HttpRangeSource {
             return;
         }
         let window_cap = self.cache_end().saturating_add(self.read_ahead_bytes);
-        // 音频流（diag_slot 1）强制单段：音频码率 ≈ 视频的 1/10，单段吞吐
-        // 绰绰有余，多连接只有并发风险没有收益。双流各按视频上限拉段时
-        // 稳态并发 8（v3+桶1 + a3+桶1），实测触发 B 站 CDN 单 IP 并发限流
-        // ——在飞段集体挂死 0 字节、新连接 Peer disconnected（见
-        // `http_prefetch_parallel` 注释）。压并发是"点播放转圈/播不出"的
-        // 主修复之一。
+        // 音频流（diag_slot 1）也 2 段在途：此前强制单段——音频码率低、单段
+        // 吞吐理论上够。但弱网下视频流（2 并行 + 整片预载桶）抢光带宽，音频
+        // 单段（est_bps 低 → 缩到 32KB 下限）下载间歇，demux 读包频繁 join
+        // 阻塞（实测平均 348ms）→ 平均供给 ~18KB/s < 音频码率 ~23KB/s →
+        // 音频下溢 + 时钟跳过（underflow 832、stage=stale），声音卡住拖垮视频
+        // 时钟（4K 弱网"一卡一顿"根因）。2 段在途让下载更持续，供给提到 ~23KB/s
+        // 持平码率。总并发 5（v2+桶1+a2）仍低于触发限流的 8，风险可控。
+        // 注意：开启「音频优先」后，音频由激进整片预载桶整条拉完，此处的
+        // 2 段并行预取会在桶覆盖 cache_end 后被 `maybe_start_prefetch` 短路，
+        // 实际只剩桶在跑，不会重复下载。
         let parallel = if self.diag_slot == 1 {
+            2
+        } else if audio_first_throttle_video() {
+            // 音频优先相位：视频把并发压到 1 段（仅维持 live demux 不被饿死），
+            // 把带宽让给正在整片拉取的音频，从源头杜绝音频饿死。
             1
         } else {
             http_prefetch_parallel()
@@ -1913,6 +2050,13 @@ impl Drop for HttpRangeSource {
         if let Some(state) = self.full_preload.take() {
             unregister(&state.downloaded);
             state.stop();
+        }
+        // 音频源销毁（播放停止/换源）→ 关闭音频优先：复位协调器，视频源随即
+        // 解除节流、恢复全速（双流同生命周期，通常一起销毁）。
+        if self.diag_slot == 1 {
+            AUDIO_FIRST.enabled.store(false, Ordering::Relaxed);
+            AUDIO_FIRST.audio_permille.store(0, Ordering::Relaxed);
+            AUDIO_FIRST.audio_total_known.store(false, Ordering::Relaxed);
         }
         if let Some(handle) = self.preload_thread.take() {
             drop(handle); // 线程已在 stop 后自退，drop 句柄不阻塞（detached）。
@@ -2956,7 +3100,9 @@ const AUDIO_DEFAULT_BACK_BUFFER_BYTES: u64 = 1024 * 1024;
 /// 默认值而非视频值**（见 `AUDIO_DEFAULT_READ_AHEAD_BYTES` 注释），可用
 /// `ERIKA_HTTP_READAHEAD_BYTES_AUDIO` 覆盖（设 0 关闭音频预取）。
 /// 顺序预取并行在途段数（`ERIKA_HTTP_PREFETCH_PARALLEL` 覆盖，默认 2，
-/// 钳制 1..=8；音频流强制 1，见 `spawn_prefetch_window`）。多段并发把
+/// 钳制 1..=8；音频流的 2 段并行仅在「音频优先」关闭时生效，开启后音频由
+/// 整片预载桶整条拉完、并行预取被短路，见 `spawn_prefetch_window`）。
+/// 多段并发把
 /// 高 RTT/单连接限速链路的吞吐叠加 ×N；段间按字节偏移连续切分、join
 /// 严格按覆盖关系（读哪段 join 哪段），乱序完成的段在队列中等待前序段
 /// ——窗口按偏移有序增长，无拼接错位。历史"坏包"根因是 window_slice
@@ -3301,7 +3447,9 @@ mod tests {
 
     #[test]
     fn http_default_read_ahead_is_streaming_sized() {
-        assert_eq!(HttpRangeSource::DEFAULT_READ_AHEAD_BYTES, 2 * 1024 * 1024);
+        // 4MB = PiliPlus mpv `demuxer-max-bytes` 默认（见常量处注释）。
+        // 与后向缓冲同量级，1080P 下约 11 秒前向余量。
+        assert_eq!(HttpRangeSource::DEFAULT_READ_AHEAD_BYTES, 4 * 1024 * 1024);
     }
 
     // ---- 带宽自适应（弱网修复）：段大小 / join 超时 / 估算器 ----
@@ -3337,11 +3485,13 @@ mod tests {
         );
         assert_eq!(audio_after.read_ahead_bytes, AUDIO_DEFAULT_READ_AHEAD_BYTES);
         assert_eq!(video_after.read_ahead_bytes, 8 * 1024 * 1024);
-        // 常规测试环境（两个 env 均未设置）：音频与视频同为内核默认 2MB，
-        // 区别只在宿主调大视频窗口时显现
-        assert_eq!(
-            HttpRangeSource::DEFAULT_READ_AHEAD_BYTES,
-            AUDIO_DEFAULT_READ_AHEAD_BYTES
+        // 常规测试环境（两个 env 均未设置）：视频窗口（4MB，对齐 PiliPlus
+        // mpv `demuxer-max-bytes`）现在**大于**音频窗口（2MB）。此前两者同为
+        // 2MB，视频侧缓冲只有 PiliPlus 的一半——这是两者抗抖动能力差异的
+        // 直接来源（2026-09-03 对照研究，见常量处注释）。
+        assert!(
+            HttpRangeSource::DEFAULT_READ_AHEAD_BYTES > AUDIO_DEFAULT_READ_AHEAD_BYTES,
+            "视频 read-ahead 应大于音频：音频码率低两个数量级，等大窗口是浪费"
         );
     }
 
