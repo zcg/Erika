@@ -843,6 +843,13 @@ impl D3d11Renderer {
         surface.render_target = None;
         surface.linear_render_target = None;
         surface.linear_shader_resource = None;
+        // 摘掉旧 swapchain 再释放（见 panel_clear_swap_chain 注释）：resize/换源/
+        // HDR 切换都会走到这里重建 swapchain，不先摘除就 drop 会与在飞的异步
+        // present 竞态 → use-after-free。clear 失败也继续释放——最坏情况是 panel
+        // 已失效（无人在消费旧 swapchain），直接释放反而安全。
+        if let (Some(panel), true) = (surface.panel, surface.swapchain.is_some()) {
+            let _ = panel_clear_swap_chain(panel);
+        }
         surface.swapchain = None;
         let output_mode = surface.output_mode;
         trace("recreate_surface_targets: create_swapchain");
@@ -1640,6 +1647,13 @@ impl RendererBackend for D3d11Renderer {
     }
 
     fn detach_surface(&mut self) -> Result<()> {
+        // 摘掉 swapchain 再释放 surface（见 panel_clear_swap_chain 注释）：直接
+        // drop surface（含 swapchain）会让 panel 悬垂引用旧 swapchain。clear 失败
+        // 也继续释放——detach 是收尾清理，不能因 panel 已失效而中止。
+        let panel = self.surface.as_ref().and_then(|s| s.panel);
+        if let Some(panel) = panel {
+            let _ = panel_clear_swap_chain(panel);
+        }
         self.surface = None;
         self.current_video = None;
         self.danmaku_atlas_cache = None;
@@ -2251,6 +2265,30 @@ fn panel_set_swap_chain(panel: *mut c_void, swapchain: &IDXGISwapChain1) -> Resu
         if hresult.is_err() {
             return Err(crate::core::PlayerError::Renderer(format!(
                 "ISwapChainPanelNative::SetSwapChain failed with {:?}",
+                hresult
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `ISwapChainPanelNative::SetSwapChain(null)`：把 swapchain 从 panel 上摘除。
+///
+/// 释放旧 swapchain 前**必须先摘除**。panel 持有对 swapchain 的引用，直接 drop
+/// Rust 侧的 swapchain 只是引用计数 -1，panel 那份引用仍在；而 render 循环的
+/// present 走 `DXGI_PRESENT_DO_NOT_WAIT`（异步提交、最多 1 帧在飞），resize/换源
+/// 重建 swapchain 时若那 1 帧仍被合成器消费旧 backbuffer，drop 旧 swapchain 即
+/// use-after-free → `ucrtbase.dll` 0xc0000005（拖拽窗口/点播放闪退根因）。
+/// SetSwapChain(null) 让 panel 先断开对旧 swapchain 的引用、合成器不再消费，
+/// 之后再 drop 才安全。
+fn panel_clear_swap_chain(panel: *mut c_void) -> Result<()> {
+    unsafe {
+        let vtbl = &*((*(panel as *mut *mut c_void)) as *const ISwapChainPanelNativeVtbl);
+        let hr = (vtbl.set_swap_chain)(panel, std::ptr::null());
+        let hresult = ::windows::core::HRESULT(hr);
+        if hresult.is_err() {
+            return Err(crate::core::PlayerError::Renderer(format!(
+                "ISwapChainPanelNative::SetSwapChain(null) failed with {:?}",
                 hresult
             )));
         }

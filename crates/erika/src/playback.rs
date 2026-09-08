@@ -221,13 +221,20 @@ struct AsyncDemuxer {
     commands: Sender<DemuxCommand>,
     generation: u64,
     active: bool,
+    /// demux 线程句柄。宿主销毁播放器时若只 send Stop 不 join，线程被 detach：
+    /// 旧播放器已释放、demux 线程却仍在 `read_packet`（FFmpeg `av_read_frame` →
+    /// AVIO 回调 → `CustomAvio::read_packet` 的 `copy_nonoverlapping`）里拷贝数据，
+    /// 一旦其 FFmpeg AVIO 上下文/源被释放即 use-after-free → `memcpy` 访问违规
+    /// （`ucrtbase.dll` 0xc0000005，bili-rs 打开/切换播放页闪退根因）。持有句柄
+    /// 以便 Drop 时 join，保证 demuxer 在 AsyncDemuxer 释放前完全退出。
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AsyncDemuxer {
     fn spawn(demuxer: Demuxer) -> Self {
         let (packet_sender, packets) = bounded(demux_packet_queue_limit());
         let (commands, command_receiver) = unbounded();
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("erika-demux".to_string())
             .spawn(move || run_demux_worker(demuxer, packet_sender, command_receiver))
             .expect("spawn erika demux worker");
@@ -236,6 +243,7 @@ impl AsyncDemuxer {
             commands,
             generation: 1,
             active: false,
+            handle: Some(handle),
         }
     }
 
@@ -313,6 +321,19 @@ impl AsyncDemuxer {
 impl Drop for AsyncDemuxer {
     fn drop(&mut self) {
         let _ = self.commands.send(DemuxCommand::Stop);
+        // 有限超时 join：demux 线程正常在收到 Stop 后快速退出（<100ms），
+        // 确保 demuxer（含 FFmpeg AVIO 上下文与源）在 AsyncDemuxer 释放前完全
+        // 释放，杜绝 detached 线程的 use-after-free。仅当阻塞在慢速 read_range
+        // （最长 30s 的段 join 超时）时才 2s 超时 detach——detach 后 demuxer 仍
+        // 自包含在 demux 线程栈上、最终会安全释放，只是不阻塞 UI 线程。
+        if let Some(handle) = self.handle.take() {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        }
     }
 }
 
