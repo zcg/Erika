@@ -243,7 +243,16 @@ fn enforce_bundled_ffmpeg_version(version_major: Option<u32>, include_dir: &Path
 }
 
 fn ensure_libclang_path() {
-    if env::var_os("LIBCLANG_PATH").is_some() {
+    if let Some(path) = env::var_os("LIBCLANG_PATH") {
+        // 即便调用方已经显式指定 LIBCLANG_PATH，也要把它插到 PATH 最前面。
+        // bindgen 底层的 clang_sys 是按 PATH 顺序查找 libclang 的，若 PATH 里
+        // 更靠前处还躺着另一个 libclang（例如 llvm-mingw / mingw-mstorsjo 的
+        // clang 23，其内置 mmintrin.h 等 intrinsic 头在 23.x 有解析 bug），
+        // 就会被它抢先命中，导致 FFmpeg bindings 生成失败
+        // （"expected ';' after top level declarator" / mmintrin.h 向量类型报错）。
+        // 把指定目录前置即可确保想要的 libclang 胜出，且只影响本构建进程、
+        // 不动调用方的全局环境。
+        prepend_path_for_dlls(Path::new(&path));
         return;
     }
     let mut candidates = vec![
