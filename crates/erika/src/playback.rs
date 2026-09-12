@@ -8166,10 +8166,26 @@ mod tests {
         assert_eq!(engine.buffering_video_pts(), visible_buffering_pts);
         assert_eq!(engine.last_buffering_video_drain_at, Some(next_drain));
 
-        for index in 2..=200 {
+        // Drain the recovery window with a fixed tick budget, then wait for the
+        // parked frame. Decoding runs on its own thread, so under parallel test
+        // load the frame that gets parked can arrive a few milliseconds later
+        // than the budget: asserting straight after the budget is flaky. The
+        // assertion itself is unchanged - once the window is exhausted a frame
+        // must sit in `pending_frame` instead of being discarded.
+        let mut index = 2u32;
+        for _ in 2..=200 {
             let _ = engine
                 .tick_at(stalled_at + BUFFERING_VIDEO_DRAIN_INTERVAL * index)
                 .unwrap();
+            index = index.saturating_add(1);
+        }
+        let park_deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        while engine.pending_frame.is_none() && Instant::now() < park_deadline {
+            let _ = engine
+                .tick_at(stalled_at + BUFFERING_VIDEO_DRAIN_INTERVAL * index)
+                .unwrap();
+            index = index.saturating_add(1);
+            thread::yield_now();
         }
         let parked = engine
             .pending_frame
@@ -8221,10 +8237,23 @@ mod tests {
         );
         assert!(!engine.session.demux_eof);
 
-        for index in 1..=200 {
+        // Same shape as `buffering_drains_only_a_bounded_video_recovery_window`:
+        // spend a fixed tick budget on the drain scan, then wait for the parked
+        // frame instead of assuming the decoder thread already delivered it.
+        let mut index = 1u32;
+        for _ in 1..=200 {
             let _ = engine
                 .tick_at(stalled_at + BUFFERING_VIDEO_DRAIN_INTERVAL * index)
                 .unwrap();
+            index = index.saturating_add(1);
+        }
+        let park_deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        while engine.pending_frame.is_none() && Instant::now() < park_deadline {
+            let _ = engine
+                .tick_at(stalled_at + BUFFERING_VIDEO_DRAIN_INTERVAL * index)
+                .unwrap();
+            index = index.saturating_add(1);
+            thread::yield_now();
         }
 
         assert!(engine.pending_frame.is_some());

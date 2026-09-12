@@ -1045,6 +1045,18 @@ impl DecoderBackend {
 pub struct DecoderConfig {
     pub backend: DecoderBackend,
     pub mediacodec_surface: bool,
+    /// D3D11VA 硬件帧池的内存预算（字节）。`None` 使用
+    /// `D3D11VA_POOL_BUDGET_BYTES`。Windows 之外的平台忽略。
+    pub d3d11va_pool_budget_bytes: Option<usize>,
+    /// D3D11VA 硬件帧池深度的下界覆盖值。`None` 使用按 codec 推导的
+    /// `d3d11va_pool_floor`。
+    ///
+    /// 只有在**同时**下调了视频帧 handoff 队列容量
+    /// （`PlayerConfig::video_frame_queue_capacity`）时才应该跟着下调：
+    /// 下界里的 9 片消费端预留有 8 片是留给那个队列的。宿主把它调回 Erika
+    /// 默认值 3 时，这里给 `Some(21)` 是安全的；队列仍是 8 时改小这里就是
+    /// 复现 `get_buffer failed`。
+    pub d3d11va_pool_min_frames: Option<i32>,
 }
 
 impl DecoderConfig {
@@ -1052,6 +1064,7 @@ impl DecoderConfig {
         Self {
             backend: DecoderBackend::Software,
             mediacodec_surface: false,
+            ..Self::default()
         }
     }
 
@@ -1059,6 +1072,7 @@ impl DecoderConfig {
         Self {
             backend: DecoderBackend::VideoToolbox,
             mediacodec_surface: false,
+            ..Self::default()
         }
     }
 
@@ -1066,6 +1080,7 @@ impl DecoderConfig {
         Self {
             backend: DecoderBackend::D3d11va,
             mediacodec_surface: false,
+            ..Self::default()
         }
     }
 
@@ -1073,6 +1088,7 @@ impl DecoderConfig {
         Self {
             backend: DecoderBackend::MediaCodec,
             mediacodec_surface: true,
+            ..Self::default()
         }
     }
 
@@ -1080,6 +1096,7 @@ impl DecoderConfig {
         Self {
             backend: DecoderBackend::MediaCodec,
             mediacodec_surface: false,
+            ..Self::default()
         }
     }
 
@@ -1087,13 +1104,19 @@ impl DecoderConfig {
         Self {
             backend: DecoderBackend::AvCodec,
             mediacodec_surface: false,
+            ..Self::default()
         }
     }
 }
 
 impl Default for DecoderConfig {
     fn default() -> Self {
-        Self::software()
+        Self {
+            backend: DecoderBackend::Software,
+            mediacodec_surface: false,
+            d3d11va_pool_budget_bytes: None,
+            d3d11va_pool_min_frames: None,
+        }
     }
 }
 
@@ -1101,6 +1124,10 @@ struct HardwareDecoderState {
     device_ref: *mut sys::AVBufferRef,
     frames_ref: *mut sys::AVBufferRef,
     pixel_format: sys::AVPixelFormat,
+    /// D3D11VA 池预算与下界覆盖值，随 `DecoderConfig` 一起下发到
+    /// `select_hw_format` → `ensure_d3d11va_frames_for_context` 的建池路径。
+    pool_budget_bytes: usize,
+    pool_min_frames: Option<i32>,
 }
 
 #[cfg(target_os = "android")]
@@ -1279,7 +1306,7 @@ impl Decoder {
                 }
             }
             DecoderBackend::VideoToolbox => decoder.configure_videotoolbox(codec)?,
-            DecoderBackend::D3d11va => decoder.configure_d3d11va(codec)?,
+            DecoderBackend::D3d11va => decoder.configure_d3d11va(codec, &config)?,
             DecoderBackend::AvCodec => {}
         }
         let mut codec_options = ptr::null_mut();        #[cfg(target_os = "android")]
@@ -1698,13 +1725,50 @@ impl Decoder {
         )
     }
 
-    fn configure_d3d11va(&mut self, codec: *const sys::AVCodec) -> Result<()> {
+    fn configure_d3d11va(
+        &mut self,
+        codec: *const sys::AVCodec,
+        config: &DecoderConfig,
+    ) -> Result<()> {
         self.configure_hardware(
             codec,
             sys::AVHWDeviceType_AV_HWDEVICE_TYPE_D3D11VA,
             "avcodec_get_hw_config(D3D11VA)",
             "av_hwdevice_ctx_create(D3D11VA)",
         )?;
+        // 池预算随 HW 状态一起下发：建池发生在 `select_hw_format` →
+        // `ensure_d3d11va_frames_for_context`，那条路径只能通过
+        // `AVCodecContext::opaque` 拿到 HW 状态，拿不到 `DecoderConfig`。
+        if let Some(state) = self.hw_state.as_mut() {
+            state.pool_budget_bytes = config
+                .d3d11va_pool_budget_bytes
+                .unwrap_or(D3D11VA_POOL_BUDGET_BYTES);
+            state.pool_min_frames = config.d3d11va_pool_min_frames;
+        }
+        // 硬解固定单线程解码。
+        //
+        // 为什么必须在这里收敛：Erika 从不设置 `thread_count`，FFmpeg 于是取默认值
+        // `FFMIN(nb_cpus + 1, 16)` 并启用**帧级多线程**
+        // （`third_party/.../libavcodec/pthread.c:49-64`、
+        // `pthread_frame.c:923-930`），同时把 `avctx->delay` 设为
+        // `thread_count - 1`（同文件 955）。帧级多线程的意义是让 CPU 侧的解码
+        // 工作并行，但 D3D11VA 的宏块重建本来就在 GPU 上，CPU 只剩位流解析，
+        // 并行收益极小；代价却是每个线程各占输出帧槽（`decoded_frames_get_free`，
+        // 同文件 192/284）和 15 帧的解码流水线延迟（30fps 下首帧就要多等 0.5s，
+        // seek/切清晰度同理）。
+        //
+        // 更重要的是池：帧级多线程让"同时在飞的切片数"与线程数成正比，
+        // 官方自己建池时会在 `libavcodec/decode.c:1148-1151` 补 `+ thread_count`
+        // 片，而 Erika 在 `select_hw_format` 里用自建 `hw_frames_ctx` 覆写，
+        // **整段补偿被绕过**。实测"1080p 池降到 48 片就 get_buffer failed"
+        // 正是这么来的。把硬解收敛成单线程后，解码器内部的池需求回到 DXVA
+        // 规范基线（`dxva2.c:619-634` 的 1 + 参考帧），池深才可能按内存预算下调。
+        //
+        // 软解/其它后端不受影响：它们不走这条分支，仍然拿满 CPU 并行度。
+        #[cfg(target_os = "windows")]
+        unsafe {
+            (*self.context).thread_count = 1;
+        }
         Ok(())
     }
 
@@ -1791,6 +1855,8 @@ impl Decoder {
                 device_ref,
                 frames_ref: ptr::null_mut(),
                 pixel_format,
+                pool_budget_bytes: D3D11VA_POOL_BUDGET_BYTES,
+                pool_min_frames: None,
             });
             unsafe {
                 (*self.context).hw_device_ctx = context_device_ref;
@@ -1855,6 +1921,8 @@ impl Decoder {
             device_ref,
             frames_ref: ptr::null_mut(),
             pixel_format,
+            pool_budget_bytes: D3D11VA_POOL_BUDGET_BYTES,
+            pool_min_frames: None,
         });
 
         unsafe {
@@ -1942,11 +2010,21 @@ unsafe fn ensure_d3d11va_frames_for_context(
                 .as_mut()
         }?;
         frames_ctx.format = unsafe { (*state).pixel_format };
-        frames_ctx.sw_format = d3d11va_sw_format_for_context(context);
+        let sw_format = d3d11va_sw_format_for_context(context);
+        frames_ctx.sw_format = sw_format;
         let alignment = d3d11va_surface_alignment(unsafe { (*context).codec_id });
-        frames_ctx.width = align_i32(unsafe { (*context).coded_width }, alignment);
-        frames_ctx.height = align_i32(unsafe { (*context).coded_height }, alignment);
-        frames_ctx.initial_pool_size = d3d11va_pool_size(unsafe { (*context).codec_id });
+        let aligned_width = align_i32(unsafe { (*context).coded_width }, alignment);
+        let aligned_height = align_i32(unsafe { (*context).coded_height }, alignment);
+        frames_ctx.width = aligned_width;
+        frames_ctx.height = aligned_height;
+        frames_ctx.initial_pool_size = d3d11va_pool_size(
+            unsafe { (*context).codec_id },
+            aligned_width,
+            aligned_height,
+            sw_format,
+            unsafe { (*state).pool_budget_bytes },
+            unsafe { (*state).pool_min_frames },
+        );
         d3d11_frames.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
         d3d11_frames.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
         let code = unsafe { sys::av_hwframe_ctx_init(frames_ref) };
@@ -1992,14 +2070,114 @@ fn d3d11va_surface_alignment(codec_id: sys::AVCodecID) -> i32 {
     }
 }
 
+/// D3D11VA 硬件帧池的默认内存预算（字节）。
+///
+/// 池是**一次性全量预分配**：`av_hwframe_ctx_init` 会执行一次
+/// `CreateTexture2D`，`ArraySize = initial_pool_size`，把池里每个切片都建成
+/// 同一张纹理的一个 array slice
+/// （`third_party/src/FFmpeg-n8.1.2/libavutil/hwcontext_d3d11va.c:298-330`）。
+/// 之后 `d3d11va_pool_alloc` 只在池里没有空闲切片时才被调用，一旦
+/// `nb_surfaces_used >= ArraySize` 就直接返回 NULL（同文件 262-265 的
+/// "Static surface pool size exceeded"），`d3d11va_get_buffer` 随之返回
+/// `AVERROR(ENOMEM)`，上层看到的就是 `get_buffer() failed`。
+///
+/// **所以"池深 × 单片字节"就是实打实的常驻内存，而池深同时又是并发上限。**
+/// 这两件事被同一个数字绑定，正是本函数要按分辨率重新折算它的原因。
+///
+/// 64MiB 的取值依据：
+/// - 1080P H.264（coded 1920x1088，NV12 1.5B/px）单片 3.13MB →
+///   64MiB / 3.13MB ≈ 21 片；低于下界 26 时由下界兜底，所以 1080P 实际取 26；
+/// - 720P 以下折算值高于下界，预算直接生效（720P ≈ 48 片 × 1.38MB ≈ 66MB），
+///   并被 `d3d11va_pool_legacy_pool_size` 的上限夹住，不会因为预算富裕就
+///   无限多占内存；
+/// - 1440P/4K 的折算值低于下界，最终由 `d3d11va_pool_floor` 决定——高分辨率
+///   省内存靠的是"不再乘 60 片"，而不是击穿正确性下界。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const D3D11VA_POOL_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// 消费端在池里占用的常驻切片数。
+///
+/// 这些切片不属于解码器，但同样从池里取，池深必须把它们算进去，否则解码器
+/// 自己的 `get_buffer` 就会撞上限：
+/// - `core.rs:1345-1353` 的视频帧 handoff 队列，容量来自
+///   `PlayerConfig::video_frame_queue_capacity`。宿主 bili-rs 设为 8
+///   （`bili-rs/src/player/mod.rs:350`），队列满时这 8 片全部被 pin 住；
+///   队列再满则 `emit_video_frame_from_worker`（`core.rs:3675-3684`）用
+///   `try_send` 丢弃而不是阻塞解码器，所以 8 就是这一项的上限，不会再涨，
+///   但也不会自己降下来。**渲染停摆（宿主 `pause_rendering` 的 open 窗口）
+///   正是队列会满的场景**，所以这一项不能按稳态的 0~2 计；
+/// - `renderer/d3d11.rs:1209-1220` 的 `try_clone_ref` 把当前帧的 AVFrame 引用
+///   存进 `ImportedVideoFrame::_frame`（同文件 1255-1256），直到下一次 import
+///   或 clear 才释放，稳态占 1 片。`preserve_current_frame_for_transition`
+///   （同文件 2045-2047）是空实现，transition 期间**不释放**这一片。
+///
+/// 不重复计算 presenter 正在 import 的那一片：它是刚从队列里 `try_recv`
+/// 出来的，队列计数已经减一，两者是同一片。
+///
+/// 合计 8 + 1 = 9。这是"最坏情况"而不是"稳态"：稳态下队列通常只有 0~2 帧。
+/// 之所以按下界而不是稳态取值，是因为池一旦耗尽就是解码中断、宿主换源重开、
+/// 进度归零——用几十 MB 换掉这个故障是划算的。
+///
+/// 真正想继续压低这一项，正确的杠杆是宿主把 `video_frame_queue_capacity`
+/// 从 8 调回 Erika 默认的 3（那时可以配合把 `DecoderConfig::
+/// d3d11va_pool_min_frames` 设成 21），而不是在这里少算。
 #[cfg(target_os = "windows")]
-fn d3d11va_pool_size(codec_id: sys::AVCodecID) -> i32 {
-    // bili-rs 宿主：快 CDN 源下解码器产帧快，小池在渲染消费不及时
-    // （open 暂停窗口等）会耗尽（get_buffer failed → 有声音无画面），
-    // 曾从 20 增到 60/40 吸收突发。**不得再减容**：实测 1080p 降到 48
-    // 帧即复现 get_buffer failed → 解码中断 → 宿主换源重开（进度归零）。
-    // D3D11VA 表面在核显（共享系统内存）计入工作集的 ~36MB 差值，不值当
-    // 拿播放稳定性换。保持全量缓冲。
+const D3D11VA_CONSUMER_HEADROOM_FRAMES: i32 = 9;
+
+/// DXVA 规范基线里的工作切片数：1 片解码工作面。
+///
+/// `third_party/src/FFmpeg-n8.1.2/libavcodec/dxva2.c:619-628` 里 FFmpeg 自己
+/// 也是这么算的（`num_surfaces = 1` 起算，再按 codec 加参考帧）。
+#[cfg(target_os = "windows")]
+const D3D11VA_BASE_WORK_SURFACES: i32 = 1;
+
+/// 解码器 DPB（参考帧）需要预留的切片数，按 codec 取规范上限。
+///
+/// 与 `dxva2.c:623-628` 完全一致：H264/HEVC 16，VP9/AV1 8，其它 2。
+///
+/// 这里**不**按"B 站 1080P 通常 ref=4"去压这个数字：池在 open 时按 SPS 定容，
+/// 之后无法增长，低估一次就是一次 `get_buffer failed`。回归片源里只要出现
+/// 一个高参考帧的视频，压过的池就会当场失效。
+#[cfg(target_os = "windows")]
+fn d3d11va_reference_surfaces(codec_id: sys::AVCodecID) -> i32 {
+    if codec_id == sys::AVCodecID_AV_CODEC_ID_H264 || codec_id == sys::AVCodecID_AV_CODEC_ID_HEVC {
+        16
+    } else if codec_id == sys::AVCodecID_AV_CODEC_ID_VP9
+        || codec_id == sys::AVCodecID_AV_CODEC_ID_AV1
+    {
+        8
+    } else {
+        2
+    }
+}
+
+/// 池深下界：低于它的池在某些播放路径上必然耗尽。
+///
+/// = DXVA 基线（1 工作面 + 参考帧上限）+ 消费端常驻切片。
+#[cfg(target_os = "windows")]
+fn d3d11va_pool_floor(codec_id: sys::AVCodecID) -> i32 {
+    D3D11VA_BASE_WORK_SURFACES
+        + d3d11va_reference_surfaces(codec_id)
+        + D3D11VA_CONSUMER_HEADROOM_FRAMES
+}
+
+/// 单片的显存字节数（对齐后尺寸 × 每像素字节）。
+///
+/// D3D11VA 的 NV12 是 1.5B/px；10bit 走 P010（每样本 16bit，4:2:0）→ 3B/px。
+#[cfg(target_os = "windows")]
+fn d3d11va_slice_bytes(width: i32, height: i32, sw_format: sys::AVPixelFormat) -> usize {
+    let pixels = (width.max(1) as usize) * (height.max(1) as usize);
+    if sw_format == sys::AVPixelFormat_AV_PIX_FMT_P010LE {
+        pixels * 3
+    } else {
+        // NV12: pixels * 3 / 2。先乘后除，避免整除截断。
+        pixels * 3 / 2
+    }
+}
+
+/// 旧的固定池深，现在只作为上限使用（见 `d3d11va_pool_size` 的注释）。
+#[cfg(target_os = "windows")]
+fn d3d11va_pool_legacy_pool_size(codec_id: sys::AVCodecID) -> i32 {
     if codec_id == sys::AVCodecID_AV_CODEC_ID_H264 || codec_id == sys::AVCodecID_AV_CODEC_ID_HEVC {
         60
     } else if codec_id == sys::AVCodecID_AV_CODEC_ID_VP9
@@ -2009,6 +2187,47 @@ fn d3d11va_pool_size(codec_id: sys::AVCodecID) -> i32 {
     } else {
         10
     }
+}
+
+/// 按内存预算折算 D3D11VA 硬件帧池深度。
+///
+/// `pool = clamp(预算 / 单片字节, 下界, 旧固定值)`
+///
+/// 历史结论（保留，别删）：这个池曾经是固定值，且是**从 20 加到 60/40** 的。
+/// 当时宿主在快 CDN 源下遇到 `get_buffer failed`（表现为有声音无画面，随后宿主
+/// 换源重开、进度归零），把池从 20 加到 60/40 才稳住，因此 48 片一度被认为
+/// "减不得"。那个结论是对的，但它描述的是**当时的并发模型**，不是池深本身：
+/// 池耗尽的根因是解码器侧同时 pin 住了远超 48 片的切片，其中最大一块是
+/// FFmpeg 的**帧级多线程**。Erika 从未设置 `thread_count`，于是 FFmpeg 取默认值
+/// `FFMIN(nb_cpus + 1, MAX_AUTO_THREADS=16)`
+/// （`libavcodec/pthread_frame.c:923-930`），并设 `avctx->delay = thread_count - 1`
+/// （同文件 955），每个解码线程还会各自占用输出帧槽
+/// （`decoded_frames_get_free`，同文件 192/284）。本机 16 逻辑核时那是 16 个
+/// 线程、15 帧流水线延迟、最多 32 片在飞——叠加 DXVA 基线 17 片与消费端 10 片，
+/// 峰值正好落在 48~60 之间，这就是"48 片会崩、60 片没事"的由来。
+///
+/// 因此现在改成两件事一起做：
+/// 1. 硬解路径把 `thread_count` 收敛为 1（见 `configure_d3d11va`），把解码器
+///    内部的池需求压回 DXVA 规范基线；
+/// 2. 池深按"内存预算 / 单片字节"折算，下界由 `d3d11va_pool_floor` 保证。
+/// 只有 1 和 2 同时成立时，小于 48 的池深才是安全的；单独调小池深就是复现
+/// 当年那次崩溃。
+#[cfg(target_os = "windows")]
+fn d3d11va_pool_size(
+    codec_id: sys::AVCodecID,
+    width: i32,
+    height: i32,
+    sw_format: sys::AVPixelFormat,
+    budget_bytes: usize,
+    min_frames_override: Option<i32>,
+) -> i32 {
+    let slice_bytes = d3d11va_slice_bytes(width, height, sw_format);
+    let by_budget = (budget_bytes / slice_bytes.max(1)) as i32;
+    let floor = min_frames_override
+        .map(|value| value.max(1))
+        .unwrap_or_else(|| d3d11va_pool_floor(codec_id));
+    let legacy = d3d11va_pool_legacy_pool_size(codec_id);
+    by_budget.clamp(floor, legacy)
 }
 
 #[cfg(target_os = "windows")]
@@ -4844,6 +5063,118 @@ mod tests {
     #[test]
     fn linked_ffmpeg_reports_version() {
         assert!(!version().is_empty());
+    }
+
+    /// 池深按"预算 / 单片字节"折算，但不许击穿下界、也不许超过旧的固定值。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn d3d11va_pool_size_follows_budget_between_floor_and_legacy_ceiling() {
+        use sys::{
+            AVCodecID_AV_CODEC_ID_AV1, AVCodecID_AV_CODEC_ID_H264, AVPixelFormat_AV_PIX_FMT_NV12,
+            AVPixelFormat_AV_PIX_FMT_P010LE,
+        };
+
+        // 1080P H.264（coded 1920x1088，NV12 3.13MB/片）：64MiB 折算 21 片，
+        // 低于下界 26（1 工作面 + 16 参考帧 + 9 消费端）→ 取 26，≈81MB。
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_H264,
+                1920,
+                1088,
+                AVPixelFormat_AV_PIX_FMT_NV12,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None
+            ),
+            26
+        );
+
+        // 4K 10bit（P010 25MB/片）：预算只折算得出 2 片，仍然不能击穿下界。
+        // 这是刻意的：高分辨率省内存靠的是"不再乘 60 片"，不是靠赌参考帧数。
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_H264,
+                3840,
+                2176,
+                AVPixelFormat_AV_PIX_FMT_P010LE,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None
+            ),
+            26
+        );
+
+        // 720P（1.38MB/片）：预算折算 48 片，落在那下界与旧固定值之间 → 用预算值，
+        // 池总内存仍被 64MiB 预算框住。
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_H264,
+                1280,
+                720,
+                AVPixelFormat_AV_PIX_FMT_NV12,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None
+            ),
+            48
+        );
+
+        // VP9/AV1 的参考帧上限是 8，下界降到 18；1080P 的预算折算 21 高于下界，
+        // 所以取 21。
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_AV1,
+                1920,
+                1088,
+                AVPixelFormat_AV_PIX_FMT_NV12,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None
+            ),
+            21
+        );
+    }
+
+    /// 配置项：下界覆盖值生效，预算放大也不会超过旧的固定池深。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn d3d11va_pool_size_respects_overrides_and_legacy_ceiling() {
+        use sys::{AVCodecID_AV_CODEC_ID_H264, AVPixelFormat_AV_PIX_FMT_NV12};
+
+        // 宿主把视频帧队列调回 3 时，可以把下界显式压到 21。
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_H264,
+                1920,
+                1088,
+                AVPixelFormat_AV_PIX_FMT_NV12,
+                D3D11VA_POOL_BUDGET_BYTES,
+                Some(21)
+            ),
+            21
+        );
+
+        // 预算再大也封顶在旧固定值 60/40/10，不会因为预算富裕而多占内存。
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_H264,
+                1280,
+                720,
+                AVPixelFormat_AV_PIX_FMT_NV12,
+                1 << 40,
+                None
+            ),
+            60
+        );
+
+        // 预算小到折算为 0 片时仍然保底在下界。
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_H264,
+                1280,
+                720,
+                AVPixelFormat_AV_PIX_FMT_NV12,
+                1 << 20,
+                None
+            ),
+            26
+        );
     }
 
     #[test]

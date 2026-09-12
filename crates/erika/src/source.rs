@@ -1,8 +1,8 @@
 #[cfg(target_os = "android")]
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
@@ -743,8 +743,11 @@ struct HttpRangeResponse {
 /// 跳过桶已覆盖的区段（不重复下载）。诊断 `cache_end`/`downloaded_bytes`
 /// 并入桶进度（缓冲前沿/下载速度如实反映整片下载）。
 struct FullPreloadState {
+    /// 本桶所属的诊断槽（0 = 视频/单流，1 = 音频）。只用于诊断上报——
+    /// 落盘失败降级是必须被宿主看见的事实，而报告里得说清是哪条流。
+    slot: usize,
     stop: AtomicBool,
-    /// 桶已覆盖到的**绝对**文件偏移终点（= `inner.start` + `bytes.len()`）。
+    /// 桶已覆盖到的**绝对**文件偏移终点（= `inner.start` + 桶窗口长度）。
     /// 0 = 尚未开始。注意桶起点会前移，故区间未必从 0 起（见 `start`）。
     end: AtomicU64,
     /// 累计网络下载字节（诊断速度差分用，单调递增）。
@@ -765,6 +768,532 @@ struct FullPreloadState {
     inner: Mutex<FullPreloadInner>,
 }
 
+// ---------------------------------------------------------------------------
+// 整片预载桶的存储后端（落盘改造）
+// ---------------------------------------------------------------------------
+
+/// 整片预载桶的存储后端。
+///
+/// 语义与原来的纯内存 `Vec<u8>` **完全一致**：持有文件 `[start, start + len)`
+/// 的连续字节，读方（`copy_range`）不感知后端差异。改造动机是把这条桶的常驻
+/// 内存降到 0——实测打开一个 1080P 视频桶覆盖 39.2MB、长视频 300~400MB、上限
+/// 512MB，DASH 双流就是两份这样的常驻内存。落盘后这份数据由 OS page cache
+/// 承担（**可回收**），RSS 不再被整条流钉死，而"打开就持续缓冲直到整片下载
+/// 完毕"的弱网整片耐受一点不减。
+///
+/// `Memory` 分支保留：磁盘写失败（磁盘满 / 权限 / 杀软锁）必须能就地回退。
+/// 落盘是省内存的优化，不是可用性依赖。
+enum PreloadStore {
+    /// 全内存桶：`Vec` 即 `[start, end)` 的字节，隐含起点是 `FullPreloadInner::start`。
+    Memory(Vec<u8>),
+    /// 落盘桶（布局见 `DiskStore`）。
+    Disk(DiskStore),
+}
+
+/// 桶文件布局：
+///
+/// ```text
+/// [0, 32)   头部：magic(8) + 版本(4) + 保留(4) + data_start(8) + data_len(8)
+/// [32, ..)  数据区：文件 [data_start, data_start + data_len) 的连续字节
+/// ```
+///
+/// 物理偏移 = `DISK_HEADER_BYTES + (逻辑偏移 - data_start)`。
+///
+/// `data_start` 只在**桶整体前移**时改变（demux 预取跑赢桶，见
+/// `full_preload_step` 的前移分支）：那一步把逻辑窗口重置到 `floor`，同时把
+/// 数据区截断成零长、`data_start` 换成新起点。为什么不"只挪逻辑偏移、保留
+/// 旧物理布局"：前移的触发条件是 `floor > end`，新起点落在旧窗口终点**之后**，
+/// 沿用旧布局就会在文件里留下 `[end, floor)` 的空洞——洞里的字节永远不会被
+/// 读，却按文件长度真实占盘（NTFS 非稀疏文件照实分配），长片反复前移能把盘
+/// 吃光。截断后文件长度恒等于"当前窗口长度 + 32"。
+///
+/// 读写都在 `FullPreloadState::inner` 锁内完成：前移会重置整个物理布局，
+/// 锁外读会撞上被截断/被重写的区间而读到**错位字节**（静默数据损坏）。代价
+/// 可接受——读命中的是尾部窗口或 page cache，写只是顺序 append。
+struct DiskStore {
+    file: PreloadFile,
+    /// 数据区首字节对应的**逻辑**文件偏移（头部 `data_start` 字段）。恒等于
+    /// `FullPreloadInner::start`（由 `reset_at` 同步维护）；单独存一份是为了
+    /// 跨进程复用残留文件时能恢复出非零起点。
+    data_start: u64,
+    /// 数据区已写入字节数（头部 `data_len` 字段）。恒等于 `state.end - data_start`。
+    data_len: u64,
+    /// 尾部内存窗口：最近写入的 `PRELOAD_TAIL_WINDOW_BYTES` 字节，`tail[0]`
+    /// 相对窗口起点的偏移是 `tail_offset`。
+    ///
+    /// 存在的理由不是"再留一份内存"，而是压掉 demux 前沿的小块读放大——桶
+    /// 前沿恰恰是 demux 最常命中的位置（追赶缓冲、seek 到桶尾都落在那里），
+    /// 一次 32KB 读若撞上 page cache 未命中就是一次真实磁盘 IO，落在播放线程
+    /// 上就是几百微秒到毫秒级抖动。上限 1MiB，相对 512MB 的桶可忽略，不会
+    /// 退化成"又一份整片内存"。
+    tail: Vec<u8>,
+    tail_offset: u64,
+}
+
+/// 桶文件句柄 + 生命周期收尾。
+///
+/// 单独包一层只为 `Drop` 的顺序：Windows 上文件还开着时 `remove_file` 会以
+/// `Access is denied` 失败，必须先显式关掉句柄再删（Linux/macOS 无此约束，
+/// 但统一走一条路径更省心）。删除失败不上报——残留文件由启动清理
+/// （`sweep_stale_preload`）兜底，不在这里制造噪音。
+struct PreloadFile {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl PreloadFile {
+    /// 打开一个**已存在**的桶文件，并取得独占锁。
+    ///
+    /// 锁必须在构造守卫**之前**就拿到：守卫的 `Drop` 会删文件，若先构造再发现
+    /// 锁在别人手里，就等于替对方删掉了他正在写的桶。拿不到锁时局部 `File`
+    /// 被丢弃（只关句柄），文件原封不动。
+    fn open_existing(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        file.try_lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(Self {
+            file: Some(file),
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// 新建一个**独占**的桶文件（`create_new`：同名的另一个会话已经在写时
+    /// 直接失败，绝不共用）。
+    fn create_new(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        // 刚建出来的文件不存在竞争；锁失败只可能是极端环境问题，按失败处理。
+        file.try_lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(Self {
+            file: Some(file),
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// 关句柄并删文件（启动清理用；`Drop` 也做同一件事，但那里的失败无法上报）。
+    fn discard(mut self) -> io::Result<()> {
+        self.file.take();
+        std::fs::remove_file(&self.path)
+    }
+
+    fn file(&self) -> &File {
+        self.file.as_ref().expect("preload file already closed")
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("preload file already closed")
+    }
+}
+
+impl Drop for PreloadFile {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 桶文件头部长度（见 `DiskStore` 布局注释）。
+const DISK_HEADER_BYTES: u64 = 32;
+/// 头部魔数：判定"这个 `.part` 是不是本模块写的"。
+const DISK_MAGIC: [u8; 8] = *b"ERIKAPRE";
+/// 布局版本：改布局必须 +1（版本不符的文件直接重建，绝不复用）。
+const DISK_LAYOUT_VERSION: u32 = 1;
+/// 尾部内存窗口上限（见 `DiskStore::tail`）。
+const PRELOAD_TAIL_WINDOW_BYTES: usize = 1024 * 1024;
+/// 陈旧桶文件的保留时长（`ERIKA_PRELOAD_RETENTION_DAYS` 覆盖，默认 3 天）。
+const PRELOAD_RETENTION_DEFAULT: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+/// 桶目录总量上限：超出时按最久未动优先淘汰，直到不再超限。防的是"反复播放
+/// 把系统盘塞满"——单文件上限就是一个 `full_preload_cap()`（默认 512MB），
+/// 几十次播放就是几十 GB。
+const PRELOAD_DIR_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+impl DiskStore {
+    /// 当前窗口长度（= `data_len`）。
+    fn len(&self) -> u64 {
+        self.data_len
+    }
+
+    /// 打开（或复用）`dir` 下属于 `key` 的桶文件。
+    fn open(dir: &Path, key: u64, cap: u64) -> io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        // 首选名：可能是上一次异常退出留下的残片（`Drop` 没跑到）。能拿到独占
+        // 锁就说明没有存活的桶在用它，于是允许**复用**：把已落盘区间当作窗口
+        // [data_start, data_start + data_len)，弱网下重开同一集不必重下。
+        let primary = dir.join(format!("{key:016x}.part"));
+        if let Ok(store) = Self::open_file(&primary, cap) {
+            return Ok(store);
+        }
+        // 拿不到锁 / 建不出来：换一个进程内唯一的名字新建。"同一条流重开"只要求
+        // **不冲突**——复用是加分项，两个会话共写一个文件是必须避免的事故。
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..8 {
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(
+                "{key:016x}-{}-{sequence}.part",
+                std::process::id()
+            ));
+            if let Ok(store) = Self::open_file(&path, cap) {
+                return Ok(store);
+            }
+        }
+        Err(io::Error::other("preload: no usable bucket file name"))
+    }
+
+    fn open_file(path: &Path, cap: u64) -> io::Result<Self> {
+        // 只在**确实不存在**时才新建。其余失败（文件被别的会话锁着 / 权限 /
+        // 只读）一律原样返回、换下一个候选名——那条路径上的文件可能正被别人
+        // 写着，任何"顺手重建"都是破坏。
+        let mut file = match PreloadFile::open_existing(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                PreloadFile::create_new(path)?
+            }
+            Err(error) => return Err(error),
+        };
+        let (data_start, data_len) = Self::recover(&mut file, cap)?;
+        let mut store = Self {
+            file,
+            data_start,
+            data_len,
+            tail: Vec::new(),
+            tail_offset: 0,
+        };
+        store.write_header()?;
+        Ok(store)
+    }
+
+    /// 校验头部、恢复可复用窗口，返回 `(data_start, data_len)`。
+    ///
+    /// 所有不确定都往"少复用"一侧倒：复用错字节 = 静默播放损坏数据，比少复用
+    /// 严重得多。所以头部声明长度超过文件实际长度（写完数据还没更新头部就被
+    /// 杀）时取下界，版本不符则整个丢掉重建。
+    fn recover(file: &mut PreloadFile, cap: u64) -> io::Result<(u64, u64)> {
+        let physical = file.file().metadata()?.len();
+        let mut header = [0u8; DISK_HEADER_BYTES as usize];
+        let valid = physical >= DISK_HEADER_BYTES
+            && file.file_mut().seek(SeekFrom::Start(0)).is_ok()
+            && file.file_mut().read_exact(&mut header).is_ok()
+            && header[0..8] == DISK_MAGIC
+            && u32::from_le_bytes(header[8..12].try_into().unwrap()) == DISK_LAYOUT_VERSION;
+        if !valid {
+            file.file_mut().set_len(DISK_HEADER_BYTES)?;
+            return Ok((0, 0));
+        }
+        let data_start = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let declared = u64::from_le_bytes(header[24..32].try_into().unwrap());
+        // 只认"文件里真的躺着这么多字节"的部分，再按本次桶上限截断——cap 比
+        // 上次小（宿主换了配置）时不能沿用更大的旧窗口。
+        let len = declared
+            .min(physical - DISK_HEADER_BYTES)
+            .min(cap.saturating_sub(data_start));
+        file.file_mut().set_len(DISK_HEADER_BYTES + len)?;
+        Ok((data_start, len))
+    }
+
+    /// 写回头部。每次追加后都写一次：崩溃时最多丢一个段（256KB）的可复用区间，
+    /// 换来复用判定永远不用猜"文件里这堆字节到底算不算数"。
+    fn write_header(&mut self) -> io::Result<()> {
+        let mut header = [0u8; DISK_HEADER_BYTES as usize];
+        header[0..8].copy_from_slice(&DISK_MAGIC);
+        header[8..12].copy_from_slice(&DISK_LAYOUT_VERSION.to_le_bytes());
+        header[16..24].copy_from_slice(&self.data_start.to_le_bytes());
+        header[24..32].copy_from_slice(&self.data_len.to_le_bytes());
+        let file = self.file.file_mut();
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header)
+    }
+
+    /// 顺序追加一段与窗口尾部连续的字节，并同步尾部窗口。
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let position = DISK_HEADER_BYTES + self.data_len;
+        {
+            let file = self.file.file_mut();
+            file.seek(SeekFrom::Start(position))?;
+            // 故意不 fsync：整片预载是"看完就丢"的缓存（源 Drop 时文件即删），
+            // 落盘与否不影响正确性，而 fsync 会把 SSD 写放大的代价搬进播放线程
+            // 的写路径。写进 page cache 已经足够，回刷交给 OS。
+            file.write_all(bytes)?;
+        }
+        self.data_len += bytes.len() as u64;
+        self.push_tail(bytes);
+        self.write_header()
+    }
+
+    /// 把新写入的字节并进尾部窗口（超出上限就从最旧的一端丢）。
+    fn push_tail(&mut self, bytes: &[u8]) {
+        if self.tail.is_empty() {
+            self.tail_offset = self.data_len.saturating_sub(bytes.len() as u64);
+        }
+        self.tail.extend_from_slice(bytes);
+        if self.tail.len() > PRELOAD_TAIL_WINDOW_BYTES {
+            let excess = self.tail.len() - PRELOAD_TAIL_WINDOW_BYTES;
+            self.tail.drain(..excess);
+            self.tail_offset += excess as u64;
+        }
+    }
+
+    /// 读窗口内 `[offset, offset + length)`（`offset` 相对窗口起点）。
+    fn read(&mut self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        if let Some(hit) = self.tail_read(offset, length) {
+            return Ok(hit);
+        }
+        if offset.saturating_add(length as u64) > self.data_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "preload read beyond bucket end",
+            ));
+        }
+        let mut out = vec![0u8; length];
+        let file = self.file.file_mut();
+        file.seek(SeekFrom::Start(DISK_HEADER_BYTES + offset))?;
+        file.read_exact(&mut out)?;
+        Ok(out)
+    }
+
+    /// 尾部窗口命中判定（纯内存，不走文件）。
+    fn tail_read(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let start = usize::try_from(offset.checked_sub(self.tail_offset)?).ok()?;
+        let end = start.checked_add(length)?;
+        if end > self.tail.len() {
+            return None;
+        }
+        Some(self.tail[start..end].to_vec())
+    }
+
+    /// 窗口整体前移到 `new_start`：逻辑窗口清空 + 数据区截断（见布局注释）。
+    fn reset_at(&mut self, new_start: u64) -> io::Result<()> {
+        self.file.file_mut().set_len(DISK_HEADER_BYTES)?;
+        self.data_start = new_start;
+        self.data_len = 0;
+        self.tail.clear();
+        self.tail_offset = 0;
+        self.write_header()
+    }
+
+    /// 就地降级到内存：把已落盘窗口读回内存。`None` = 连读都失败（文件被外部
+    /// 删掉 / 句柄失效），调用方只能把窗口缩到当前位置。
+    fn into_memory(mut self) -> Option<Vec<u8>> {
+        let length = usize::try_from(self.data_len).ok()?;
+        let mut recovered = vec![0u8; length];
+        let file = self.file.file_mut();
+        let ok = file.seek(SeekFrom::Start(DISK_HEADER_BYTES)).is_ok()
+            && (length == 0 || file.read_exact(&mut recovered).is_ok());
+        ok.then_some(recovered)
+    }
+}
+
+impl PreloadStore {
+    /// 当前窗口长度（= `state.end - inner.start`）。
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Disk(disk) => disk.len(),
+        }
+    }
+
+    /// 后端自带的窗口起点（逻辑文件偏移）。只有落盘后端知道自己的起点——它
+    /// 记录在文件头部，跨进程复用残留文件时可能不是 0；内存桶的起点恒由
+    /// `FullPreloadInner::start` 决定，这里返回 `None`。
+    ///
+    /// 存在理由：复用一份"前移过"的残留文件时，`inner.start` 必须跟着文件头
+    /// 里的 `data_start` 走。两边一旦不一致，`copy_range` 算出来的窗口内偏移
+    /// 就会和 `DiskStore::read` 期待的偏移错开一个 `data_start`——读出来的是
+    /// **错位字节**，正是这条桶最不能出的错。
+    fn window_start(&self) -> Option<u64> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Disk(disk) => Some(disk.data_start),
+        }
+    }
+
+    /// 顺序追加一段与窗口尾部连续的字节。
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Memory(buffer) => {
+                buffer.extend_from_slice(bytes);
+                Ok(())
+            }
+            Self::Disk(disk) => disk.append(bytes),
+        }
+    }
+
+    /// 读窗口内 `[offset, offset + length)`，`offset` 相对**窗口起点**。
+    ///
+    /// 越界或 IO 失败一律 `Err`，调用方回退到 demux 自己的取数路径
+    /// （`copy_range` 返回 None）——**绝不能返回错位字节**。
+    fn read(&mut self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Memory(buffer) => {
+                let start = usize::try_from(offset).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "preload offset overflow")
+                })?;
+                let end = start
+                    .checked_add(length)
+                    .filter(|end| *end <= buffer.len())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "preload read beyond bucket end",
+                        )
+                    })?;
+                Ok(buffer[start..end].to_vec())
+            }
+            Self::Disk(disk) => disk.read(offset, length),
+        }
+    }
+
+    /// 窗口整体前移到 `new_start`（`[start, new_start)` 的字节作废）。
+    fn reset_at(&mut self, new_start: u64) -> io::Result<()> {
+        match self {
+            Self::Memory(buffer) => {
+                buffer.clear();
+                Ok(())
+            }
+            Self::Disk(disk) => disk.reset_at(new_start),
+        }
+    }
+}
+
+/// 桶文件目录。
+///
+/// Windows 默认 `%LOCALAPPDATA%\bili-rs\preload`：与宿主的应用数据目录约定
+/// 对齐（`storage::data_dir` / `image_cache` 同款，LOCALAPPDATA 不可用时同样
+/// 退到 `%TEMP%\bili-rs`）。不选 `%TEMP%` 作默认是因为它会被"磁盘清理"随手
+/// 删掉——被删掉的后果是整片预载白下一遍，正是这条桶要对抗的场景。
+/// `ERIKA_PRELOAD_DIR` 可整体改道（用户想把缓存放到别的盘时用）。
+fn preload_dir() -> PathBuf {
+    if let Some(dir) = env::var_os("ERIKA_PRELOAD_DIR") {
+        return PathBuf::from(dir);
+    }
+    if cfg!(target_os = "windows") {
+        let base = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir);
+        return base.join("bili-rs").join("preload");
+    }
+    if let Some(base) = env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(base).join("erika").join("preload");
+    }
+    env::temp_dir().join("erika-preload")
+}
+
+/// 桶文件名摘要：源 URI 的**稳定部分** + 流槽位。
+///
+/// 不能直接哈希整条 URI：B 站 CDN URL 带 `deadline`/`upsig` 等一次性签名，
+/// 每次播放都变，整条哈希等于每次都换新名字，"同一条流重开"永远命中不到同一个
+/// 文件。URI 里真正标识内容的是 path（含 cid 与码率 id，形如
+/// `/<...>/<cid>-1-30280.m4s`），去掉 query/fragment 后跨会话稳定。
+///
+/// 用自写的 FNV-1a 而不是 `DefaultHasher`：后者只承诺"同一进程内稳定"，
+/// 而文件名要跨进程（乃至跨 std 版本）复用。
+fn preload_key(uri: &str, slot: usize) -> u64 {
+    let stable = uri.split(['?', '#']).next().unwrap_or(uri);
+    let slot_bytes = slot.to_le_bytes();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in stable.as_bytes().iter().chain(slot_bytes.iter()) {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 是否把整片预载桶落到磁盘。默认**开**，`ERIKA_PRELOAD_TO_DISK=0` 关闭
+/// （退回全内存桶，即落盘改造前的行为）。
+fn preload_to_disk_enabled() -> bool {
+    // 与 `trace::env_flag` 同一套字面量，但默认相反（这条开关默认开）。
+    !matches!(
+        env::var("ERIKA_PRELOAD_TO_DISK").ok().as_deref(),
+        Some("0" | "false" | "FALSE" | "off" | "OFF" | "")
+    )
+}
+
+/// 陈旧桶文件的保留时长（`ERIKA_PRELOAD_RETENTION_DAYS` 覆盖，默认 3 天）。
+fn preload_retention() -> Duration {
+    env::var("ERIKA_PRELOAD_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|days| Duration::from_secs(days.saturating_mul(24 * 60 * 60)))
+        .unwrap_or(PRELOAD_RETENTION_DEFAULT)
+}
+
+/// 启动清理：删掉桶目录下**陈旧**的文件。
+///
+/// 必要性：(1) 进程被强杀（任务管理器结束进程 / 崩溃）时桶文件会留在盘上，
+/// `Drop` 跑不到，不清理就是几十~几百 MB 的永久垃圾；(2) 反复重开同一集会
+/// 因为"不冲突"策略而生成带序号的新文件。判定用 mtime：正在用的桶每写一段
+/// 就刷新一次 mtime，"很久没动过"只可能是死文件。
+///
+/// 两条淘汰路径：超龄（默认 3 天）必删；目录总量超过 `PRELOAD_DIR_LIMIT_BYTES`
+/// 时按最久未动优先删，删到不再超限为止（不做"批量清空"——多留一份没超限的
+/// 桶，就可能多省一次重下）。
+///
+/// 全程 best-effort：清理是卫生工作，任何一步失败都不影响播放。
+fn sweep_stale_preload(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut candidates: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // 只碰自己的 `.part`：目录可能被 `ERIKA_PRELOAD_DIR` 指到用户自己的
+        // 目录上，绝不能顺手删别人的文件。
+        if path.extension().and_then(|value| value.to_str()) != Some("part") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(now);
+        total = total.saturating_add(metadata.len());
+        candidates.push((path, modified, metadata.len()));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    // 旧 → 新：超限时先牺牲最久未动的。
+    candidates.sort_by_key(|(_, modified, _)| *modified);
+    let retention = preload_retention();
+    let mut remaining = total;
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for (path, modified, size) in &candidates {
+        let expired = now.duration_since(*modified).unwrap_or_default() > retention;
+        if !expired && remaining <= PRELOAD_DIR_LIMIT_BYTES {
+            break; // 后面的文件都更新，也不会再超限
+        }
+        // 活跃文件绝不删：拿不到独占锁说明另一个播放会话正用着它（超龄判定
+        // 已经足够保守，这是第二道闸）。`open_existing` 自带这个判定。
+        let Ok(file) = PreloadFile::open_existing(path) else {
+            continue;
+        };
+        if file.discard().is_ok() {
+            removed += 1;
+            freed = freed.saturating_add(*size);
+            remaining = remaining.saturating_sub(*size);
+        }
+    }
+    if removed > 0 {
+        trace::diagnostic(format!(
+            "{{\"event\":\"erika_preload_sweep\",\"dir\":\"{}\",\"removed\":{removed},\"freed\":{freed}}}",
+            json_escape(&dir.to_string_lossy()),
+        ));
+    }
+}
+
+/// 启动清理只跑一次：本进程第一次要用磁盘桶时。放在这里而不是某个 `main`——
+/// Erika 是被宿主嵌入的库，没有自己的启动点，而"第一次要用磁盘桶"就是磁盘
+/// 路径真正的启动时刻。
+static PRELOAD_SWEEP: LazyLock<()> = LazyLock::new(|| sweep_stale_preload(&preload_dir()));
+
 struct FullPreloadInner {
     /// 文件总长（由首个成功响应的 total 回填；None = 未探测到，线程等待）。
     total: Option<u64>,
@@ -772,8 +1301,54 @@ struct FullPreloadInner {
     /// `floor` 并丢弃旧字节——那些字节 demux cache 里已有一份，桶里再留
     /// 就是重复下载（纯浪费带宽）。前移后桶表示 [start, end)。
     start: u64,
-    /// 存储桶：文件 [start, end) 的连续字节。
-    bytes: Vec<u8>,
+    /// 存储桶：文件 [start, end) 的连续字节。落盘改造前这里是 `Vec<u8>`，
+    /// 现在默认是文件；`PreloadStore::Memory` 只在关闭落盘或落盘失败时启用。
+    store: PreloadStore,
+}
+
+impl FullPreloadInner {
+    /// 把一段与窗口尾部连续的字节追加进桶。
+    ///
+    /// 落盘写失败时就地**降级到内存桶**并把这批字节补进内存——磁盘满 / 权限 /
+    /// 杀软锁都不该让播放失败。返回 `Err` 表示刚刚发生过降级（只可能发生一次），
+    /// 调用方负责把这件事报出去。
+    fn append_chunk(&mut self, bytes: &[u8]) -> std::result::Result<(), String> {
+        let error = match self.store.append(bytes) {
+            Ok(()) => return Ok(()),
+            Err(error) => error.to_string(),
+        };
+        // 降级尽量完整：已落盘区间读回内存，窗口原样保留，读路径完全无感；
+        // 读不回来（文件被外部删掉）就把窗口缩到当前位置重新起步——`start = end`
+        // 时没有可服务区间，但桶继续往内存里长，后续字节照样能命中。
+        let covered_end = self.start + self.store.len();
+        let previous = std::mem::replace(&mut self.store, PreloadStore::Memory(Vec::new()));
+        self.store = match previous {
+            PreloadStore::Disk(disk) => match disk.into_memory() {
+                Some(recovered) => PreloadStore::Memory(recovered),
+                None => {
+                    self.start = covered_end;
+                    PreloadStore::Memory(Vec::new())
+                }
+            },
+            memory => memory,
+        };
+        let _ = self.store.append(bytes);
+        Err(error)
+    }
+
+    /// 桶整体前移到 `new_start`：逻辑窗口清空、起点换到 `new_start`，落盘后端
+    /// 同时截断数据区。失败不致命——调用方换成空的内存桶即可（前移本来就是要
+    /// 丢掉全部旧字节，这条路径没有任何额外数据损失）。
+    fn reset_at(&mut self, new_start: u64) -> io::Result<()> {
+        self.start = new_start;
+        self.store.reset_at(new_start)
+    }
+
+    /// 前移失败时的兜底：换成空的内存桶（见 `reset_at` 注释）。
+    fn fallback_to_memory_at(&mut self, new_start: u64) {
+        self.start = new_start;
+        self.store = PreloadStore::Memory(Vec::new());
+    }
 }
 
 /// 整片预载单步：从当前 `end` 下载一段（≤256KB）追加进桶。返回 true 表示
@@ -804,8 +1379,17 @@ fn full_preload_step(
     // 受限下的正确取舍（暂停后 demux 停止推进，桶随即接管并持续补到文件尾）。
     if floor > end {
         let mut g = state.inner.lock().expect("full preload poisoned");
-        g.bytes.clear();
-        g.start = floor;
+        // 前移要改写物理布局（落盘后端会截断数据区）。重置失败也不致命：旧
+        // 字节本来就要丢，换成空的内存桶即可，不把磁盘问题升级成播放失败。
+        if let Err(error) = g.reset_at(floor) {
+            trace::diagnostic(format!(
+                "{{\"event\":\"erika_preload_disk_reset_failed\",\"slot\":{},\"start\":{},\"error\":\"{}\"}}",
+                state.slot,
+                floor,
+                json_escape(&error.to_string()),
+            ));
+            g.fallback_to_memory_at(floor);
+        }
         drop(g);
         state.end.store(floor, Ordering::Relaxed);
         return false; // 无网络动作，下一步直接从 floor 下载
@@ -847,8 +1431,21 @@ fn full_preload_step(
             if state.end.load(Ordering::Relaxed) != end || g.start != start {
                 return false;
             }
-            g.bytes.extend_from_slice(&response.bytes);
+            // 落盘写失败（磁盘满/权限/杀软锁）已就地降级到内存桶：慢一拍，
+            // 但内存桶照样把这段字节收下，播放不受影响。
+            let degraded = g.append_chunk(&response.bytes).err();
             drop(g);
+            if let Some(reason) = degraded {
+                // diag 是无条件通道（不受 trace 开关影响）：宿主必须知道这条流
+                // 已经退回"整片常驻内存"了——这正是本次改造要消灭的形态。
+                trace::diagnostic(format!(
+                    "{{\"event\":\"erika_preload_disk_fallback\",\"slot\":{},\"start\":{},\"length\":{},\"error\":\"{}\"}}",
+                    state.slot,
+                    start,
+                    n,
+                    json_escape(&reason),
+                ));
+            }
             state.end.fetch_add(n, Ordering::Relaxed);
             // 注意：`state.downloaded` 已由 `fetch_http_range` 的分块读循环实时
             // 累加（含本段被完整性守卫丢弃的情形——字节确实到过线路上，计入
@@ -956,20 +1553,71 @@ fn now_epoch_ms() -> u64 {
 }
 
 impl FullPreloadState {
-    /// 构造一份新的预载状态（桶空、总长未知）。调用方随后用 `enable_full_preload`
-    /// 启动后台下载线程；线程第一个成功响应将回填 `total`。
+    /// 构造一份新的**全内存**桶预载状态（桶空、总长未知）。测试与
+    /// `ERIKA_PRELOAD_TO_DISK=0` 的对照路径用它；生产路径走 `open`（默认落盘）。
+    #[cfg(test)]
     fn new() -> Arc<Self> {
+        Self::build(
+            0,
+            FullPreloadInner {
+                total: None,
+                start: 0,
+                store: PreloadStore::Memory(Vec::new()),
+            },
+        )
+    }
+
+    /// 构造预载状态：默认把整片预载桶落到磁盘（`ERIKA_PRELOAD_TO_DISK=0` 关闭）。
+    ///
+    /// 落盘的任何失败（目录建不出来 / 权限 / 磁盘满）都只是**退回内存桶**并
+    /// 上报一条 diag——整片预载本身照常工作，宿主行为与落盘改造前完全一致。
+    /// 落盘是省内存的优化，不该有能力把播放变成"开不了"。
+    ///
+    /// `dir` 由调用方传入（而不是内部读 `preload_dir()`）：既让生产路径只有
+    /// 一处目录来源，也让测试能指到自己的临时目录、走完整的"复用残留文件"
+    /// 链路——这条链路决定了桶里每个字节的**逻辑偏移**，必须端到端测。
+    fn open(uri: &str, slot: usize, cap: u64, dir: &Path) -> Arc<Self> {
+        let store = if preload_to_disk_enabled() {
+            // 启动清理随第一次落盘建桶一起跑（只跑一次）。
+            LazyLock::force(&PRELOAD_SWEEP);
+            match DiskStore::open(dir, preload_key(uri, slot), cap) {
+                Ok(disk) => PreloadStore::Disk(disk),
+                Err(error) => {
+                    trace::diagnostic(format!(
+                        "{{\"event\":\"erika_preload_disk_unavailable\",\"slot\":{slot},\"dir\":\"{}\",\"error\":\"{}\"}}",
+                        json_escape(&dir.to_string_lossy()),
+                        json_escape(&error.to_string()),
+                    ));
+                    PreloadStore::Memory(Vec::new())
+                }
+            }
+        } else {
+            PreloadStore::Memory(Vec::new())
+        };
+        Self::build(
+            slot,
+            FullPreloadInner {
+                total: None,
+                // 复用残留文件时窗口起点可能非 0（那份文件上次前移过），必须
+                // 跟着文件头走，见 `PreloadStore::window_start`。
+                start: store.window_start().unwrap_or(0),
+                store,
+            },
+        )
+    }
+
+    fn build(slot: usize, inner: FullPreloadInner) -> Arc<Self> {
+        // 复用残留文件时窗口可能非空：`end` 必须从窗口终点起步，否则
+        // `covered_until` 会谎报 0，桶会把已经躺在盘上的字节重下一遍。
+        let covered = inner.start + inner.store.len();
         Arc::new(Self {
+            slot,
             stop: AtomicBool::new(false),
-            end: AtomicU64::new(0),
+            end: AtomicU64::new(covered),
             downloaded: Arc::new(AtomicU64::new(0)),
             floor: AtomicU64::new(0),
             last_demux_read_ms: AtomicU64::new(0),
-            inner: Mutex::new(FullPreloadInner {
-                total: None,
-                start: 0,
-                bytes: Vec::new(),
-            }),
+            inner: Mutex::new(inner),
         })
     }
 
@@ -1070,7 +1718,11 @@ impl FullPreloadState {
     /// 复制 [offset, offset+length) 字节出桶。调用方必须先 `covers()` 返回 true。
     /// 绝对偏移需减去桶起点 `start` 才是桶内下标。
     fn copy_range(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
-        let g = self.inner.lock().ok()?;
+        // 读全程持锁（**含磁盘读**）：前移会重置落盘后端的物理布局，锁外读会
+        // 撞上被截断/被重写的区间而读到错位字节——静默数据损坏比"这次回退到
+        // demux 自己的路径"严重得多。锁内代价可忽略：命中尾部窗口是纯内存拷贝，
+        // 其余也基本落在 page cache 上。
+        let mut g = self.inner.lock().ok()?;
         if g.total.is_none() {
             return None;
         }
@@ -1078,10 +1730,12 @@ impl FullPreloadState {
         // 绝对 → 桶内相对偏移（checked_sub 覆盖 offset < start 的情况）
         let rel_start = offset.checked_sub(g.start)?;
         let rel_end = end.checked_sub(g.start)?;
-        if rel_end as usize > g.bytes.len() {
+        if rel_end > g.store.len() {
             return None;
         }
-        Some(g.bytes[rel_start as usize..rel_end as usize].to_vec())
+        // 读失败（越界 / IO 错）一律 None：调用方会回退到 demux 自己的缓存与
+        // 网络路径，绝不把半截或错位的字节交出去。
+        g.store.read(rel_start, (rel_end - rel_start) as usize).ok()
     }
 }
 
@@ -1259,19 +1913,6 @@ impl HttpRangeSource {
         }
     }
 
-    /// 启用后台整片预载。新建 `FullPreloadState`、记录预载上限（环境变量
-    /// `ERIKA_FULL_PRELOAD_CAP`，默认 512MB），把状态 `Arc` 注入自身，再用
-    /// `std::thread::spawn` 启动独立下载线程。线程是 `Fn` 循环（不在 demux
-    /// 与 runtime 上、也不在 UI 线程上），顺序按 `full_preload_step` 推进桶：
-    /// 自然被 `core::time` 与 OS 调度器带，独立于 demux 队列——demux 暂停
-    /// 或队列已满都不影响下载继续。失败由线程自身退避重试（瞬时网络抖动
-    /// 在此消化）。返回 `self` 便于链式调用
-    ///
-    /// ```ignore
-    /// HttpRangeSource::with_http_headers_and_diag_slot(uri, hdr, slot)
-    ///     .enable_full_preload()
-    /// ```
-    ///
     /// 注入多 host 候选（按快→慢排序的 `(uri, score)`）。必须在
     /// `enable_full_preload` 之前调用，使桶线程捕获到含候选的共享 uri 引用。
     /// 空列表 = 单源模式（沿用旧行为）。注入后立即把活跃 uri 切到最优候选
@@ -1384,9 +2025,31 @@ impl HttpRangeSource {
         }
     }
 
+    /// 启用后台整片预载。新建 `FullPreloadState`、记录预载上限（环境变量
+    /// **`ERIKA_HTTP_FULLPRELOAD_MAX_BYTES`**，默认 512MB），把状态 `Arc` 注入
+    /// 自身，再用 `std::thread::spawn` 启动独立下载线程。线程是 `Fn` 循环（不在
+    /// demux 与 runtime 上、也不在 UI 线程上），顺序按 `full_preload_step` 推进
+    /// 桶：自然被 `core::time` 与 OS 调度器带，独立于 demux 队列——demux 暂停
+    /// 或队列已满都不影响下载继续。失败由线程自身退避重试（瞬时网络抖动
+    /// 在此消化）。返回 `self` 便于链式调用。
+    ///
+    /// 桶的存储后端默认**落盘**（`%LOCALAPPDATA%\bili-rs\preload\<摘要>.part`，
+    /// 见 `DiskStore`），使这条"整片预载"不再把 300~512MB 常驻内存；落盘不可用
+    /// 或写失败时自动退回内存桶。`ERIKA_PRELOAD_TO_DISK=0` 可整体关掉落盘。
+    ///
+    /// 注意：历史注释里出现过的 `ERIKA_FULL_PRELOAD_CAP` **从来不存在**——代码
+    /// 只读 `ERIKA_HTTP_FULLPRELOAD_MAX_BYTES`，设前者唯一的效果是"设了个寂寞"
+    /// （这条订正于落盘改造，原文的错误注释误导过一次排查）。要调上限请用后者。
+    ///
+    /// ```ignore
+    /// HttpRangeSource::with_http_headers_and_diag_slot(uri, hdr, slot)
+    ///     .enable_full_preload()
+    /// ```
+    ///
     /// 主调用方 `source_from_uri_with_hint_and_headers` / `source_from_auto_uri_with_slot`
     /// 在 VOD 路径自动启用；直播与本地文件不调本方法。Drop 时由
-    /// `Drop for HttpRangeSource` 调 `stop.store(true, Relaxed)` 并 join 线程。
+    /// `Drop for HttpRangeSource` 调 `stop.store(true, Relaxed)` 并 detach 线程
+    /// （线程在 stop 后自退，桶文件随最后一个 `Arc` 释放而删除）。
     pub fn enable_full_preload(mut self) -> Self {
         // 已经启用过则幂等跳过——避免上游多次构造/换源场景下重复启动。
         if self.full_preload.is_some() || self.preload_thread.is_some() {
@@ -1400,7 +2063,10 @@ impl HttpRangeSource {
             return self;
         }
         let cap = full_preload_cap();
-        let state = FullPreloadState::new();
+        // 文件名摘要在 `set_candidates` 之后算：那时 `uri` 已经切到最优候选，
+        // 桶线程捕获的也是同一份。摘要只取 URI 的稳定部分，换 CDN 不影响复用。
+        let uri = self.uri.lock().expect("uri poisoned").clone();
+        let state = FullPreloadState::open(&uri, self.diag_slot, cap, &preload_dir());
         // 桶的计数器和源共用同一套「实时已收」语义：桶下载期间（尤其暂停后
         // 桶接管全速补片的阶段）宿主读到非零供给速度，而不是"暂停=0 速度"。
         if let Ok(mut counters) = SOURCE_RX.lock() {
@@ -1424,7 +2090,7 @@ impl HttpRangeSource {
             // 普通视频桶：播放中向 demux 让路、不报音频优先。
             (false, false, true)
         };
-        let uri = self.uri.clone(); // Arc<Mutex<String>>：换 host 时桶线程自动跟随
+        let shared_uri = self.uri.clone(); // Arc<Mutex<String>>：换 host 时桶线程自动跟随
         let headers = self.http_headers.clone();
         let agent = self.agent.clone();
         let handle = std::thread::Builder::new()
@@ -1432,7 +2098,7 @@ impl HttpRangeSource {
             .spawn(move || {
                 full_preload_loop(
                     &agent,
-                    uri,
+                    shared_uri,
                     &headers,
                     &state,
                     cap,
@@ -4477,5 +5143,261 @@ mod tests {
         state.mark_demux_read();
         // demux 活跃（播放中）→ 桶让路，无在飞
         assert_eq!(state.in_flight_segments(), 0);
+    }
+
+    /// 落盘桶测试用的独立目录（按名字分，跑完清掉）。不引 `tempfile`：仓库
+    /// 没有这个依赖，为几条测试拉一个新 crate 不值当。
+    fn preload_test_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "erika-preload-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn preload_disk_bucket_round_trips_and_shifts_offsets() {
+        let dir = preload_test_dir("round-trip");
+        let mut store = DiskStore::open(&dir, 0xabc, 64 * 1024 * 1024).unwrap();
+        store.append(&[1u8; 256 * 1024]).unwrap();
+        store.append(&[2u8; 256 * 1024]).unwrap();
+        assert_eq!(store.len(), 512 * 1024);
+        // 尾部窗口内（第二段）纯内存命中，窗口外（第一段）走文件读：同一份
+        // 绝对偏移从两条路径读出来必须完全一致，否则 demux 会拿到错位字节。
+        assert_eq!(store.read(0, 8).unwrap(), vec![1u8; 8]);
+        assert_eq!(store.read(256 * 1024, 8).unwrap(), vec![2u8; 8]);
+        assert_eq!(store.read(512 * 1024 - 4, 4).unwrap(), vec![2u8; 4]);
+
+        // 前移：窗口清空、起点换到 1MB，且文件里**不能**留下 [512KB, 1MB) 的
+        // 空洞——非稀疏文件会照实占盘，长片反复前移能把盘吃光。
+        store.reset_at(1024 * 1024).unwrap();
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.data_start, 1024 * 1024);
+        assert_eq!(
+            std::fs::metadata(&store.file.path).unwrap().len(),
+            DISK_HEADER_BYTES
+        );
+        store.append(&[3u8; 64]).unwrap();
+        assert_eq!(store.read(0, 64).unwrap(), vec![3u8; 64]);
+        // 越界读必须报错（调用方回退 demux 路径），绝不能返回错位的字节。
+        assert!(store.read(64, 1).is_err());
+
+        let path = store.file.path.clone();
+        drop(store);
+        // Drop 负责删文件：桶是"看完就丢"的缓存，不该把用户盘当垃圾场。
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 造一份"上次异常退出留下的桶文件"：合法头部 + 数据区。
+    fn write_preload_fixture(path: &Path, data_start: u64, data: &[u8]) {
+        let mut header = [0u8; DISK_HEADER_BYTES as usize];
+        header[0..8].copy_from_slice(&DISK_MAGIC);
+        header[8..12].copy_from_slice(&DISK_LAYOUT_VERSION.to_le_bytes());
+        header[16..24].copy_from_slice(&data_start.to_le_bytes());
+        header[24..32].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        let mut file = File::create(path).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(data).unwrap();
+    }
+
+    #[test]
+    fn preload_disk_bucket_recovers_leftover_file() {
+        let dir = preload_test_dir("recover");
+        // 上次异常退出（Drop 没跑到）留下的桶：合法头部 + 数据区。
+        let path = dir.join(format!("{:016x}.part", 0x1234));
+        write_preload_fixture(&path, 0, &[9u8; 4096]);
+        let mut store = DiskStore::open(&dir, 0x1234, 64 * 1024 * 1024).unwrap();
+        assert_eq!(store.len(), 4096, "残留文件的窗口必须被恢复（弱网重开省流量）");
+        assert_eq!(store.data_start, 0);
+        assert_eq!(store.read(0, 4).unwrap(), vec![9u8; 4]);
+
+        // 头部声明超过文件实际长度（写完数据、还没更新头部就被杀）→ 只认文件
+        // 里真的躺着的那部分：宁可少复用，也不能复用出错位数据。
+        let truncated = dir.join(format!("{:016x}.part", 0x4321));
+        {
+            let mut header = [0u8; DISK_HEADER_BYTES as usize];
+            header[0..8].copy_from_slice(&DISK_MAGIC);
+            header[8..12].copy_from_slice(&DISK_LAYOUT_VERSION.to_le_bytes());
+            header[24..32].copy_from_slice(&(1024u64 * 1024).to_le_bytes());
+            let mut file = File::create(&truncated).unwrap();
+            file.write_all(&header).unwrap();
+            file.write_all(&[5u8; 128]).unwrap();
+        }
+        let store = DiskStore::open(&dir, 0x4321, 64 * 1024 * 1024).unwrap();
+        assert_eq!(store.len(), 128);
+
+        // 不是本模块写的文件（版本不符 / 垃圾）→ 整个丢掉重建，绝不猜。
+        let junk = dir.join(format!("{:016x}.part", 0x77));
+        std::fs::write(&junk, b"not a preload bucket at all, just noise").unwrap();
+        let store = DiskStore::open(&dir, 0x77, 64 * 1024 * 1024).unwrap();
+        assert_eq!(store.len(), 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preload_state_adopts_reused_window_start() {
+        let dir = preload_test_dir("adopt-start");
+        let uri = "https://example.invalid/upgcxcode/1/2/3/4000000000002-1-30077.m4s?deadline=1";
+        // 造一份"上次前移过"的残留桶：数据区对应逻辑 [512KB, 512KB + 4096)。
+        let path = dir.join(format!("{:016x}.part", preload_key(uri, 0)));
+        write_preload_fixture(&path, 512 * 1024, &[4u8; 4096]);
+
+        let state = FullPreloadState::open(uri, 0, 64 * 1024 * 1024, &dir);
+        assert_eq!(
+            state.covered_until(),
+            512 * 1024 + 4096,
+            "复用窗口必须计入已覆盖前沿（否则桶会把盘上已有的字节重下一遍）"
+        );
+        assert_eq!(state.inner.lock().unwrap().start, 512 * 1024);
+        // 总长要等第一个响应回填；那边之前桶只用于读，未探测到 total 时不可命中。
+        state.inner.lock().unwrap().total = Some(2 * 1024 * 1024);
+        assert_eq!(
+            state.copy_range(512 * 1024, 4096).unwrap(),
+            vec![4u8; 4096],
+            "复用的字节必须按它自己的绝对偏移读出来，错开一个 data_start 就是错位数据"
+        );
+        assert!(!state.covers(0, 16), "窗口起点之前的地址不在桶覆盖范围内");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preload_disk_bucket_never_touches_a_locked_bucket() {
+        let dir = preload_test_dir("locked");
+        let path = dir.join(format!("{:016x}.part", 0x888));
+        let mut held = DiskStore::open(&dir, 0x888, 64 * 1024 * 1024).unwrap();
+        held.append(&[1u8; 64]).unwrap();
+
+        // 同一摘要的第二次打开：拿不到独占锁，必须换名字新建。**绝不能**把
+        // 第一个会话正在写的文件删掉——那是别人的播放数据。
+        let second = DiskStore::open(&dir, 0x888, 64 * 1024 * 1024).unwrap();
+        assert_ne!(second.file.path, held.file.path);
+        assert_eq!(second.len(), 0);
+        assert_eq!(held.len(), 64);
+        assert!(path.exists(), "正在使用的桶文件不能被动到");
+        drop(second);
+        assert!(path.exists(), "关掉第二个会话也不能带走第一个的文件");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preload_write_failure_degrades_to_memory_bucket() {
+        let dir = preload_test_dir("degrade");
+        let path = dir.join("readonly.part");
+        std::fs::write(&path, [0u8; DISK_HEADER_BYTES as usize]).unwrap();
+        // 用**只读**句柄构造落盘后端：之后任何 append 都必然拿到 IO 错误，
+        // 与磁盘满 / 权限不足 / 杀软锁同一类，且不依赖测试机的磁盘状态。
+        let disk = DiskStore {
+            file: PreloadFile {
+                file: Some(File::open(&path).unwrap()),
+                path: path.clone(),
+            },
+            data_start: 0,
+            data_len: 0,
+            tail: Vec::new(),
+            tail_offset: 0,
+        };
+        let mut inner = FullPreloadInner {
+            total: None,
+            start: 0,
+            store: PreloadStore::Disk(disk),
+        };
+        let error = inner.append_chunk(b"first-chunk").unwrap_err();
+        assert!(!error.is_empty());
+        // 硬要求：落盘写失败只能降级成内存桶，绝不能把播放变成"失败"。
+        assert!(
+            matches!(inner.store, PreloadStore::Memory(_)),
+            "写失败必须退回内存桶"
+        );
+        // 降级后窗口仍然连续：这批字节必须完整落进内存桶，一个都不能丢。
+        assert_eq!(inner.store.len(), 11);
+        assert_eq!(inner.store.read(0, 11).unwrap(), b"first-chunk".to_vec());
+        // 后续追加照常（内存桶不会再失败），桶继续往前长。
+        assert!(inner.append_chunk(b"-more").is_ok());
+        assert_eq!(inner.store.read(11, 5).unwrap(), b"-more".to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preload_sweep_keeps_fresh_and_unrelated_files() {
+        let dir = preload_test_dir("sweep");
+        let live = dir.join(format!("{:016x}.part", 0xaaa));
+        write_preload_fixture(&live, 0, &[1u8; 64]);
+        std::fs::write(dir.join("keep-me.txt"), b"not ours").unwrap();
+        let held = DiskStore::open(&dir, 0xaaa, 64 * 1024 * 1024).unwrap();
+        assert_eq!(held.len(), 64);
+
+        // 清理是"卫生工作"，最要紧的不是删得干净，而是**绝不误伤**：正在用的
+        // 桶（拿不到独占锁）和非本模块的文件都必须原封不动。
+        sweep_stale_preload(&dir);
+        assert!(live.exists(), "正在使用的桶不能被清理");
+        assert!(
+            dir.join("keep-me.txt").exists(),
+            "`.part` 之外的任何文件都不能碰"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preload_key_ignores_one_time_url_signature() {
+        // 同一条流的两次播放签名不同（B 站 URL 的 deadline/upsig 每次都变），
+        // 摘要必须一致——否则"重开同一集"永远命不中自己上次的文件。
+        let first = "https://cn-gotcha.bilivideo.com/upgcxcode/1/2/3/4000000000000-1-30280.m4s?deadline=111&upsig=aaa";
+        let second = "https://cn-gotcha.bilivideo.com/upgcxcode/1/2/3/4000000000000-1-30280.m4s?deadline=999&upsig=zzz";
+        assert_eq!(preload_key(first, 1), preload_key(second, 1));
+        // 不同流绝不能撞名——撞名就是两个会话共写一个文件，字节必然错位。
+        assert_ne!(preload_key(first, 1), preload_key(second, 0));
+        let other = "https://cn-gotcha.bilivideo.com/upgcxcode/1/2/3/4000000000001-1-30077.m4s?deadline=1";
+        assert_ne!(preload_key(first, 1), preload_key(other, 1));
+    }
+
+    #[test]
+    fn full_preload_step_keeps_disk_bucket_offsets() {
+        // 与 `full_preload_skips_ranges_already_covered_by_demux` 同构，但后端
+        // 换成文件：下载 + 按**绝对**偏移读回必须与内存桶完全一致（落盘是纯
+        // 存储替换，对上层不可见）。
+        let dir = preload_test_dir("step");
+        let body = vec![7u8; 256 * 1024];
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(512 * 1024, 1024 * 1024, &body),
+        )]);
+        let disk = DiskStore::open(&dir, 0x99, 1024 * 1024).unwrap();
+        let state = FullPreloadState::new();
+        *state.inner.lock().unwrap() = FullPreloadInner {
+            total: Some(1024 * 1024),
+            // 与 `set_floor` 一致：模拟 demux 已跑赢、桶刚刚前移过
+            start: 512 * 1024,
+            store: PreloadStore::Disk(disk),
+        };
+        state.end.store(512 * 1024, Ordering::Relaxed);
+
+        assert!(!full_preload_step(
+            &state,
+            &http_agent(),
+            &uri,
+            &[],
+            1024 * 1024
+        ));
+        let head = recv_request_head(&requests);
+        assert!(
+            head.contains("range: bytes=524288-"),
+            "应从桶当前前沿 512KB 起下载，实际请求头: {head}"
+        );
+        assert_eq!(state.covered_until(), 512 * 1024 + 256 * 1024);
+        assert_eq!(
+            state.copy_range(512 * 1024, 256 * 1024).unwrap(),
+            body,
+            "落盘桶按绝对偏移读回的字节必须与刚下载的一致"
+        );
+        // 桶起点之前的地址不在窗口内，绝不能"命中"（前移丢掉的字节没有第二份）。
+        assert!(!state.covers(0, 1024));
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
