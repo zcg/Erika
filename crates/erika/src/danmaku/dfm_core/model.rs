@@ -156,6 +156,18 @@ pub struct DanmakuItem {
     pub priority: u8,
     pub alpha: u8,
 
+    // -- 发送者元数据 --
+    //
+    // 只服务于屏蔽规则（`danmaku::rules`），不参与布局与绘制。三个字段都允许为
+    // “未知”：B 站点播 XML 只提供 `user_hash`（填进 `user_id`），用户名与等级
+    // 要到直播/录播姬来源才有。空串/0 表示未知，规则引擎据此跳过对应判定。
+    /// 发送者标识：B 站 XML 的 `user_hash`，或录播姬 XML 的 uid。
+    pub user_id: String,
+    /// 发送者用户名。
+    pub user_name: String,
+    /// 发送者等级；0 = 未知。
+    pub user_level: u32,
+
     // -- Duration --
     pub duration_ms: i64,
 
@@ -205,6 +217,9 @@ impl DanmakuItem {
             index: 0,
             priority: 0,
             alpha: 255,
+            user_id: String::new(),
+            user_name: String::new(),
+            user_level: 0,
             duration_ms,
             paint_width: -1.0,
             paint_height: -1.0,

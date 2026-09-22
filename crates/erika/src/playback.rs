@@ -217,11 +217,49 @@ impl PlaybackPumpDemand {
     }
 }
 
+/// demux 线程与播放线程之间共享的源读取读数。
+///
+/// 存在的理由：`Demuxer` 被 demux 线程独占，播放线程问不到它"seek 之后从源读
+/// 了多少字节"，于是 `video_seek_preroll` 只能报耗时和丢帧数——真机那 5.1 秒
+/// 究竟是**等字节**还是**解码慢**无法区分。这里把 AVIO 的累计读取量发布成
+/// 跨线程读数，`finish_video_seek_preroll` 用差分报出"本次预滚新增读取量"。
+/// 判据：`新增读取量 ÷ 预滚耗时` 若接近链路速率（真机 `[net] V: speed=` 那条），
+/// 预滚就是在等字节；若远低于它，差额才是解码/调度。
+///
+/// 该结论在 `tests/seek_preroll_diag.rs` 已闭环：真机样本限速 320KB/s 时
+/// `986857B ÷ 320KB/s = 3.01s`，实测预滚 3010ms 逐位吻合。
+#[derive(Default)]
+struct DemuxIoCounters {
+    /// 各输入自创建起从源消费的字节总量；下标同 `Demuxer` 的输入顺序
+    /// （DASH 双流下 0=video、1=audio）。本地路径无自定义 AVIO → 恒 0。
+    input_bytes: [std::sync::atomic::AtomicU64; 2],
+}
+
+impl DemuxIoCounters {
+    fn publish(&self, demuxer: &Demuxer) {
+        for (index, bytes) in demuxer.input_bytes_read().into_iter().enumerate() {
+            if let (Some(bytes), Some(slot)) = (bytes, self.input_bytes.get(index)) {
+                slot.store(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> [u64; 2] {
+        [
+            self.input_bytes[0].load(std::sync::atomic::Ordering::Relaxed),
+            self.input_bytes[1].load(std::sync::atomic::Ordering::Relaxed),
+        ]
+    }
+}
+
 struct AsyncDemuxer {
     packets: Receiver<DemuxMessage>,
     commands: Sender<DemuxCommand>,
     generation: u64,
     active: bool,
+    /// demux 线程独占 `Demuxer`，播放线程要读的源读取字节数只能经这里拿到
+    /// （见 [`DemuxIoCounters`]）。
+    io: Arc<DemuxIoCounters>,
     /// demux 线程句柄。宿主销毁播放器时若只 send Stop 不 join，线程被 detach：
     /// 旧播放器已释放、demux 线程却仍在 `read_packet`（FFmpeg `av_read_frame` →
     /// AVIO 回调 → `CustomAvio::read_packet` 的 `copy_nonoverlapping`）里拷贝数据，
@@ -235,17 +273,27 @@ impl AsyncDemuxer {
     fn spawn(demuxer: Demuxer) -> Self {
         let (packet_sender, packets) = bounded(demux_packet_queue_limit());
         let (commands, command_receiver) = unbounded();
+        let io = Arc::new(DemuxIoCounters::default());
         let handle = thread::Builder::new()
             .name("erika-demux".to_string())
-            .spawn(move || run_demux_worker(demuxer, packet_sender, command_receiver))
+            .spawn({
+                let io = Arc::clone(&io);
+                move || run_demux_worker(demuxer, packet_sender, command_receiver, io)
+            })
             .expect("spawn erika demux worker");
         Self {
             packets,
             commands,
             generation: 1,
             active: false,
+            io,
             handle: Some(handle),
         }
+    }
+
+    /// 各输入累计从源消费的字节数（`[video, audio]`，见 [`DemuxIoCounters`]）。
+    fn io_bytes(&self) -> [u64; 2] {
+        self.io.snapshot()
     }
 
     fn start(&mut self) -> Result<()> {
@@ -321,6 +369,7 @@ impl AsyncDemuxer {
 
 impl Drop for AsyncDemuxer {
     fn drop(&mut self) {
+        let teardown_started = std::time::Instant::now();
         let _ = self.commands.send(DemuxCommand::Stop);
         // 有限超时 join：demux 线程正常在收到 Stop 后快速退出（<100ms），
         // 确保 demuxer（含 FFmpeg AVIO 上下文与源）在 AsyncDemuxer 释放前完全
@@ -333,7 +382,20 @@ impl Drop for AsyncDemuxer {
                 let _ = handle.join();
                 let _ = done_tx.send(());
             });
-            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+            let joined = done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            // 打点：`joined=false` 就是"demux 线程 2s 内没退、已 detach"。
+            // 这条是判断"关窗卡顿到底卡在 demux 线程还是别处"的直接依据。
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "playback_engine_teardown",
+                    "stage": "demux_drop",
+                    "joined": joined,
+                    "elapsedMs": teardown_started.elapsed().as_secs_f64() * 1000.0,
+                })
+                .to_string(),
+            );
         }
     }
 }
@@ -342,12 +404,18 @@ fn run_demux_worker(
     mut demuxer: Demuxer,
     packets: Sender<DemuxMessage>,
     commands: Receiver<DemuxCommand>,
+    io: Arc<DemuxIoCounters>,
 ) {
     let mut generation = 1u64;
     let mut eof = false;
     let mut active = false;
     let mut pending_seek = None;
     loop {
+        // 每轮先发布：上一轮的 `demuxer.seek()`（在 `handle_demux_command` 里
+        // 真正执行）与 read_packet 的读取量都要让播放线程看得到——预滚的读数
+        // 必须在"首个目标帧解出"之前就已发布，否则差分口径会漏掉 seek 本身的
+        // 读取量。
+        io.publish(&demuxer);
         while let Ok(command) = commands.try_recv() {
             if !handle_demux_command(
                 &mut demuxer,
@@ -422,6 +490,9 @@ fn run_demux_worker(
                 }
             }
         };
+        // 读后立即发布：播放线程在预滚里等的正是这一步的结果，读数滞后一个
+        // 循环会让"预滚期间新增读取量"少算最后一块。
+        io.publish(&demuxer);
         if !send_demux_message(
             &mut demuxer,
             &packets,
@@ -434,6 +505,7 @@ fn run_demux_worker(
         ) {
             return;
         }
+        io.publish(&demuxer);
     }
 }
 
@@ -609,15 +681,21 @@ pub enum VideoDecodePreference {
 }
 
 impl VideoDecodePreference {
-    fn decoder_config(self) -> DecoderConfig {
-        match self {
+    /// `video_frame_queue_capacity`：调用方 handoff 队列的实际容量。硬解池下界
+    /// 里的消费端预留按它算（见 `ffmpeg::d3d11va_pool_floor`），所以队列容量
+    /// 与池深来自同一个数字，不会出现"队列调大、池没跟上"的 `get_buffer failed`。
+    fn decoder_config(self, video_frame_queue_capacity: usize) -> DecoderConfig {
+        let mut config = match self {
             Self::Software => DecoderConfig::software(),
             Self::VideoToolbox => DecoderConfig::videotoolbox(),
             Self::D3d11va => DecoderConfig::d3d11va(),
             Self::MediaCodec => DecoderConfig::mediacodec(),
             Self::MediaCodecByteBuffer => DecoderConfig::mediacodec_byte_buffer(),
             Self::AvCodec => DecoderConfig::avcodec(),
-        }
+        };
+        config.d3d11va_consumer_queue_frames =
+            video_frame_queue_capacity.clamp(1, i32::MAX as usize) as i32;
+        config
     }
 }
 
@@ -718,6 +796,32 @@ impl OpenedMediaInfo {
             subtitle: self.selected_subtitle_track,
         }
     }
+}
+
+/// 最近一次 `open` 的分阶段读数（进程级槽；写入点见
+/// `open_with_decoder_resources` 内的说明）。
+static LAST_OPEN_STAGES: std::sync::Mutex<Vec<crate::ffmpeg::OpenStageTiming>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// 上面的槽被写入过多少次。宿主在**提交 open 之前**记下当前值，之后只有
+/// 序号变大才能确信读到的是**本次** open 的读数——否则 `play()` 在 open
+/// 排队期间被调用时会打印上一次开播的分段，看起来像"这次的数据"。
+static OPEN_STAGES_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 取 `(写入序号, 最近一次 open 的分阶段读数)`；尚未 open 过时为 `(0, 空)`。
+///
+/// 元素是**累计口径**：`video_bytes` / `audio_bytes` 为该阶段结束时两条输入
+/// 各自从源消费的字节总量，相邻两行的差即该阶段新增读取量。`elapsed_ms` 是
+/// 真实墙钟耗时——网络路径下它包含"等字节到达"，因此它能直接回答「这几秒
+/// 花在哪一段」。并行 open 后两条流的 `elapsed_ms` 会重叠，
+/// `dash_open_total` 才是整体墙钟。
+pub fn last_open_stages() -> (u64, Vec<crate::ffmpeg::OpenStageTiming>) {
+    let seq = OPEN_STAGES_SEQ.load(std::sync::atomic::Ordering::Acquire);
+    let stages = LAST_OPEN_STAGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    (seq, stages)
 }
 
 struct DecodedVideoFrame {
@@ -875,6 +979,18 @@ unsafe impl Send for PlaybackSession {}
 
 impl Drop for PlaybackSession {
     fn drop(&mut self) {
+        // **进入点先打一行**：下面的 `session_drop` 队列统计是在
+        // `discard_queued_frames_and_packets()` **之后**才写的，一旦卡在那一步，
+        // 日志里就一行都没有 —— 无法区分"根本没走到这里"和"卡在里面"。实测
+        // 2026-09-14 22:07 的 `AppHangB1` 正是这种情况：最后一行停在
+        // `drop_before_decoder`，之后 22 秒无输出、进程被 Windows 终止。
+        trace::diagnostic(
+            serde_json::json!({
+                "event": "playback_engine_teardown",
+                "stage": "session_drop_begin",
+            })
+            .to_string(),
+        );
         // MediaCodec Surface frames keep an AVBuffer release callback that
         // calls back into the decoder's MediaCodec context. Release every
         // queued frame while video_decoder is still alive; Rust otherwise
@@ -887,13 +1003,28 @@ impl Drop for PlaybackSession {
 }
 
 impl PlaybackSession {
-    pub fn open(request: &MediaRequest, config: PlaybackSessionConfig) -> Result<Self> {
-        Self::open_with_decoder_resources(request, config, PlaybackDecoderResources::default())
+    /// 各输入累计从源消费的字节数（`[video, audio]`）。读数由 demux 线程发布
+    /// （见 [`DemuxIoCounters`]），播放线程用差分算出"这次 seek 之后读了多少"。
+    fn io_bytes(&self) -> [u64; 2] {
+        self.demuxer.io_bytes()
     }
 
+    pub fn open(request: &MediaRequest, config: PlaybackSessionConfig) -> Result<Self> {
+        Self::open_with_decoder_resources(
+            request,
+            config,
+            crate::core::DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY,
+            PlaybackDecoderResources::default(),
+        )
+    }
+
+    /// `video_frame_queue_capacity` 是调用方 handoff 队列的实际容量：它决定
+    /// D3D11VA 帧池下界里的消费端预留（见 `ffmpeg::d3d11va_pool_floor`）。
+    /// 队列与池深必须同源，所以它从调用方传进来，而不是在解码器里猜一个值。
     pub(crate) fn open_with_decoder_resources(
         request: &MediaRequest,
         config: PlaybackSessionConfig,
+        video_frame_queue_capacity: usize,
         decoder_resources: PlaybackDecoderResources,
     ) -> Result<Self> {
         let queue_limits = PlaybackQueueLimits::for_request(request);
@@ -934,6 +1065,20 @@ impl PlaybackSession {
             }
             None => Demuxer::open_source(source)?,
         };
+        // —— open 阶段读数：留在进程级槽里供宿主取用 ——
+        //
+        // 存在的理由：宿主侧只看到内核停在 `Opening`、`duration` 仍是 0，而网络
+        // 明明在下载——是链路慢、是内核在解析流信息、还是解码器初始化，宿主
+        // 区分不了。`avformat_open_input` / `avformat_find_stream_info` 会按
+        // `probesize` / `analyzeduration` 读入可观的流数据才能判定流信息
+        // （B 站 m4s 实测约 0.9MB／输入，见 `tests/open_stages_diag.rs`），
+        // 慢链路上这一段就是数秒。把每段的耗时与读入字节留在这里，宿主可以
+        // 把它打进 `%TEMP%\bili-rs-diag.log`，让"这几秒花在哪"有数字可看。
+        //
+        // 单播放窗口下进程级槽足够（多窗口会互相覆盖，与 `source` 的诊断槽
+        // 同一约定）。
+        let mut open_stages: Vec<crate::ffmpeg::OpenStageTiming> = demuxer.open_stages().to_vec();
+        let decoder_started = std::time::Instant::now();
         let mut probe = demuxer.probe().clone();
         trace::log(format!(
             "[erika-open-trace] stage=probe_done tracks={} duration_secs={:.3}",
@@ -978,7 +1123,9 @@ impl PlaybackSession {
             selected_streams.push(stream_index);
             let parameters = codec_parameters_for(&codec_parameters, stream_index)?;
             let codec = parameters.codec_name();
-            let decoder_config = config.video_decode.decoder_config();
+            let decoder_config = config
+                .video_decode
+                .decoder_config(video_frame_queue_capacity);
             trace::log(format!(
                 "[erika-open-trace] stage=video_decoder_open_start codec={} backend={:?}",
                 codec.as_deref().unwrap_or("?"),
@@ -1326,6 +1473,28 @@ impl PlaybackSession {
         selected_streams.dedup();
         if !selected_streams.is_empty() {
             demuxer.set_stream_selection(StreamSelection::only(selected_streams))?;
+        }
+
+        // 解码器初始化（视频硬解/软解 + 音频 + 字幕）耗时：与上面两个输入的
+        // 网络读取分开记账，便于区分"在等数据"与"在建解码器"。
+        {
+            let (video_bytes, audio_bytes) = open_stages
+                .last()
+                .map(|stage| (stage.video_bytes, stage.audio_bytes))
+                .unwrap_or((0, 0));
+            open_stages.push(crate::ffmpeg::OpenStageTiming {
+                stage: "decoder_open",
+                elapsed_ms: decoder_started.elapsed().as_secs_f64() * 1000.0,
+                video_bytes,
+                audio_bytes,
+                streams: None,
+            });
+            let mut slot = LAST_OPEN_STAGES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = open_stages;
+            // 先写内容、再抬序号：宿主读到"序号变大"时内容一定已就绪。
+            OPEN_STAGES_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
 
         let video_params = selected_video_track.and_then(|stream_index| {
@@ -4386,6 +4555,16 @@ pub struct VideoPlaybackEngine {
     video_seek_preroll_started_at: Option<Instant>,
     video_seek_preroll_dropped_frames: u64,
     last_video_seek_preroll_log: Option<Instant>,
+    /// 预滚起算时的源读取累计字节（`[video, audio]`，见 [`DemuxIoCounters`]）。
+    /// 与 `video_seek_preroll_started_at` 同时设定，让 `finish_video_seek_preroll`
+    /// 能用差分报出"这次 seek 之后从源读了多少"——预滚耗时 ÷ 该字节数就是预滚
+    /// 期间的**有效链路速率**，它低于宿主 `[net] V: speed=` 的差额才是解码/调度。
+    video_seek_io_baseline: [u64; 2],
+    /// 预滚里见到的**第一个视频帧**的 pts（= `AVSEEK_FLAG_BACKWARD` 的落点）。
+    /// `target - landing` 就是这次 seek 必须回填的时长：关键帧间隔 5s 的视频上
+    /// seek 到 69s 只会落在 65s，30fps 下正好 120 帧——真机 `totalDroppedFrames`
+    /// 的 120 正是这么来的，不是随机丢帧。
+    video_seek_landing_pts: Option<Duration>,
     /// 预载目标（统一时间轴）。Some 时 `tick` 进入预载分支：只消费 demux
     /// 填充源缓存（不输出帧、不推进时钟、不发声）；达到目标或 EOF 后
     /// 复位 demux 到 0（缓存保留），再发 `PreloadCompleted`。
@@ -4456,17 +4635,30 @@ impl Drop for VideoPlaybackEngine {
 
 impl VideoPlaybackEngine {
     pub fn open(request: &MediaRequest, config: PlaybackSessionConfig) -> Result<Self> {
-        Self::open_with_decoder_resources(request, config, PlaybackDecoderResources::default())
+        Self::open_with_decoder_resources(
+            request,
+            config,
+            crate::core::DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY,
+            PlaybackDecoderResources::default(),
+        )
     }
 
+    /// `video_frame_queue_capacity`：调用方 handoff 队列的实际容量，用于推导
+    /// D3D11VA 帧池下界（见 `PlaybackSession::open_with_decoder_resources`）。
     pub(crate) fn open_with_decoder_resources(
         request: &MediaRequest,
         config: PlaybackSessionConfig,
+        video_frame_queue_capacity: usize,
         decoder_resources: PlaybackDecoderResources,
     ) -> Result<Self> {
         let timing = playback_timing_for_request(request, config.timing);
         Ok(Self::from_session_with_timing(
-            PlaybackSession::open_with_decoder_resources(request, config, decoder_resources)?,
+            PlaybackSession::open_with_decoder_resources(
+                request,
+                config,
+                video_frame_queue_capacity,
+                decoder_resources,
+            )?,
             timing,
         ))
     }
@@ -4510,6 +4702,8 @@ impl VideoPlaybackEngine {
             video_seek_preroll_started_at: None,
             video_seek_preroll_dropped_frames: 0,
             last_video_seek_preroll_log: None,
+            video_seek_io_baseline: [0, 0],
+            video_seek_landing_pts: None,
             preload_target: None,
             preload_completed: false,
         }
@@ -5236,6 +5430,8 @@ impl VideoPlaybackEngine {
         self.video_seek_preroll_started_at = Some(now);
         self.video_seek_preroll_dropped_frames = 0;
         self.last_video_seek_preroll_log = None;
+        self.video_seek_io_baseline = self.session.io_bytes();
+        self.video_seek_landing_pts = None;
     }
 
     pub fn media_time(&self) -> Duration {
@@ -5736,6 +5932,11 @@ impl VideoPlaybackEngine {
             self.finish_video_seek_preroll(target, None, "missing_pts");
             return false;
         };
+        // 第一个进入本判定的帧就是 `AVSEEK_FLAG_BACKWARD` 的落点。它与 target
+        // 的距离决定了必须解码并丢弃多少帧——真机 120 帧全部来自这里。
+        if self.video_seek_landing_pts.is_none() {
+            self.video_seek_landing_pts = Some(pts);
+        }
         if pts < target {
             true
         } else {
@@ -5786,6 +5987,23 @@ impl VideoPlaybackEngine {
             .video_seek_preroll_started_at
             .map(|started| started.elapsed())
             .unwrap_or_default();
+        // 预滚期间的**新增源读取量**：baseline 在 seek 提交后（见
+        // `reset_video_seek_preroll_budget`）取，差分即本次 seek 之后从源
+        // 读走的字节。`videoBytesPerSecond` 是据此算出的有效链路速率——
+        // 它接近宿主 `[net] V: speed=` 就说明预滚在等字节，远低于它就是
+        // 解码/调度/建连在耗时。
+        let io_now = self.session.io_bytes();
+        let video_read = io_now[0].saturating_sub(self.video_seek_io_baseline[0]);
+        let audio_read = io_now[1].saturating_sub(self.video_seek_io_baseline[1]);
+        let seconds = elapsed.as_secs_f64();
+        let video_bytes_per_second = if seconds > 0.0 {
+            video_read as f64 / seconds
+        } else {
+            0.0
+        };
+        let backfill_seconds = self
+            .video_seek_landing_pts
+            .map(|landing| target.saturating_sub(landing).as_secs_f64());
         trace::diagnostic(
             serde_json::json!({
                 "event": "video_seek_preroll",
@@ -5793,14 +6011,24 @@ impl VideoPlaybackEngine {
                 "reason": reason,
                 "targetSeconds": target.as_secs_f64(),
                 "firstOutputPtsSeconds": pts.map(|pts| pts.as_secs_f64()),
+                "landingPtsSeconds": self.video_seek_landing_pts.map(|pts| pts.as_secs_f64()),
+                "backfillSeconds": backfill_seconds,
                 "totalDroppedFrames": dropped_frames,
                 "elapsedMs": elapsed.as_secs_f64() * 1000.0,
+                "videoSeekReadBytes": video_read,
+                "audioSeekReadBytes": audio_read,
+                "videoBytesPerSecond": (video_bytes_per_second * 10.0).round() / 10.0,
+                "wallMs": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_millis().min(u64::MAX as u128) as u64)
+                    .unwrap_or(0),
             })
             .to_string(),
         );
         self.video_seek_preroll_started_at = None;
         self.video_seek_preroll_dropped_frames = 0;
         self.last_video_seek_preroll_log = None;
+        self.video_seek_landing_pts = None;
     }
 
     fn ensure_pending_frame_with_now(&mut self, now: &mut impl FnMut() -> Instant) -> Result<()> {

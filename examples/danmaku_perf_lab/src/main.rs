@@ -1208,6 +1208,9 @@ fn generate_timeline(options: &PerfOptions) -> Result<DanmakuTimeline, String> {
             color,
             opacity: 1.0,
             is_self: options.self_every.is_some_and(|every| index % every == 0),
+            user_id: String::new(),
+            user_name: String::new(),
+            user_level: 0,
         });
     }
     DanmakuTimeline::new(items).map_err(|error| error.to_string())

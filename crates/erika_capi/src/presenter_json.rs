@@ -29,7 +29,30 @@ pub unsafe extern "C" fn erika_presenter_render_tick_json(
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut stats = ErikaPresenterStats::default();
         call_status(unsafe { erika_presenter_render_tick(handle, time_seconds, &mut stats) })?;
-        Ok(stats_json(stats))
+        // C ABI 的 `ErikaPresenterStats` 布局保持冻结（Swift/Dart 侧有手抄镜像
+        // 结构体），但 JSON 这条路径可以自由扩展：把「真的合成了多少帧 / 真的
+        // 上屏了多少个新视频帧 / 整拍跳过了多少重复合成帧」一并交给宿主，便于
+        // 按帧率口径判断重绘冗余，而不是把 tick 次数误当成视频帧率。
+        let mut value = stats_json(stats);
+        if let Value::Object(map) = &mut value {
+            let presenter_stats =
+                unsafe { handle.as_ref() }.map(|handle| handle.presenter.runtime_snapshot().stats);
+            if let Some(presenter_stats) = presenter_stats {
+                map.insert(
+                    "presentedVideoFrames".to_string(),
+                    json!(presenter_stats.presented_video_frames),
+                );
+                map.insert(
+                    "skippedCompositeFrames".to_string(),
+                    json!(presenter_stats.skipped_composite_frames),
+                );
+                map.insert(
+                    "compositeFrames".to_string(),
+                    json!(presenter_stats.rendered_video_frames),
+                );
+            }
+        }
+        Ok(value)
     }));
     response_string(result)
 }

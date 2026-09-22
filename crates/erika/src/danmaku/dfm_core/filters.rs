@@ -1,5 +1,3 @@
-use aho_corasick::AhoCorasick;
-use regex::Regex;
 /// Danmaku filtering system.
 /// Ported from DanmakuFilters.java with support for:
 /// - Type blocking
@@ -12,6 +10,7 @@ use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::danmaku::dfm_core::model::{DanmakuItem, DanmakuType, Duration, GlobalFlags};
+use crate::danmaku::rules::{BlockReason, DanmakuRuleSet, RuleError};
 
 /// Context passed to filters during the rendering loop.
 #[derive(Debug)]
@@ -31,6 +30,53 @@ pub struct RetainerState {
     pub line_number: u32,
 }
 
+/// `filter_param` 诊断码：命中屏蔽时写进 `DanmakuItem::filter_param`，供统计浮窗
+/// 与测试区分「为什么这条被屏蔽了」。1~5 沿用 DFM+ 既有编号，6 起是本模块新增的
+/// 规则维度（见 `crate::danmaku::rules`）。
+pub mod filter_param {
+    /// 类型屏蔽（`blocked_types` 字段，DFM+ 既有）
+    pub const TYPE: u32 = 1;
+    /// 同屏密度上限（DFM+ 既有）
+    pub const QUANTITY: u32 = 2;
+    /// 帧耗时保护（DFM+ 既有）
+    pub const ELAPSED: u32 = 3;
+    /// 关键词屏蔽（DFM+ 既有）
+    pub const KEYWORD: u32 = 4;
+    /// 正则屏蔽（从 DFM+ 的关键词码里拆出来，便于诊断行分别显示"关键词/正则"）
+    pub const REGEX: u32 = 12;
+    /// 重复合并（DFM+ 既有）
+    pub const DUPLICATE: u32 = 5;
+    /// 用户标识屏蔽（`<标识>` 规则）
+    pub const USER: u32 = 6;
+    /// 用户名屏蔽（`[用户名]` 规则）
+    pub const NAME: u32 = 7;
+    /// 用户等级屏蔽（`level:` 规则）
+    pub const LEVEL: u32 = 8;
+    /// 文本长度屏蔽（`len:` 规则）
+    pub const TEXT_LENGTH: u32 = 9;
+    /// 时间区间屏蔽（`time:` 规则）
+    pub const TIME_RANGE: u32 = 10;
+    /// 彩色弹幕屏蔽（`type:color` 规则）
+    pub const COLOR: u32 = 11;
+    /// 轨道分配失败 / 超出最大行数（DFM+ 既有留白码）
+    pub const OVERFLOW: u32 = 99;
+}
+
+/// 规则命中原因 → `filter_param` 诊断码。
+fn param_for_reason(reason: BlockReason) -> u32 {
+    match reason {
+        BlockReason::Type => filter_param::TYPE,
+        BlockReason::Color => filter_param::COLOR,
+        BlockReason::Keyword => filter_param::KEYWORD,
+        BlockReason::Regex => filter_param::REGEX,
+        BlockReason::User => filter_param::USER,
+        BlockReason::Name => filter_param::NAME,
+        BlockReason::Level => filter_param::LEVEL,
+        BlockReason::TextLength => filter_param::TEXT_LENGTH,
+        BlockReason::TimeRange => filter_param::TIME_RANGE,
+    }
+}
+
 /// Complete filter system.
 #[derive(Debug)]
 pub struct FilterSystem {
@@ -38,9 +84,15 @@ pub struct FilterSystem {
     pub max_quantity: Option<u32>,
     pub max_lines: FxHashMap<DanmakuType, u32>,
     pub overlapping_filter: FxHashMap<DanmakuType, bool>,
-    pub blocked_users: FxHashSet<String>,
-    pub blocked_keywords_aho: Option<AhoCorasick>,
-    pub blocked_regexes: Vec<Regex>,
+    /// 结构化屏蔽规则（关键词 / 正则 / 类型 / 颜色 / 长度 / 时间 / 等级 / 用户名）。
+    /// 判定入口是 [`DanmakuRuleSet::matches`]，规则集为空时零开销短路。
+    pub rules: DanmakuRuleSet,
+    /// 最近一次 [`FilterSystem::set_block_words`] 的编译诊断。
+    ///
+    /// 与「写错了就悄悄不生效」相对：写错的正则/类型名会留在这里，调用方可以
+    /// 打日志或回显给用户。DanmakuFactory 的对应缺陷是编译失败后
+    /// `regCodes[i]` 与 `keyStrings[i]` 索引错位，更难查。
+    pub rule_errors: Vec<RuleError>,
     pub duplicate_merge: bool,
     pub elapsed_time_limit_ms: u64,
     last_skipped_time: Option<i64>,
@@ -56,9 +108,8 @@ impl Default for FilterSystem {
             max_quantity: None,
             max_lines: FxHashMap::default(),
             overlapping_filter: FxHashMap::default(),
-            blocked_users: FxHashSet::default(),
-            blocked_keywords_aho: None,
-            blocked_regexes: Vec::new(),
+            rules: DanmakuRuleSet::default(),
+            rule_errors: Vec::new(),
             duplicate_merge: false,
             elapsed_time_limit_ms: 20,
             last_skipped_time: None,
@@ -77,7 +128,7 @@ impl FilterSystem {
         // Type filter
         if self.blocked_types.contains(&item.danmaku_type) {
             item.is_filtered = true;
-            item.filter_param = 1;
+            item.filter_param = filter_param::TYPE;
             item.flags.filter = ctx.global_flags.filter_flag;
             return true;
         }
@@ -86,7 +137,7 @@ impl FilterSystem {
         if item.danmaku_type.is_scroll() {
             if self.filter_quantity(item, ctx) {
                 item.is_filtered = true;
-                item.filter_param = 2;
+                item.filter_param = filter_param::QUANTITY;
                 item.flags.filter = ctx.global_flags.filter_flag;
                 return true;
             }
@@ -97,15 +148,19 @@ impl FilterSystem {
             && item.is_outside(ctx.timer_ms, &ctx.global_flags)
         {
             item.is_filtered = true;
-            item.filter_param = 3;
+            item.filter_param = filter_param::ELAPSED;
             item.flags.filter = ctx.global_flags.filter_flag;
             return true;
         }
 
-        // Keyword filter
-        if self.filter_keywords(item) {
+        // 结构化屏蔽规则（关键词 / 正则 / 类型 / 颜色 / 长度 / 时间 / 用户 / 等级）。
+        // 规则集为空时 `matches` 在第一行就返回 None，不进任何自动机。
+        if let Some(reason) = self
+            .rules
+            .matches(item, item.get_actual_time(&ctx.global_flags))
+        {
             item.is_filtered = true;
-            item.filter_param = 4;
+            item.filter_param = param_for_reason(reason);
             item.flags.filter = ctx.global_flags.filter_flag;
             return true;
         }
@@ -113,7 +168,7 @@ impl FilterSystem {
         // Duplicate merging filter
         if self.duplicate_merge && self.filter_duplicate(item, ctx) {
             item.is_filtered = true;
-            item.filter_param = 5;
+            item.filter_param = filter_param::DUPLICATE;
             item.flags.filter = ctx.global_flags.filter_flag;
             return true;
         }
@@ -178,21 +233,6 @@ impl FilterSystem {
         false
     }
 
-    /// Keyword and regex filter.
-    fn filter_keywords(&self, item: &DanmakuItem) -> bool {
-        if let Some(ref aho) = self.blocked_keywords_aho {
-            if aho.is_match(&item.text) {
-                return true;
-            }
-        }
-        for re in &self.blocked_regexes {
-            if re.is_match(&item.text) {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Duplicate merging filter.
     /// Ported from DuplicateMergingFilter.needFilter().
     fn filter_duplicate(&mut self, item: &DanmakuItem, ctx: &FilterContext) -> bool {
@@ -230,43 +270,27 @@ impl FilterSystem {
         self.passed_duplicates.clear();
     }
 
-    /// Parse block_words list into keywords and regex patterns.
-    /// Format: plain text → keyword, "规则名称/表达式/" → regex
+    /// 用屏蔽词表重建规则集。
+    ///
+    /// 规则文本语法见 `crate::danmaku::rules`（兼容既有的 `规则名称/表达式/`
+    /// 正则写法，以及 DanmakuFactory `--blacklist` 的 `<uid>` / `[用户名]` 约定）。
+    /// 编译诊断留在 [`FilterSystem::rule_errors`]，不会静默丢弃写错的规则。
+    ///
+    /// 所有维度（含 `<标识>` / `[用户名]` 的用户级屏蔽）都由规则集自己在
+    /// [`DanmakuRuleSet::matches`] 里判定，`FilterSystem` 不再保存第二份
+    /// 用户集合——曾经那个 `blocked_users` 字段**写入但从不被读取**，白付一次
+    /// 每次改配置的 `HashSet` 克隆，还会与规则集形成两份真相。
+    ///
+    /// `type:repeat` 规则会顺带打开 [`FilterSystem::duplicate_merge`]：同屏重复
+    /// 屏蔽在本内核里是由重复合并过滤器执行的，规则集本身不做这件事。
     pub fn set_block_words(&mut self, words: &[String]) {
-        self.blocked_keywords_aho = None;
-        self.blocked_regexes.clear();
-        let mut keywords: Vec<&str> = Vec::new();
-        for word in words {
-            if let Some(regex_str) = parse_regex_rule(word) {
-                if let Ok(re) = Regex::new(&regex_str) {
-                    self.blocked_regexes.push(re);
-                }
-            } else {
-                keywords.push(word.as_str());
-            }
+        let (rules, errors) = DanmakuRuleSet::parse(words);
+        if rules.wants_repeat_filter() {
+            self.duplicate_merge = true;
         }
-        if !keywords.is_empty() {
-            self.blocked_keywords_aho = Some(AhoCorasick::builder().build(keywords).unwrap());
-        }
+        self.rules = rules;
+        self.rule_errors = errors;
     }
-}
-
-/// Parse "规则名称/表达式/" format into just the regex pattern string.
-/// Returns None if not in this format.
-fn parse_regex_rule(word: &str) -> Option<String> {
-    if !word.contains('/') {
-        return None;
-    }
-    let first_slash = word.find('/')?;
-    let last_slash = word.rfind('/')?;
-    if first_slash == last_slash || last_slash != word.len() - 1 {
-        return None;
-    }
-    let pattern = &word[first_slash + 1..last_slash];
-    if pattern.is_empty() {
-        return None;
-    }
-    Some(pattern.to_string())
 }
 
 #[cfg(test)]

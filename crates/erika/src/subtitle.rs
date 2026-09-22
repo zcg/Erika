@@ -2402,11 +2402,18 @@ const BUNDLED_ASS_FALLBACK_FONT_FAMILY: &str = "Droid Sans Fallback";
 
 #[cfg(target_os = "macos")]
 const DEFAULT_ASS_FONT_FAMILY: &str = "PingFang SC";
+/// Windows 也用**内嵌子集字体**，而不是 `Arial`。
+///
+/// `Arial` 会让 libass 去系统 provider（Windows 上是 DirectWrite）里查一个
+/// 系统字族：那条路上 libass 取得的是**整个字体文件**——本机实测因此把
+/// `msyh.ttc`(18.8 MB) 与 `msyhbd.ttc`(16.1 MB) 映射进了进程。本应用的字幕
+/// 是中文，而内嵌的 `subfont.ttf`（6.2 MB，已由 `ass_add_font` 注册进 libass，
+/// **不占额外内存**）覆盖常用中文 + 拉丁 + 符号，直接用它就没有这一步开销。
+///
+/// 这**不是**把系统字体挡死：provider 仍是 `AUTODETECT`，内嵌字体缺字时
+/// libass 照旧回退到系统字族，只是那一步现在只在真缺字时才发生。
 #[cfg(target_os = "windows")]
-const DEFAULT_ASS_FONT_FAMILY: &str = "Arial";
-// Every other target renders without a system font provider (mobile selects
-// `ASS_FONTPROVIDER_NONE`, and the vendored libass build has fontconfig
-// disabled), so the bundled fallback family is the only one libass resolves.
+const DEFAULT_ASS_FONT_FAMILY: &str = BUNDLED_ASS_FALLBACK_FONT_FAMILY;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const DEFAULT_ASS_FONT_FAMILY: &str = BUNDLED_ASS_FALLBACK_FONT_FAMILY;
 
@@ -2427,12 +2434,18 @@ fn default_ass_font_provider() -> libc::c_int {
 
 #[cfg(feature = "libass")]
 fn default_ass_font_family_cstr() -> &'static CStr {
-    if cfg!(target_os = "macos") {
+    // 这是把 `DEFAULT_ASS_FONT_FAMILY` 交给 libass 的**唯一**转换点。
+    //
+    // 历史上这里是硬编码的第二份字面量（Windows 分支写死 `"Arial"`），与常量
+    // 各自演化——`default_ass_font_family_matches_platform_fallback_policy`
+    // 正是为抓这种漂移而存在的。现在两边只有一份事实来源：常量变了，
+    // 这里必须跟着变（反之亦然，测试会当场失败）。
+    if DEFAULT_ASS_FONT_FAMILY == BUNDLED_ASS_FALLBACK_FONT_FAMILY {
+        // Windows 现在也走内嵌子集字体，理由见常量的文档注释。
         c"Droid Sans Fallback"
-    } else if cfg!(target_os = "windows") {
-        c"Arial"
     } else {
-        c"Droid Sans Fallback"
+        // 目前只有 macOS 会走到这里。
+        c"PingFang SC"
     }
 }
 

@@ -225,7 +225,24 @@ impl Default for PresenterConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PresenterStats {
     pub decoded_video_frames: u64,
+    /// 真正提交渲染的次数。宿主每显示帧调用一次 `render_tick`，但只有内容
+    /// 变化的那几拍才真的做取样/合成/present——没有新东西要画、
+    /// 时间推进也不改变任何图层内容的显示帧会被整拍跳过（见
+    /// [`Self::skipped_composite_frames`]）。因此它按构造不会超过 tick 次数。
+    ///
+    /// 需要「实际上屏了多少个不同的视频帧」时读 [`Self::presented_video_frames`]：
+    /// 播放中 `rendered_video_frames` 会包含没有换帧的重复 present，直接把它
+    /// 当视频帧率会得到远高于解码帧率的假数字。
     pub rendered_video_frames: u64,
+    /// 本拍真的把「一个新的视频帧」画上了屏的次数：只在渲染器接受了新上传
+    /// 的解码帧、并且本次渲染返回 `Ok(true)` 时递增。暂停、解码暂时落后、
+    /// 弹幕/字幕单独驱动重绘都不会让它增长。
+    pub presented_video_frames: u64,
+    /// 本拍被整拍跳过的合成帧数：视频帧没有更新、弹幕/字幕/HUD 内容逐字节
+    /// 未变、渲染参数与输出尺寸未变时递增。与
+    /// [`Self::rendered_video_frames`] 之和等于实际处理的 tick 数（不含
+    /// 早退路径）。
+    pub skipped_composite_frames: u64,
     pub rendered_test_frames: u64,
     pub pushed_audio_frames: u64,
     pub decoded_subtitle_frames: u64,
@@ -272,6 +289,11 @@ pub struct PresenterRuntimeSnapshot {
     pub current_danmaku_scroll_bucket_count: usize,
     pub current_danmaku_scroll_buckets: [DanmakuDebugBucket; DANMAKU_DEBUG_BUCKETS],
     pub current_danmaku_prepared: DanmakuPreparedStats,
+    /// 最近一次弹幕布局准备中**编译失败**的屏蔽规则条数（0 = 全部规则都生效）。
+    ///
+    /// 存在的理由：规则写错时不会报错、只是不生效，用户看到的现象是"配了不管用"。
+    /// 把条数暴露出来，界面就能提示"有 N 条规则没生效"。
+    pub current_danmaku_rule_error_count: usize,
     pub last_tick_duration: Duration,
     pub last_pump_duration: Duration,
     pub last_audio_pump_duration: Duration,
@@ -282,6 +304,128 @@ pub struct PresenterRuntimeSnapshot {
     pub last_render_duration: Duration,
     pub last_render_current_duration: Duration,
     pub last_render_test_duration: Duration,
+}
+
+/// `render_tick` 的一拍「要不要真的做 GPU 合成」判据快照。
+///
+/// 只描述会改变输出像素的内容，不描述时钟本身：媒体时间推进而所有图层内容
+/// 都没变时，重复 present 同一张画面是纯浪费（宿主把渲染挂在显示合成回调上，
+/// 30fps 素材会被按刷新率重绘数倍）。因此这里逐项记录视频帧、弹幕、字幕/HUD
+/// 与输出尺寸，逐项相等就整拍跳过。
+#[derive(Debug, Clone)]
+struct FramePresentState {
+    /// 渲染器当前持有的视频帧序号（`uploaded_video_frames`）。变化即「换了帧」。
+    uploaded_video_frames: u64,
+    /// 本拍媒体时间，只用于诊断：时钟推进本身不是内容变化，不参与
+    /// `matches`。整条渲染链上所有后端都只用 `media_time` 打线程内 trace
+    /// （`renderer/metal/mod.rs` 是唯一读取点），没有任何后端按它改变像素；
+    /// 图层内容自己会随媒体时间变化，变化会体现在下面几项里。
+    #[allow(dead_code)]
+    media_time: Duration,
+    generation: u64,
+    output_width: u32,
+    output_height: u32,
+    present_params_generation: u64,
+    /// 上一拍渲染时弹幕字形位置的内容摘要（见 `danmaku_position_hash`）。
+    danmaku_position_hash: Option<u64>,
+    /// 上一拍渲染时的叠加层（字幕 + HUD）内容。存克隆而非引用：本拍内容变化
+    /// 时需要把它替换成新内容，没有任何借用能跨 tick 存活。
+    overlay: Option<OverlayFrame>,
+}
+
+impl FramePresentState {
+    /// 本拍内容是否与上一次真正合成的内容完全一致。返回 `true` 表示这一拍
+    /// 没有新东西要画，可以整拍跳过取样/合成/present。
+    ///
+    /// 宁可漏判「少画一帧重复帧」也不能误判「该画没画」，所以每个字段都做了
+    /// 保守比较：无法证明相等就返回 `false`（去画）。
+    fn matches(&self, current: &FramePresentState) -> bool {
+        self.uploaded_video_frames == current.uploaded_video_frames
+            && self.generation == current.generation
+            && self.output_width == current.output_width
+            && self.output_height == current.output_height
+            && self.present_params_generation == current.present_params_generation
+            && self.danmaku_position_hash == current.danmaku_position_hash
+            && overlay_layers_match(self.overlay.as_ref(), current.overlay.as_ref())
+    }
+}
+
+/// 叠加层（字幕 + 调试 HUD 平面）是否逐字节相同。
+///
+/// RGBA 平面（调试 HUD、debug 字幕走这条）做完整比较：这些平面只在内容变化
+/// 时重建，尺寸也有上界，逐字节比较一次比重新合成一遍便宜得多。
+///
+/// Alpha 平面（libass 走这条）**不比较像素**：libass 每拍重渲都会给出新的
+/// `Vec<u8>`，逐字节比较等于每拍多付一次全画面 memcmp。它们的变化由
+/// `OverlayFrame::subtitle_changed` 承载（libass 增量渲染的变化标志），这里
+/// 只比较平面数量与几何，两者都不变时由 `subtitle_changed` 负责强制重绘。
+///
+/// `OverlayFrame::pts` 同样不参与比较：它是这条 overlay 生成时的时钟读数，
+/// 每拍都在变但从不驱动任何像素——叠加层的实际内容由下面的平面决定。
+fn overlay_layers_match(previous: Option<&OverlayFrame>, current: Option<&OverlayFrame>) -> bool {
+    let (Some(previous), Some(current)) = (previous, current) else {
+        return previous.is_none() && current.is_none();
+    };
+    if previous.viewport != current.viewport
+        || previous.subtitle_changed != current.subtitle_changed
+        || previous.subtitle_planes.len() != current.subtitle_planes.len()
+        || previous.subtitle_alpha_planes.len() != current.subtitle_alpha_planes.len()
+    {
+        return false;
+    }
+    previous
+        .subtitle_planes
+        .iter()
+        .zip(current.subtitle_planes.iter())
+        .all(|(previous, current)| {
+            previous.x == current.x
+                && previous.y == current.y
+                && previous.width == current.width
+                && previous.height == current.height
+                && previous.canvas_width == current.canvas_width
+                && previous.canvas_height == current.canvas_height
+                && previous.rgba == current.rgba
+        })
+        && previous
+            .subtitle_alpha_planes
+            .iter()
+            .zip(current.subtitle_alpha_planes.iter())
+            .all(|(previous, current)| {
+                previous.placement == current.placement
+                    && previous.stride == current.stride
+                    && previous.color_rgba == current.color_rgba
+            })
+}
+
+/// 弹幕字形位置的内容摘要。`None` 表示这一拍没有任何字形要画（计划缺失，
+/// 或计划里没有可见字形）——视觉上都是「弹幕层是空的」，两者必须等价。
+///
+/// 弹幕层是引擎自己画的连续动画：计划本身每拍重建，滚动弹幕的 x 每拍都在
+/// 变，所以「计划对象不同」不等于「像素不同」。这里只摘要真正决定像素的
+/// 位置与纹理矩形（外加顶点数），逐字段用 f64 哈希，浮点量化抖动不会造成
+/// 漏判：「可能变了」与「可能没变」都返回不同哈希，只有两拍摘要全等才跳过。
+fn danmaku_position_hash(plan: Option<&DanmakuRenderPlan>) -> Option<u64> {
+    let plan = plan?;
+    if plan.items.is_empty() {
+        return None;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for item in &plan.items {
+        // 只取位置相关量：item_id 在重排后可能复用，颜色/阴影不随动画变化，
+        // 纳进来只会增加噪声。
+        for value in [
+            item.rect[0],
+            item.rect[1],
+            item.tex_rect[0],
+            item.tex_rect[1],
+            item.rect[2],
+            item.rect[3],
+        ] {
+            hash ^= (value as f64 + 0.0).to_bits();
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    Some(hash)
 }
 
 pub struct PresenterRuntime {
@@ -312,6 +456,19 @@ pub struct PresenterRuntime {
     current_generation: u64,
     current_surface_metrics: Option<SurfaceMetrics>,
     current_danmaku_viewport: Option<DanmakuViewport>,
+    /// 上一次真正交给渲染器合成的图层内容（played 帧/弹幕/字幕/输出尺寸）。
+    /// `render_tick` 用它判断这一拍是不是「没有新东西可画」。
+    last_presented_layers: Option<FramePresentState>,
+    /// 进入渲染器的视频帧累计计数：每次 `upload_player_frame` 成功导入一个新
+    /// 解码帧时 +1。它是「渲染器当前显示的是不是同一帧」的唯一可靠判据——
+    /// 帧序号单调递增，所以 seek 后 PTS 回退、同一 PTS 重复出现都不会误判。
+    uploaded_video_frames: u64,
+    /// 本拍已导入但还没被 `render_tick` 消费的新视频帧数。
+    pending_video_frames: u64,
+    /// 渲染输出参数版本号：渲染器表面上任何「画什么」的参数变化（缩放滤镜、
+    /// HDR headroom、surface 尺寸）都会 +1，用于强制下一拍重绘。这些参数无法
+    /// 从图层内容里看出来，所以必须单独跟踪。
+    present_params_generation: u64,
     /// 完整配置副本（resolve 之后保存）——device_lost 自愈时重建渲染器用
     config: PresenterConfig,
     /// 渲染器后端偏好（build_renderer 重建用）
@@ -588,9 +745,20 @@ impl Drop for AsyncDanmakuPlanner {
         // The Windows plugin unloads the native DLL after the last presenter.
         // A shutdown notification alone leaves the worker executing (or even
         // starting) in unmapped code. Release the state lock before joining.
+        //
+        // **但 join 必须有限超时**：这个 Drop 跑在播放窗口的 UI 线程上（窗口
+        // 卸载 → 宿主释放 presenter），而 planner 可能正在跑一整轮排布。无界
+        // join 会把 UI 线程一起挂住 → 窗口不泵消息 → Windows 判 AppHang 并终止
+        // 进程（实测 2026-09-14 22:07 的一次 `AppHangB1`）。2s 内没退就 detach，
+        // 与 `AsyncDemuxer::drop` / `WasapiRenderThread::drop` 同一套做法。
         #[cfg(target_os = "windows")]
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = worker.join();
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
         }
     }
 }
@@ -751,6 +919,10 @@ impl PresenterRuntime {
             current_generation: 1,
             current_surface_metrics: None,
             current_danmaku_viewport: None,
+            last_presented_layers: None,
+            uploaded_video_frames: 0,
+            pending_video_frames: 0,
+            present_params_generation: 0,
             config: saved_config,
             renderer_preference,
             attached_surface: None,
@@ -796,6 +968,7 @@ impl PresenterRuntime {
         }
         self.current_surface_metrics = Some(metrics);
         self.clear_current_danmaku_state();
+        self.bump_present_params();
         Ok(())
     }
 
@@ -806,7 +979,9 @@ impl PresenterRuntime {
         self.attached_surface = None;
         self.clear_current_danmaku_state();
         self.player.detach_surface()?;
-        self.renderer.detach_surface()
+        self.renderer.detach_surface()?;
+        self.bump_present_params();
+        Ok(())
     }
 
     /// Borrowed COM identity of a DirectComposition swap chain. No `AddRef`.
@@ -846,6 +1021,9 @@ impl PresenterRuntime {
         }
         self.renderer.resize_surface(metrics)?;
         self.current_surface_metrics = Some(metrics);
+        // 输出尺寸变了（即使宽度高度没变，scale 也可能影响逻辑内容），本拍
+        // 必须重绘一次。
+        self.bump_present_params();
         // 同步刷新缓存的 attached_surface 尺寸：设备丢失自愈重建渲染器时
         // 会用缓存重新 attach，若仍是首次 attach 的初始值（bili-rs 为
         // 960x540），backbuffer 会卡在初始小尺寸，画面只占面板左上角
@@ -1391,10 +1569,13 @@ impl PresenterRuntime {
     /// upscaler implementation ignore the request.
     pub fn set_luma_upscaler(&mut self, mode: crate::renderer::pipeline::LumaUpscalerMode) {
         self.renderer.set_luma_upscaler(mode);
+        // 缩放滤镜换档：即使图层内容一个字节都没变，输出像素也不同。
+        self.bump_present_params();
     }
 
     pub fn set_output_headroom(&mut self, headroom: f32, known: bool) {
         self.renderer.set_output_headroom(headroom, known);
+        self.bump_present_params();
     }
 
     pub fn add_external_subtitle(&self, uri: impl Into<String>) -> Result<SubtitleTrackConfig> {
@@ -1562,6 +1743,14 @@ impl PresenterRuntime {
             None
         };
         let render_overlay = hud_overlay.as_ref().or(self.current_overlay.as_ref());
+        // 本拍真的交进渲染器的新视频帧数（pump_video 计数），累加到
+        // 「渲染器持有的帧序号」上。同帧的早退仍会在 pump 里更新
+        // `current_media_time`，所以这里必须先消费计数再判重绘。
+        let uploaded_video_frames = self
+            .uploaded_video_frames
+            .saturating_add(self.pending_video_frames);
+        self.uploaded_video_frames = uploaded_video_frames;
+        self.pending_video_frames = 0;
         let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
             .overlay(render_overlay)
             .danmaku(self.current_danmaku.as_ref())
@@ -1578,14 +1767,42 @@ impl PresenterRuntime {
             self.last_tick_duration = tick_started.elapsed();
             return Ok(self.stats);
         }
+        // 没有新东西要画就整拍跳过：视频帧没变、弹幕字形位置逐项相同、字幕/HUD
+        // 平面逐字节相同、输出尺寸与渲染参数都没变时，重新取样/合成/present
+        // 只会得到与上一拍完全相同的像素。宿主把 render_tick 挂在显示合成回调
+        // 上（每刷新周期一次），30fps 素材会被按刷新率重复上屏数倍——这一段
+        // 就是那部分冗余的全部来源。跳过不会推迟该显示的新帧：只要本拍泵进了
+        // 新解码帧，上面的帧序号就已经变了，必然走到真正的渲染。
+        let layers = self.build_frame_present_state(uploaded_video_frames, render_overlay);
+        if !Self::should_present_frame(self.last_presented_layers.as_ref(), &layers) {
+            self.stats.skipped_composite_frames += 1;
+            self.last_render_duration = Duration::ZERO;
+            self.last_render_current_duration = Duration::ZERO;
+            self.last_render_test_duration = Duration::ZERO;
+            self.last_tick_duration = tick_started.elapsed();
+            return Ok(self.stats);
+        }
+        let video_frame_changed = self
+            .last_presented_layers
+            .as_ref()
+            .map_or(uploaded_video_frames > 0, |last| {
+                last.uploaded_video_frames != uploaded_video_frames
+            });
         let render_started = Instant::now();
         let render_result = self.renderer.render_current_frame(context);
         self.last_render_current_duration = render_started.elapsed();
         self.last_render_duration = self.last_render_current_duration;
         self.last_render_test_duration = Duration::ZERO;
         match render_result {
-            Ok(true) => self.stats.rendered_video_frames += 1,
+            Ok(true) => {
+                self.stats.rendered_video_frames += 1;
+                if video_frame_changed {
+                    self.stats.presented_video_frames += 1;
+                }
+                self.last_presented_layers = Some(layers);
+            }
             Ok(false) => {
+                self.last_presented_layers = Some(layers);
                 if self.render_test_pattern_when_idle {
                     let render_started = Instant::now();
                     self.renderer.render_test_frame(time_seconds)?;
@@ -1635,7 +1852,7 @@ impl PresenterRuntime {
         if trace::enabled() {
             let renderer = self.renderer.runtime_stats();
             trace::log(format!(
-                "[erika-presenter-trace] stage=render_tick media={} player={} gen={} playing={} tick_ms={:.3} pump_ms={:.3} audio_ms={:.3} subtitle_ms={:.3} video_ms={:.3} clock_ms={:.3} plan_ms={:.3} render_ms={:.3} render_current_ms={:.3} render_test_ms={:.3} stats_video={} stats_audio={} stats_subtitle={} stats_overlay={} renderer_rendered={} renderer_offscreen={} renderer_gpu_ms={:.3} audio_queued={} audio_queued_ms={} audio_underflow={} output={}x{} danmaku_items={}",
+                "[erika-presenter-trace] stage=render_tick media={} player={} gen={} playing={} tick_ms={:.3} pump_ms={:.3} audio_ms={:.3} subtitle_ms={:.3} video_ms={:.3} clock_ms={:.3} plan_ms={:.3} render_ms={:.3} render_current_ms={:.3} render_test_ms={:.3} stats_decoded={} stats_composites={} stats_presented={} stats_skipped={} stats_audio={} stats_subtitle={} stats_overlay={} renderer_rendered={} renderer_offscreen={} renderer_gpu_ms={:.3} audio_queued={} audio_queued_ms={} audio_underflow={} output={}x{} danmaku_items={}",
                 duration_label(Some(self.current_media_time)),
                 duration_label(Some(self.player.current_media_time())),
                 self.current_generation,
@@ -1651,6 +1868,9 @@ impl PresenterRuntime {
                 self.last_render_current_duration.as_secs_f64() * 1000.0,
                 self.last_render_test_duration.as_secs_f64() * 1000.0,
                 self.stats.decoded_video_frames,
+                self.stats.rendered_video_frames,
+                self.stats.presented_video_frames,
+                self.stats.skipped_composite_frames,
                 self.stats.pushed_audio_frames,
                 self.stats.decoded_subtitle_frames,
                 self.stats.overlay_frames,
@@ -1680,6 +1900,49 @@ impl PresenterRuntime {
             ));
         }
         Ok(self.stats)
+    }
+
+    /// 这一拍要不要真的做合成上屏。
+    ///
+    /// 返回 `false` 只表示「与上一拍真正画过的内容逐项相同」，此时重复
+    /// present 出来的像素与屏幕上已有的完全相同。首次渲染（还没有上一拍
+    /// 快照）、以及任何一项内容变化都必须返回 `true`。
+    fn should_present_frame(
+        previous: Option<&FramePresentState>,
+        current: &FramePresentState,
+    ) -> bool {
+        previous.is_none_or(|previous| !previous.matches(current))
+    }
+
+    /// 构造本拍的重绘判据快照。**必须**在 `pump_video` 与
+    /// `refresh_stale_danmaku_plan` 之后调用，否则拿到的还是上一拍的帧序号与
+    /// 弹幕计划，会把「本拍刚到的帧」判成重复帧而丢掉。
+    fn build_frame_present_state(
+        &self,
+        uploaded_video_frames: u64,
+        render_overlay: Option<&OverlayFrame>,
+    ) -> FramePresentState {
+        FramePresentState {
+            uploaded_video_frames,
+            media_time: self.current_media_time,
+            generation: self.current_generation,
+            output_width: self
+                .current_surface_metrics
+                .map_or(0, |metrics| metrics.physical_extent.width),
+            output_height: self
+                .current_surface_metrics
+                .map_or(0, |metrics| metrics.physical_extent.height),
+            present_params_generation: self.present_params_generation,
+            danmaku_position_hash: danmaku_position_hash(self.current_danmaku.as_ref()),
+            overlay: render_overlay.cloned(),
+        }
+    }
+
+    /// 声明「渲染输出参数变了」：下一拍必须重绘，即使图层内容看起来没变。
+    /// 渲染器表面上的缩放滤镜、HDR headroom、输出尺寸、以及换帧/清帧这类会
+    /// 直接改动画面的动作都要经过这里。
+    fn bump_present_params(&mut self) {
+        self.present_params_generation = self.present_params_generation.wrapping_add(1);
     }
 
     /// GPU 设备移除（TDR）自愈。Windows 上 D3D11 设备被移除后，渲染器设备与
@@ -2194,6 +2457,10 @@ impl PresenterRuntime {
             current_danmaku_scroll_bucket_count: frame_stats.scroll_bucket_count,
             current_danmaku_scroll_buckets: frame_stats.scroll_buckets,
             current_danmaku_prepared: frame_stats.prepared,
+            current_danmaku_rule_error_count: self
+                .current_danmaku_prepared
+                .as_ref()
+                .map_or(0, |prepared| prepared.prepared.rule_error_count()),
             last_tick_duration: self.last_tick_duration,
             last_pump_duration: self.last_pump_duration,
             last_audio_pump_duration: self.last_audio_pump_duration,
@@ -2237,6 +2504,9 @@ impl PresenterRuntime {
                             if self.rejected_video_import_route.is_some() {
                                 self.rejected_video_import_route = None;
                             }
+                            // 渲染器换帧了：记一笔待消费的新帧，`render_tick`
+                            // 据此判定本拍必须真的合成上屏。
+                            self.pending_video_frames = self.pending_video_frames.saturating_add(1);
                             let pts = frame.pts.unwrap_or(frame.media_time);
                             self.current_media_time = pts;
                             self.current_generation =
@@ -3025,6 +3295,9 @@ impl PresenterRuntime {
             self.stats.render_failures += 1;
             eprintln!("Erika presenter renderer clear failed: {error}");
         }
+        // 帧被丢掉后画面必然要重画一次：即使这不是「新帧」，也不能让上一拍的
+        // 内容快照把这一拍当成重复帧跳过。
+        self.bump_present_params();
     }
 
     fn preserve_current_video_frame_for_transition(&mut self) {
@@ -3040,7 +3313,9 @@ impl PresenterRuntime {
                 .to_string(),
             );
             self.release_current_video_frame();
+            return;
         }
+        self.bump_present_params();
     }
 
     fn preserve_current_video_frame_for_track_transition(&mut self) {
@@ -3056,7 +3331,9 @@ impl PresenterRuntime {
                 .to_string(),
             );
             self.release_current_video_frame();
+            return;
         }
+        self.bump_present_params();
     }
 
     fn quiesce_frame_output(&mut self, operation: &'static str) -> Result<bool> {
@@ -4394,6 +4671,180 @@ mod tests {
         assert!(!should_reject_video_import(Some(rejected), byte_buffer));
     }
 
+    /// 一次合成的判据快照：媒体时间默认不同，用来验证「时钟推进本身不重绘」。
+    fn present_state_at(media_time_millis: u64) -> FramePresentState {
+        FramePresentState {
+            uploaded_video_frames: 1,
+            media_time: Duration::from_millis(media_time_millis),
+            generation: 1,
+            output_width: 1920,
+            output_height: 1080,
+            present_params_generation: 0,
+            danmaku_position_hash: None,
+            overlay: None,
+        }
+    }
+
+    #[test]
+    fn frame_without_new_content_is_not_presented_twice() {
+        let first = present_state_at(1_000);
+        // 首次渲染必须真的上屏：还没有任何一拍的画面对应它。
+        assert!(PresenterRuntime::should_present_frame(None, &first));
+        // 时钟推进而没有任何图层内容变化：重复 present 只会得到同一张画面。
+        let second = present_state_at(1_008);
+        assert!(!PresenterRuntime::should_present_frame(
+            Some(&first),
+            &second
+        ));
+    }
+
+    #[test]
+    fn new_video_frame_forces_present_even_when_nothing_else_changed() {
+        let first = present_state_at(1_000);
+        let mut second = present_state_at(1_008);
+        second.uploaded_video_frames = 2;
+
+        assert!(PresenterRuntime::should_present_frame(
+            Some(&first),
+            &second
+        ));
+    }
+
+    #[test]
+    fn render_parameter_and_output_size_changes_force_present() {
+        let first = present_state_at(1_000);
+
+        let mut upscaler_switched = present_state_at(1_000);
+        upscaler_switched.present_params_generation = 1;
+        assert!(PresenterRuntime::should_present_frame(
+            Some(&first),
+            &upscaler_switched
+        ));
+
+        let mut resized = present_state_at(1_000);
+        resized.output_width = 1280;
+        resized.output_height = 720;
+        assert!(PresenterRuntime::should_present_frame(
+            Some(&first),
+            &resized
+        ));
+
+        let mut reopened = present_state_at(1_000);
+        reopened.generation = 2;
+        assert!(PresenterRuntime::should_present_frame(
+            Some(&first),
+            &reopened
+        ));
+    }
+
+    #[test]
+    fn unchanged_overlay_layers_do_not_force_present() {
+        let overlay = OverlayFrame {
+            pts: Duration::from_millis(1_000),
+            viewport: OverlayViewport::new(1920, 1080),
+            subtitle_planes: vec![SubtitleBitmapPlane::new(0, 0, 2, 2, vec![1, 2, 3, 4])],
+            subtitle_alpha_planes: Vec::new(),
+            subtitle_changed: false,
+        };
+        let mut first = present_state_at(1_000);
+        first.overlay = Some(overlay.clone());
+
+        // 同一份字幕内容、只是 pts 走了一拍：不需要重绘。
+        let mut second = present_state_at(1_008);
+        let mut same_content = overlay;
+        same_content.pts = Duration::from_millis(1_008);
+        second.overlay = Some(same_content);
+        assert!(!PresenterRuntime::should_present_frame(
+            Some(&first),
+            &second
+        ));
+
+        // 字幕画面变了（libass 增量渲染报 changed）必须重绘。
+        let mut changed = present_state_at(1_008);
+        let mut relabeled = second.overlay.clone().expect("overlay set above");
+        relabeled.subtitle_changed = true;
+        changed.overlay = Some(relabeled);
+        assert!(PresenterRuntime::should_present_frame(
+            Some(&first),
+            &changed
+        ));
+
+        // 字幕像素变了（调试 HUD 平面走这条）也必须重绘。
+        let mut pixels_grew = present_state_at(1_008);
+        let mut grown = second.overlay.clone().expect("overlay set above");
+        grown.subtitle_planes[0].rgba = vec![1, 2, 3, 5];
+        pixels_grew.overlay = Some(grown);
+        assert!(PresenterRuntime::should_present_frame(
+            Some(&first),
+            &pixels_grew
+        ));
+
+        // 字幕整体消失同样要重绘。
+        let mut cleared = present_state_at(1_008);
+        cleared.overlay = None;
+        assert!(PresenterRuntime::should_present_frame(
+            Some(&first),
+            &cleared
+        ));
+    }
+
+    #[test]
+    fn danmaku_plan_hash_tracks_glyph_motion_only() {
+        let viewport = DanmakuViewport::new(1920, 1080);
+        let mut moved = DanmakuRenderPlan::empty(Duration::from_millis(1_000), 1, viewport);
+        moved.items.push(crate::danmaku::DanmakuGlyphInstance {
+            item_id: 7,
+            rect: [10.0, 20.0, 4.0, 6.0],
+            tex_rect: [0.0, 0.0, 0.5, 0.5],
+            color_rgba: [1.0, 1.0, 1.0, 1.0],
+            outline_rgba: [0.0, 0.0, 0.0, 1.0],
+            shadow_rgba: [0.0, 0.0, 0.0, 0.5],
+            shadow_offset: [1.0, 1.0],
+        });
+        let hash_at_ten = danmaku_position_hash(Some(&moved));
+
+        let mut advanced = moved.clone();
+        advanced.media_time = Duration::from_millis(1_008);
+        advanced.items[0].rect[0] = 18.0;
+        assert_ne!(
+            hash_at_ten,
+            danmaku_position_hash(Some(&advanced)),
+            "a scrolling danmaku that moved must change the position hash"
+        );
+
+        // 只有时间戳推进、字形位置一个都没动（暂停/时钟停滞时的重复计划）：
+        // 摘要必须保持相等，否则弹幕层会一直触发重绘。
+        let mut frozen = moved.clone();
+        frozen.media_time = Duration::from_millis(2_000);
+        assert_eq!(hash_at_ten, danmaku_position_hash(Some(&frozen)));
+
+        // 没有弹幕计划时摘要为 None；空计划与它必须被判成相等，否则
+        // 「本来就没有弹幕」会被当成内容变化，每拍都重绘。
+        assert_eq!(None, danmaku_position_hash(None));
+        let empty = DanmakuRenderPlan::empty(Duration::from_millis(1_000), 1, viewport);
+        let mut without_danmaku = present_state_at(1_008);
+        without_danmaku.danmaku_position_hash = danmaku_position_hash(Some(&empty));
+        let mut no_plan = present_state_at(1_000);
+        no_plan.danmaku_position_hash = danmaku_position_hash(None);
+        assert!(!PresenterRuntime::should_present_frame(
+            Some(&no_plan),
+            &without_danmaku
+        ));
+    }
+
+    #[test]
+    fn danmaku_glyph_motion_forces_present() {
+        let mut first = present_state_at(1_000);
+        first.danmaku_position_hash = Some(0x1111);
+        let mut second = present_state_at(1_008);
+        second.danmaku_position_hash = Some(0x2222);
+
+        assert!(PresenterRuntime::should_present_frame(
+            Some(&first),
+            &second
+        ));
+    }
+
     #[test]
     fn rejected_mediacodec_bytebuffer_route_suppresses_repeat_failures() {
         let rejected = RejectedVideoImportRoute::new(DecoderBackend::MediaCodec, false, 7);
@@ -4554,6 +5005,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            // 测试构造的条目没有发送者元数据，屏蔽规则里 `<标识>` / `[用户名]` /
+            // `level:` 三类对它不生效（与真实来源缺失这些字段时的行为一致）。
+            user_id: String::new(),
+            user_name: String::new(),
+            user_level: 0,
         }
     }
 
@@ -5172,6 +5628,48 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         );
     }
 
+    /// 端到端（真实 presenter + 真实渲染器）验证整拍跳过：第二次及之后的
+    /// tick 内容与第一拍完全相同，`render_current_frame` 根本不会被调用——
+    /// 跳过的那几拍 `last_render_duration` 归零就是证据（被调用的那一拍
+    /// 一定留下非零耗时）。
+    #[test]
+    fn idle_ticks_skip_the_renderer_entirely_after_the_first_present() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+
+        let first = presenter.render_tick(0.0).unwrap();
+        assert_eq!(first.skipped_composite_frames, 0);
+        assert!(
+            presenter.runtime_snapshot().last_render_duration > Duration::ZERO,
+            "the first tick must reach the renderer"
+        );
+
+        let second = presenter.render_tick(0.016).unwrap();
+        assert_eq!(second.skipped_composite_frames, 1);
+        assert_eq!(
+            presenter.runtime_snapshot().last_render_duration,
+            Duration::ZERO,
+            "an unchanged tick must not call into the renderer"
+        );
+
+        let third = presenter.render_tick(0.032).unwrap();
+        assert_eq!(third.skipped_composite_frames, 2);
+        assert_eq!(third.rendered_video_frames, 0);
+
+        // 输出参数变化必须立刻恢复真实渲染（这里用 headroom：它和缩放滤镜、
+        // surface 尺寸一样只改渲染参数、不改图层内容，是最容易被判据漏掉的一类）。
+        presenter.set_output_headroom(1000.0, true);
+        let retuned = presenter.render_tick(0.048).unwrap();
+        assert_eq!(retuned.skipped_composite_frames, 2);
+        assert!(
+            presenter.runtime_snapshot().last_render_duration > Duration::ZERO,
+            "a render-parameter change must force a real composite"
+        );
+
+        // …而且只恢复那一拍：参数没再变就继续跳过。
+        let settled = presenter.render_tick(0.064).unwrap();
+        assert_eq!(settled.skipped_composite_frames, 3);
+    }
+
     #[test]
     #[cfg(feature = "wgpu")]
     fn foreground_tick_keeps_video_resume_pending_until_surface_is_ready() {
@@ -5369,6 +5867,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: crate::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            user_id: String::new(),
+            user_name: String::new(),
+            user_level: 0,
         }])
         .unwrap();
         let mut stale_engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
@@ -5502,6 +6003,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: crate::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            user_id: String::new(),
+            user_name: String::new(),
+            user_level: 0,
         }])
         .unwrap();
         let mut fallback_engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());

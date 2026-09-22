@@ -9,12 +9,14 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use std::collections::HashMap;
 
+use super::DanmakuFilterBreakdown;
 use super::dfm_core::{
     filters::{FilterContext, FilterSystem},
     model::{DanmakuItem, DanmakuType, Duration, GlobalFlags},
     retainer::DanmakuRetainer,
 };
 use super::outline::resolve_width_px;
+use super::rules::RuleError;
 use std::hash::{Hash, Hasher};
 
 const STATIC_DURATION_MS: i64 = 3800;
@@ -31,6 +33,12 @@ pub struct PrepareItem {
     pub font_size: f32,
     pub paint_width: f64,
     pub paint_height: f64,
+    /// 发送者标识（B 站 XML 的 `user_hash` 或录播姬的 uid）；空串 = 未知。
+    pub user_id: String,
+    /// 发送者用户名；空串 = 未知（B 站点播 XML 不提供）。
+    pub user_name: String,
+    /// 发送者等级；0 = 未知。
+    pub user_level: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +72,12 @@ pub struct PreparedLayout {
     pub items: Vec<PreparedItem>,
     pub item_times: Vec<f64>,
     pub track_count: i32,
+    /// 屏蔽规则的编译诊断（写错的正则/类型名）。空表示全部规则都编译成功；
+    /// 有值时那些规则**没有生效**，调用方可以打日志或回显给用户。
+    pub rule_errors: Vec<RuleError>,
+    /// 被屏蔽条目按原因分类的计数（分类之和 == 被丢弃的条数）。
+    /// 供界面显示「被什么屏蔽了多少条」，而不只是一个总数。
+    pub filter_breakdown: DanmakuFilterBreakdown,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +123,8 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
     let global_flags = GlobalFlags::default();
     let outline_width = request.outline_width.max(0.0) as f32;
     let outline_px = resolve_width_px(font_size, outline_width);
+    // 由下面的屏蔽规则编译赋值一次（此处不初始化，避免「赋了值又被覆盖」的告警）。
+    let rule_errors;
 
     let mut items = request
         .items
@@ -131,6 +147,11 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
             );
             item.index = i as u32;
             item.alpha = (raw.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+            // 发送者元数据只服务屏蔽规则，不参与布局；未知来源就是空串/0，
+            // 规则引擎会据此跳过对应的判定分支。
+            item.user_id = raw.user_id;
+            item.user_name = raw.user_name;
+            item.user_level = raw.user_level;
             if raw.paint_width > 0.0 && raw.paint_height > 0.0 {
                 item.paint_width = raw.paint_width as f32 + outline_px * 2.0;
                 item.paint_height = raw.paint_height as f32;
@@ -178,6 +199,8 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
     }
     filter_sys.duplicate_merge = request.merge_danmaku;
     filter_sys.set_block_words(&request.block_words);
+    // 写错的规则不能静默失效：诊断随 prepared layout 带出去。
+    rule_errors = filter_sys.rule_errors.clone();
 
     let scroll_duration = Duration::new(scroll_dur_ms);
     let mut ctx = FilterContext {
@@ -258,6 +281,15 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
         }
     }
 
+    // 屏蔽命中统计：按 `filter_param` 分类。放在轨道分配之后统计，才能把
+    // 「轨道装不下 / 被合并掉」的那部分也算进去（它们用码 99）。
+    let mut filter_breakdown = DanmakuFilterBreakdown::default();
+    for (_, _, _, _, item) in &items {
+        if item.is_filtered {
+            filter_breakdown.add_filter_param(item.filter_param);
+        }
+    }
+
     let mut prepared_items = Vec::with_capacity(items.len());
     for (source_id, is_me, raw_font_size, duplicate_count, item) in &mut items {
         if item.is_filtered {
@@ -308,6 +340,8 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
         items: prepared_items,
         item_times,
         track_count: ((height * display_area) / (font_size * 1.2 * 1.25)).max(1.0) as i32,
+        rule_errors,
+        filter_breakdown,
     })
 }
 

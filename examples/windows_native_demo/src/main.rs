@@ -257,6 +257,9 @@ mod windows_demo {
                 },
                 opacity: 1.0,
                 is_self: false,
+                user_id: String::new(),
+                user_name: String::new(),
+                user_level: 0,
             });
         }
         DanmakuTimeline::new(items).map_err(|error| erika::PlayerError::Renderer(error.to_string()))

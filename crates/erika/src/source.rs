@@ -1,15 +1,16 @@
 #[cfg(target_os = "android")]
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "android")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -24,6 +25,18 @@ pub enum SourceError {
     Io(String),
     #[error("http error: {0}")]
     Http(String),
+    /// **暂时性**读取失败：传输层断连/超时/body 读错误/5xx —— 源可能马上又能用。
+    ///
+    /// 与 [`SourceError::Http`] 的区别就是"该不该等"：调用方（
+    /// [`HttpRangeSource::read_range_with_transient_wait`]）会吸收本变体，
+    /// 退避重试并等待字节回来（mpv `paused-for-cache` 语义）；
+    /// 而 `Http` 是**终局**（4xx/签名过期、Range 被忽略、Content-Range 违约、
+    /// 帧内数据错位）——那些重试多少次都不会好，必须立刻让宿主换源。
+    ///
+    /// 分类由 `fetch_http_range` 产生：重试耗尽时按 `http_error_is_retryable`
+    /// （传输错误与 5xx = 可重试 → 本变体；4xx = 不可重试 → `Http`）判定。
+    #[error("transient http error: {0}")]
+    Transient(String),
     #[error("unsupported source URI: {0}")]
     Unsupported(String),
     #[error("invalid owned file descriptor URI: {0}")]
@@ -61,7 +74,14 @@ pub struct SourceDiagSnapshot {
     pub cache_start: u64,
     /// 当前缓存窗口终点（字节，含）。
     pub cache_end: u64,
-    /// 正在下载的预取段数（多连接并行 in-flight）。
+    /// 正在下载的**段/连接数**（in-flight）。
+    ///
+    /// 语义分两条通路（2026-09-03）：
+    ///   - 顺序长读（生产默认）：**0 或 1**——只有一条持续读的长连接，
+    ///     0 可能是"正在背压等待"（缓冲已满）或"读完收工"；
+    ///   - 旧分段路径：并行预取段数 + 整片桶（历史上稳态 5~6）。
+    /// 宿主判"源是否空闲"必须结合 `demux_cache_end`（0 且窗口为空才是真空闲）：
+    /// 长读路径下 0 只表示"此刻没在读 socket"，不代表没数据。
     pub prefetch_in_flight: usize,
     /// **实时**累计已接收字节（字节在线路上到达即计入，不等待整段完成）。
     ///
@@ -95,13 +115,201 @@ pub struct SourceDiagSnapshot {
     /// 从 0 顺序预载的进度混进来，seek 后窗口被严重高估 → ABR「余粮充足」
     /// 误判不降档 / starve 判不出来（2026-09-02 无感化改造 K4）。
     pub demux_cache_end: u64,
+    /// **本片是否已完整缓冲到服务端声明的文件末尾**（"不需要再下载了"）。
+    ///
+    /// 判据：长读窗口的网络填充前沿 `write_pos` 已经到达服务端声明的总长
+    /// `total`（首个 206 的 `Content-Range: bytes x-y/total` 回填，或 HEAD）。
+    /// 旧分段路径下退化为 `cache_end >= content_length`。
+    ///
+    /// **为什么必须独立成字段**（真机事故 2026-09-15）：整片下载完之后
+    /// `write_pos` 不再前进 → 「距上次收到字节」的时间戳一路涨到几百秒，
+    /// 与"链路死了"在**任何只看到达字节的指标上完全同形**。宿主因此打出
+    /// `vstall=596s` / `采用供给0.00Mbps`，读起来像"没网速"，实际是
+    /// "已经下完了"。本字段是唯一能把这两种现实分开的**正面事实**：
+    /// 它为真时，`stalled_sec` 大、`est_bps` 为 0 都是**预期**，不是故障。
+    ///
+    /// ⚠️ **不要**用 [`Self::cache_end`]（`max(demux, 整片预载桶)`）判：桶的
+    /// `covered_until` 只增不减，且从 0 顺序预载，seek 后仍停在旧前沿。这里
+    /// 用**长读窗口自己的** `write_pos`——它就是"这条流真的读到哪了"。
+    pub whole_file_cached: bool,
     /// 源 host 代数（每次实际切换 +1）。宿主据此确认 request_host_switch 已生效。
     pub host_epoch: u64,
+    /// 该槽的读路径此刻是否正处在「暂时读不到数据、退避重试中」的等待窗口
+    /// （见 [`HttpRangeSource::read_range_with_transient_wait`]）。
+    ///
+    /// 语义与 `prefetch_in_flight` **不同**：后者只说明"有段在飞"，段挂死时同样
+    /// 为真；本字段只在"读请求已经失败、源正在等待字节回来"时为真。
+    /// 内核 worker 读它对外发 `BufferingChanged`，宿主据此显示"缓冲中"而不是
+    /// 把这段静止当成"源已死"——这是 mpv `paused-for-cache` 的对等语义：
+    /// **等数据，不判整条流失败**。
+    ///
+    /// 置位时机：等待窗口打开；清除时机：读恢复、等待窗口判定为真死、或源析构。
+    pub transient_wait: bool,
+    /// **累计已发出的 HTTP Range 请求数**（进程级单调，**含重试与断点续传**）。
+    ///
+    /// 口径：每一次真正打到网络的 GET 记 1。计数点在**唯一发请求的那一处**
+    /// ——[`fetch_http_range`] 的重试循环里、`request.call()` 之前；因此一次
+    /// 逻辑 fetch 因失败重试或断点续传发出的**每一个**请求都各记 1（三次
+    /// 尝试 = +3）。**不在调用点计数**：调用点记数会把重试合并成 1 次，
+    /// "请求放大"这一现象（重试/续传把请求数推高、每请求平均字节被拖低）
+    /// 就看不出来了，而这恰恰是判定"是不是被 CDN 限速"的关键证据。
+    ///
+    /// **进程级单调、永不清零**：故意不在源构造/析构时复位。宿主同进程里
+    /// 存在短命的"探针源"（`probe_http_total_length` 只为探长度而建），把
+    /// 计数挂在源实例上、或构造时清零，探针一构造就会把正在播放那条流的
+    /// 计数洗掉，宿主两次轮询的差分随即失真。单调总量 + 宿主差分是唯一稳的
+    /// 口径（与 `downloaded_bytes` 的差分同一套做法）。换源/重开播都不复位：
+    /// 宿主读到的（差分得到的）是"当前这一刻本槽的请求速率"，与源实例无关。
+    pub http_requests: u64,
+    /// 与 [`Self::http_requests`] **同口径**的累计已收字节（进程级单调）。
+    ///
+    /// 用途：算"平均每个请求收回多少字节"（`http_request_bytes /
+    /// http_requests`），即"请求画像"的均值一侧。**不能拿 `downloaded_bytes`
+    /// 去除**：后者是**源级**计数（`Drop` 时注销、换源即从 0 起），与进程级
+    /// 单调的 `http_requests` 生命周期不同，换过源的会话里这个商会把分母
+    /// 留在历史值上 → 得到远小于真值的伪均值。两个进程级单调量相除才自洽。
+    ///
+    /// 口径含失败请求：连接失败/5xx 的请求只进分母（收到 0 字节），均值因此
+    /// 天然反映"重试浪费"——正常顺序预取时它应接近**段大小**（段上限
+    /// 256KB）；显著偏低说明请求在空转（在飞段没填满 / 段被反复作废）。
+    pub http_request_bytes: u64,
+    // ---- 滑动窗口分层缓存（2026-09-04）----
+    /// **内存层（热区）常驻字节数**：顺序长读窗口里实际躺着的字节
+    /// （前向 read-ahead + 后向回看）。单位：字节。上限见 `memory_budget_bytes`。
+    pub cache_memory_bytes: u64,
+    /// **磁盘层（冷区）当前字节数**：热区淘汰下来、按段落盘的区间总量
+    /// （含仍在内存缓冲写、尚未落盘的尾部）。单位：字节；上限由冷区预算
+    /// （`ERIKA_HTTP_COLD_BUDGET_BYTES`，默认 256MiB）钉住，超限丢最久远的段。
+    pub cache_disk_bytes: u64,
+    /// **冷区（磁盘层）命中次数**（累计单调，含跨冷/热边界的前缀命中）。
+    ///
+    /// 口径：每一次"因为冷区里有字节而**没有**发网络请求"的读记 1。它是
+    /// "回拖/重播不重下"的现场证据：用户在已缓冲区间里拖动时，这个数在涨，
+    /// 而 `http_requests` 不涨。
+    pub cold_hits: u64,
+    /// 冷区命中字节数（累计单调，与 `cold_hits` 同口径配对）。
+    pub cold_hit_bytes: u64,
+    /// **内存层硬上限**（字节预算）：`前后向缓存字节数之和`永不超过它。
+    /// 默认视频/单流 24MiB、音频 6MiB（`ERIKA_HTTP_WINDOW_MEMORY_BYTES` 覆盖），
+    /// 且永不低于宿主配置的 read-ahead + back（不许比改造前更小）。
+    pub memory_budget_bytes: u64,
+    /// **前向预算**（字节）：当前"往前读到哪"的目标——由时间预算
+    /// `N`（秒）× 实测码率算出，弱网下 N 变大（180s 上限），因此这个值也变大。
+    /// 达到它读线程就停在那里（背压），消费推进后再往前补。
+    pub forward_budget_bytes: u64,
+    /// 当前**前向可播秒数** = 前向缓冲字节 ÷ 实测码率（无码率估计时为 0）。
+    /// 这是"弱网更激进"最直观的验收数字：吞吐越低，它应当越大。
+    pub forward_playable_secs: f64,
+    /// **窗口未满期间实测到的链路吞吐**（字节/秒，500ms 窗口 + 0.3/0.7 EMA）。
+    ///
+    /// 口径与为什么可信：只有窗口**没满**（读线程真的在读 socket）的时间片才
+    /// 采样；窗口满（背压）时不采样、不衰减，所以本值反映"链路能推多快"，
+    /// 而**不会**被"客户端故意不读"钳成消费速率。宿主判"能不能升画质/换源"
+    /// 要的是这个口径。读数路径：顺序长读线程直接写全局槽，宿主 500ms poll
+    /// 直接读，**不经过 demux 线程**——demux 阻塞在别处也照样新鲜。
+    /// 0.0 = 尚未测得（如全程都在背压/还未开始读）。
+    ///
+    /// **它同时是滑动窗口预算里"实测吞吐"的唯一来源**（内核 `supply_estimate_bps`）：
+    /// 预算与宿主读的是同一个数，不存在两套互相打架的网速判断。
+    pub fill_throughput_bps: f64,
+    /// 顺序长读的**连接重建总次数**（= 除首个请求外多出来的请求数）。
+    ///
+    /// 恒等式：**某条流的请求数 = 1 + `stream_reconnects_total`**（首个请求不算
+    /// 重建）。宿主可用它把自己的 `http_requests` 差分拆开。
+    ///
+    /// 现场判据：**正常顺序播放期间它应当为 0**（一条连接读到底）。它不是 0 时，
+    /// 用下面四个分桶字段看是谁的锅——用户的真机实测正是靠这几个数分清
+    /// "CDN 提前收线"与"我们的 reset/换源"。
+    pub stream_reconnects_total: u64,
+    /// 分桶：**服务端提前收线 / body 传输错误**（本次连接收到过字节）。CDN 行为。
+    ///
+    /// 用户真机实测的形态：CDN 声明了完整 `Content-Range` 却在约 1MB 处收线，
+    /// 内核静默续传——每 ~1MB 一个请求，稳定 ~0.5 次/秒。这**不是**内核的 bug，
+    /// 但也无法消除：请求数下界 = 实际下载字节 ÷ CDN 每次连接愿给的字节。
+    pub stream_reconnects_early_close: u64,
+    /// 分桶：连接建立后**一个字节都没收到**（限流/瞬时错误，退避重试）。
+    pub stream_reconnects_empty: u64,
+    /// 分桶：本地 `reset()`（seek 出窗 / 回拖超出后向窗口 / 乱序读）。
+    /// 顺序播放期间应当为 0；它涨说明 demux 在窗口外跳读。
+    pub stream_reconnects_reset: u64,
+    /// 分桶：换 host（`host_epoch` 变化）导致的重建。
+    pub stream_reconnects_host_switch: u64,
+    /// **分片式 CDN 的正常续传次数**：服务端用有界 `Content-Range`
+    /// （`end + 1 < total`）明确表示"这次只给这一段"，内核在分片边界续传。
+    /// 计入 `stream_reconnects_total`，但语义是"按服务端节奏走"，不是故障。
+    pub stream_chunk_resumes: u64,
+    /// **判决实验（假说 D）**：请求起点与"上一次连接结束时的前沿"一致的次数
+    /// ——即**断点续传**。单调递增的请求序列会全部落进这个桶。
+    pub stream_range_contiguous: u64,
+    /// 判决实验：起点**大于**前沿的次数（前向跳读）。
+    pub stream_range_forward_jumps: u64,
+    /// 判决实验：起点**小于**前沿的次数（**回拖 = demux 在 seek**）。
+    /// 它明显非零时，请求放大的根因是 demux 的读模式，**与 CDN 无关**。
+    pub stream_range_backward_jumps: u64,
+    /// 最近一次 Range 请求的起点偏移（字节）。
+    pub stream_range_last_start: u64,
+    /// 最近一条连接实际收到的字节数。"每条连接给多少字节"的分布是判
+    /// "CDN 有固定配额 / 还是停读导致"（调研疑问 1）的一手数据。
+    pub stream_last_connection_bytes: u64,
+    /// 所有连接里收到字节最多的那一条（看有没有长连接真跑出过大块）。
+    pub stream_max_connection_bytes: u64,
+    /// **最近一次换源的可读原因**（如
+    /// `upos-a.bilivideo.com → upos-b.bilivideo.com：starving(前向0.8s<2.0s 持续3.2s)`）。
+    /// 空串 = 本轮还没换过。宿主直接把它显示在诊断面板上：用户看到"换源 N 次"
+    /// 时必须能同时看到"为什么换"（"看得见才算数"）。
+    pub last_host_switch_reason: String,
+    // ---- seek 出窗的**跨节点并行回填**（2026-09-15；形态约束见文件上方整段）----
+    /// **累计跨节点并行回填批次数**：每次"seek 到未缓冲位置"尝试并行 +1。
+    ///
+    /// **正常顺播期间恒不涨**——这就是把三种形态分开的那个数：
+    ///   - 纯顺播（一条 open-ended Range）：`seek_fill_batches` 不动；
+    ///   - seek 走了跨节点 N 段：`seek_fill_batches` 与 `seek_fill_connections` 同涨；
+    ///   - **seek 退化为单连接**（门禁否决/分段失败）：`seek_fill_batches` 涨、
+    ///     `seek_fill_gate_denied` 或 `seek_fill_fallbacks` 涨、而
+    ///     `seek_fill_connections` 几乎不涨。
+    /// 有了这三个数，`http_requests` 上涨才不会被误读成"退化成 downloader"。
+    pub seek_fill_batches: u64,
+    /// 累计建立的并行分段连接数（每个候选节点一条；含只做了下载前预检的段）。
+    pub seek_fill_connections: u64,
+    /// 累计**被采用**的跨节点并行字节数（回退时被丢弃的段不计）。
+    pub seek_fill_bytes: u64,
+    /// **下载前门禁否决**次数（ETag/文件总长缺失或不一致 → 退回单节点）。
+    /// 它涨说明"这次没并行是因为证据不足"，**不是并行没生效**。
+    pub seek_fill_gate_denied: u64,
+    /// 回退到单连接的批次次数（任一段失败/超时/比对不过/期间又 seek 了）。
+    pub seek_fill_fallbacks: u64,
+    /// 边界重叠逐字节比对**通过**的批次数（跨节点数据一致性的直接证据）。
+    pub seek_fill_overlap_ok: u64,
+    /// 边界重叠逐字节比对**失败**的批次数。`> 0` 时请立刻看日志那一行：
+    /// 该批已被整批丢弃并回退，**没有任何可疑字节进过播放流**。
+    pub seek_fill_overlap_mismatch: u64,
+    /// 最近一次批次的段数（0 = 本次会话还没走过跨节点并行）。
+    pub seek_fill_last_segments: u64,
+    /// **当前在飞的分段连接数**（0 = 没有并行批次在跑）。用户要的"用了几条连接"
+    /// 当场可读；它同时是硬上限 [`SEEK_PARALLEL_MAX_CONNECTIONS`] 的执行依据
+    /// （超过上限的新批次会被整批放弃，见 `run_seek_fill`）。
+    pub seek_fill_in_flight: u64,
+    /// 最近一次批次被采用的字节数。
+    pub seek_fill_last_bytes: u64,
+    /// 最近一次批次墙钟（毫秒）。
+    pub seek_fill_last_ms: u64,
+    /// 最近一次批次"同一批数据用单连接拉"的预计墙钟（毫秒）。实测 ÷ 它
+    /// 就是**可复核的提速幅度**（日志那一行同时给出两个数）。
+    pub seek_fill_last_expected_ms: u64,
+    /// 最近一次批次是否最终回退（true = 这次 seek 走了单连接串行）。
+    pub seek_fill_last_fallback: bool,
+    /// 最近一次**下载前门禁裁定的可读理由**（内核原文，宿主原样展示：
+    /// 用户看到"没加速"时必须能同时看到"为什么"）。
+    pub seek_fill_last_gate_reason: String,
+    /// 自适应关闭：连续实测到"并行没有叠加"（例如 CDN 按出口 IP 限速）已停用
+    /// 本会话的并行。此时 seek 仍走单连接——**不是功能坏了，是测出来没用**。
+    pub seek_fill_disabled: bool,
 }
 
 /// 诊断槽数。DASH 双流（video + audio）各占一槽独立发布/清空，互不覆盖；
 /// 单流/直播只用槽 0。见 `HttpRangeSource::with_http_headers_and_diag_slot`。
-const SOURCE_DIAG_SLOTS: usize = 2;
+/// 内核 worker 遍历全部槽判定"源是否在等字节"（`core::source_transient_wait_active`）。
+pub(crate) const SOURCE_DIAG_SLOTS: usize = 2;
 
 static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new([
     SourceDiagSnapshot {
@@ -116,6 +324,46 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
         candidate_count: 0,
         demux_cache_end: 0,
         host_epoch: 0,
+        whole_file_cached: false,
+        transient_wait: false,
+        http_requests: 0,
+        http_request_bytes: 0,
+        cache_memory_bytes: 0,
+        cache_disk_bytes: 0,
+        cold_hits: 0,
+        cold_hit_bytes: 0,
+        memory_budget_bytes: 0,
+        forward_budget_bytes: 0,
+        forward_playable_secs: 0.0,
+        fill_throughput_bps: 0.0,
+        stream_reconnects_total: 0,
+        stream_reconnects_early_close: 0,
+        stream_reconnects_empty: 0,
+        stream_reconnects_reset: 0,
+        stream_reconnects_host_switch: 0,
+        stream_chunk_resumes: 0,
+        stream_range_contiguous: 0,
+        stream_range_forward_jumps: 0,
+        stream_range_backward_jumps: 0,
+        stream_range_last_start: 0,
+        stream_last_connection_bytes: 0,
+        stream_max_connection_bytes: 0,
+        last_host_switch_reason: String::new(),
+        seek_fill_batches: 0,
+        seek_fill_connections: 0,
+        seek_fill_bytes: 0,
+        seek_fill_gate_denied: 0,
+        seek_fill_fallbacks: 0,
+        seek_fill_overlap_ok: 0,
+        seek_fill_overlap_mismatch: 0,
+        seek_fill_last_segments: 0,
+        seek_fill_in_flight: 0,
+        seek_fill_last_bytes: 0,
+        seek_fill_last_ms: 0,
+        seek_fill_last_expected_ms: 0,
+        seek_fill_last_fallback: false,
+        seek_fill_last_gate_reason: String::new(),
+        seek_fill_disabled: false,
     },
     SourceDiagSnapshot {
         content_length: None,
@@ -129,9 +377,48 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
         candidate_count: 0,
         demux_cache_end: 0,
         host_epoch: 0,
+        whole_file_cached: false,
+        transient_wait: false,
+        http_requests: 0,
+        http_request_bytes: 0,
+        cache_memory_bytes: 0,
+        cache_disk_bytes: 0,
+        cold_hits: 0,
+        cold_hit_bytes: 0,
+        memory_budget_bytes: 0,
+        forward_budget_bytes: 0,
+        forward_playable_secs: 0.0,
+        fill_throughput_bps: 0.0,
+        stream_reconnects_total: 0,
+        stream_reconnects_early_close: 0,
+        stream_reconnects_empty: 0,
+        stream_reconnects_reset: 0,
+        stream_reconnects_host_switch: 0,
+        stream_chunk_resumes: 0,
+        stream_range_contiguous: 0,
+        stream_range_forward_jumps: 0,
+        stream_range_backward_jumps: 0,
+        stream_range_last_start: 0,
+        stream_last_connection_bytes: 0,
+        stream_max_connection_bytes: 0,
+        last_host_switch_reason: String::new(),
+        seek_fill_batches: 0,
+        seek_fill_connections: 0,
+        seek_fill_bytes: 0,
+        seek_fill_gate_denied: 0,
+        seek_fill_fallbacks: 0,
+        seek_fill_overlap_ok: 0,
+        seek_fill_overlap_mismatch: 0,
+        seek_fill_last_segments: 0,
+        seek_fill_in_flight: 0,
+        seek_fill_last_bytes: 0,
+        seek_fill_last_ms: 0,
+        seek_fill_last_expected_ms: 0,
+        seek_fill_last_fallback: false,
+        seek_fill_last_gate_reason: String::new(),
+        seek_fill_disabled: false,
     },
 ]);
-
 /// 每槽位的「实时已收字节」计数器集合（一个槽可能同时登记多个计数器：
 /// 源自身的 `rx` + 整片预载桶的 `downloaded`）。
 ///
@@ -140,6 +427,103 @@ static SOURCE_DIAG: Mutex<[SourceDiagSnapshot; SOURCE_DIAG_SLOTS]> = Mutex::new(
 /// `est_bps` 不再失真的基础。源构造时登记、`Drop` 时按 `Arc::ptr_eq` 注销。
 static SOURCE_RX: Mutex<[Vec<Arc<AtomicU64>>; SOURCE_DIAG_SLOTS]> =
     Mutex::new([Vec::new(), Vec::new()]);
+
+/// **HTTP 请求画像**的进程级单调计数器（每槽一份）：累计已发出的 HTTP Range
+/// 请求数（含重试与断点续传）。计数点在 [`fetch_http_range`] 里唯一发请求的
+/// 那一处，口径见 [`SourceDiagSnapshot::http_requests`]。
+///
+/// 为什么是"进程级 + 单调 + 永不清零"：宿主同进程里存在短命的"探针源"
+/// （`probe_http_total_length` 只为探总长而建），若计数挂在源实例上、或源
+/// 构造时清零，探针一构造就会把正在播放那条流的计数洗掉，宿主两次轮询的
+/// 差分随即失真。单调总量 + 宿主差分是唯一稳的口径（与 `downloaded_bytes`
+/// 同一套做法）；换源、重开播都不复位。
+static SOURCE_HTTP_REQUESTS: [AtomicU64; SOURCE_DIAG_SLOTS] =
+    [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// 与 `SOURCE_HTTP_REQUESTS` 配对的"累计已收字节"（同口径、同生命周期、
+/// 同一处累加）。只用于算"平均每请求多少字节"——两个原子量必须同源同寿命，
+/// 相除才自洽（拿**源级**的 `downloaded_bytes` 去除，换过源就会得到把分母
+/// 留在历史值上的伪均值）。
+static SOURCE_HTTP_REQUEST_BYTES: [AtomicU64; SOURCE_DIAG_SLOTS] =
+    [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// **填窗期实测吞吐**（每槽一份，`f64` 位模式装在 `AtomicU64` 里）。
+///
+/// 口径见 [`SourceDiagSnapshot::fill_throughput_bps`]：只在窗口未满（读线程
+/// 真的在读 socket）的时间片上采样，因此不会被"客户端故意不读"的背压钳成
+/// 消费速率。由顺序长读线程直接写、宿主的 500ms poll 直接读——不经过 demux
+/// 线程，所以 demux 阻塞在长 join 上时宿主照样能读到新鲜值。
+static SOURCE_FILL_BPS: [AtomicU64; SOURCE_DIAG_SLOTS] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// 发布填窗期吞吐到全局槽（宿主 poll 读它）。
+fn store_fill_bps(slot: usize, bps: f64) {
+    if let Some(entry) = SOURCE_FILL_BPS.get(slot) {
+        entry.store(bps.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// 读取填窗期吞吐（未测得为 0.0）。
+fn load_fill_bps(slot: usize) -> f64 {
+    SOURCE_FILL_BPS
+        .get(slot)
+        .map(|entry| f64::from_bits(entry.load(Ordering::Relaxed)))
+        .unwrap_or(0.0)
+}
+
+/// **滑动窗口预算使用的"实测吞吐"口径（唯一入口）。**
+///
+/// 为什么集中到这一个函数：网速判断必须只有一套。内核侧曾有三套来源
+/// （`est_bps` 的 2s EMA、宿主 `policy::LinkThroughput` 的填窗期 EMA、以及
+/// 自适应测量层）。本函数明确：**预算只用"填窗期实测吞吐"**，它的唯一事实源
+/// 就是内核顺序长读线程自己采样并发布的 [`SourceDiagSnapshot::fill_throughput_bps`]
+/// （全局槽 `SOURCE_FILL_BPS[slot]`，宿主 500ms 轮询读的也是同一个值）。
+/// 宿主若要做统一供给估计（如 `supply_estimate_bps()`），**直接读这个字段即可**
+/// ——不要再另起一套 EMA，也不要再喂 `est_bps`（`est_bps` 是"全部到达字节速率"，
+/// 窗口满时会退化成消费速率，口径不同，只服务旧分段路径的自适应）。
+///
+/// 返回 `None` = **未知**（不是 0、更不是"充裕"）。调用方必须把"未知"当成
+/// "我们不知道链路有多快"来处理：回退到保守的固定秒数/字节，见 `window_budget`。
+///
+/// 新鲜度：读线程在窗口未满时每 ≥500ms 发布一次（`FillMeter`），进入背压
+/// （窗口满）时把该填窗期结算掉然后**冻结**读数——窗口满期间读到的就是"上一次
+/// 真实填窗期测到的链路吞吐"，不会被"我们故意不读"稀释成 0。
+fn supply_estimate_bps(slot: usize) -> Option<f64> {
+    let bps = load_fill_bps(slot);
+    (bps.is_finite() && bps > 0.0).then_some(bps)
+}
+
+/// 「这次 HTTP 请求画像记到哪两个原子量上」。
+///
+/// 为什么不直接传槽位下标：槽位是进程级共享数组的索引，而**单测需要一个
+/// 不受并行用例干扰的计数**——静态数组是全进程共享的，同进程并行跑的两个
+/// 用例会互相污染计数，"一次成功请求 = 1"这类断言就不可靠了。把"记到哪里"
+/// 显式作为参数传入：生产路径指向 `SOURCE_HTTP_REQUESTS[diag_slot]`，用例
+/// 指向自己的静态计数器，两者互不影响。
+#[derive(Debug, Clone, Copy)]
+struct HttpRequestProfile {
+    requests: &'static AtomicU64,
+    bytes: &'static AtomicU64,
+}
+
+/// 取某槽位的请求画像计数目标；槽位越界返回 None（不计数，但不影响取数）。
+fn http_request_profile(slot: usize) -> Option<HttpRequestProfile> {
+    Some(HttpRequestProfile {
+        requests: SOURCE_HTTP_REQUESTS.get(slot)?,
+        bytes: SOURCE_HTTP_REQUEST_BYTES.get(slot)?,
+    })
+}
+
+impl HttpRequestProfile {
+    /// 记录一次**真正发出**的 GET（重试与断点续传各记 1）。
+    fn record_request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记录本次请求在 body 分块读循环里实际到达的字节。
+    fn record_bytes(&self, n: u64) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+    }
+}
 
 /// 带宽估算的窗口采样状态（拉模型用）。
 struct BandwidthSample {
@@ -215,7 +599,8 @@ fn audio_first_throttle_video() -> bool {
         return false;
     }
     // 防呆：点亮过久（如音频总长迟迟探测不到）则放弃节流。
-    let since = audio_first_now_ms().saturating_sub(AUDIO_FIRST.enabled_at_ms.load(Ordering::Relaxed));
+    let since =
+        audio_first_now_ms().saturating_sub(AUDIO_FIRST.enabled_at_ms.load(Ordering::Relaxed));
     if since > AUDIO_FIRST_MAX_THROTTLE_MS {
         return false;
     }
@@ -300,6 +685,285 @@ fn refresh_bandwidth(slot: usize, total_rx: u64) -> f64 {
     bps
 }
 
+// ---------------------------------------------------------------------------
+// 滑动窗口预算（2026-09-04 架构改造：时间预算 + 内存硬上限 + 冷区磁盘预算）
+// ---------------------------------------------------------------------------
+//
+// ## 一、为什么"按字节卡预算"在弱网下是反的
+//
+// 缓冲的本职是**吸收抖动**，而抖动的绝对量纲是**时间**，不是字节。同一条
+// KB 级弱网上，"再攒 20MB"可能意味着好几分钟的播放；而在 1080P 高速链路上
+// 攒 20MB 只是几十秒。若只按固定字节预算推进前向窗口：
+//
+//     链路越差 → 单位时间能拉到的字节越少 → 按固定字节折算的"可播秒数"越短
+//     → 越卡的场景缓冲越薄 → 抖动一来就饿死
+//
+// 这正是要修的反向激励。本改造把预算拆成**两个互不冲突的口径**：
+//
+//   - **时间预算**（保体验）：目标是"前方始终有 `N` 秒可播"。`N` 随实测吞吐
+//     相对码率的下降而**上升**（弱网更激进地去缓冲），见 `window_forward_secs`。
+//   - **字节硬上限**（保内存）：无论 `N` 多大，**内存常驻不超过硬上限**；超出
+//     的部分走**冷区分层落盘**（`FullPreloadState` 的段存储），不是停止读取。
+//
+// 两者能同时成立，是因为弱网下 ABR 早已把码率降到很低：秒数要得激进，字节
+// 压力却很小（360P ≈ 100KB/s，攒 120 秒也只有约 12MB）。也就是说
+// "按秒激进 + 按字节守内存"不是折中，而是**在弱网上同时拿满两个好处**。
+//
+// ## 一·五、对照标准：官方网页端的激进程度（取值不是凭空拍的）
+//
+// 用户对照实测：**同一视频、同一清晰度，网页端（B 站 web 播放器）在弱网下
+// 不卡，我们的客户端卡**；网页端的形态被描述为"会直接缓冲后面好大一段"
+// （同类客户端 issue 亦记录同一对照：`cotaku/Bibi-Release#344`「希望增强
+// 缓冲能力」——"在网速较差的环境会频繁卡顿……使用网页端观看同清晰度的同一
+// 视频就不卡，而且可以观察到网页端的缓冲策略比较激进，会直接缓冲后面好大一段"）。
+//
+// 因此 `WINDOW_FORWARD_SECS_COMFORT = 30s` / `WINDOW_FORWARD_SECS_MAX = 180s`
+// 这两个数字的目标就是**对齐并超过**那个"好大一段"的量级：
+//   - 充裕链路：30s 前向（1080P ≈ 12MB）——与 mpv 默认 `demuxer-max-bytes` 4MiB
+//     同向但更宽松，且不依赖宿主调参；
+//   - KB 级弱网：180s 前向 + 60s 后向。低码率（360P ≈ 100KB/s）下 180s ≈ 18MB，
+//     **字节压力只有 1080P 的一半都不到**，但弱网抖动的容忍窗口是它的 6 倍。
+// 现象层面的验收标准就是网页端那条：**同片同清晰度下，本客户端的可播秒数
+// 不得低于网页端的激进缓冲**（弱网档位尤其如此），而内存占用仍被硬上限钉住。
+//
+// ## 二、冲突时的优先级（明确，别改回去）
+//
+//   1. **"往前读到哪"由时间预算决定**（`forward_bytes`）。冷区/内存预算再紧
+//      也不阻止读线程往前读——多出来的字节落到冷区（磁盘）。
+//   2. **"这些字节放内存还是放磁盘"由字节预算决定**：前向窗口（热区）不超过
+//      `memory_bytes` 里给前向的份额，其余在淘汰时交由冷区段存储（默认落盘）。
+//   3. **冷区预算真的不够时**：丢**最久远**的冷区段（`evict_cold_to_budget`），
+//      保留最近回看窗口；仍然不停读。丢的永远是最旧的一段，**不会**让
+//      "前方的可播秒数"变小——所以它不会退化成"弱网缓冲变薄"。
+//
+// ## 三、单位与取值来源
+//
+//   - `bitrate_bps`：**实测消费速率**（`HttpRangeSource::consume_bps`，demux
+//     稳态消费的字节/秒）。稳态下它就是当前 ABR 档位的有效码率（demux 只能
+//     按播放速度消费，缓冲满时被背压钳住），因此不需要宿主把码率告诉我们。
+//     可用 `ERIKA_HTTP_STREAM_BITRATE_BPS` 覆盖（排障 / 离线对照）。
+//   - `throughput_bps`：**实测链路吞吐**，唯一入口是 [`supply_estimate_bps`]
+//     —— 也就是内核自己上报的**填窗期实测吞吐**（诊断字段
+//     `SourceDiagSnapshot::fill_throughput_bps`，宿主 500ms 轮询读的是同一个值）。
+//     采样条件：只在窗口未满、读线程真的在读 socket 时采样；新鲜度：≥500ms
+//     一更；窗口满（背压）时冻结读数（不衰减）。`None` = **未知**。
+//     **预算不再使用 `est_bps`**（那是"全部到达字节的速率"，窗口满时会退化成
+//     消费速率，口径不同，只服务旧分段路径的段大小/join 超时自适应）。
+//   - 时间预算：`N = clamp(max(N_COMFORT, N_MIN * WEAK_GAIN / ratio), N_MIN, N_MAX)`，
+//     `ratio = clamp(吞吐/码率, 0.10, 4.0)`：
+//       ratio ≥ 4（链路 4 倍于码率）→ N = 30s
+//       ratio = 1（刚好够播）        → N = 30s
+//       ratio = 0.5（半速）          → N = 40s
+//       ratio = 0.25（四分之一速）   → N = 80s
+//       ratio ≤ 0.10（KB 级弱网）    → N = 180s（上限）
+//   - **吞吐未知时**（`supply_estimate_bps` 返回 `None`）：`N` 回退到**保守的
+//     固定秒数** `WINDOW_FORWARD_SECS_CONSERVATIVE = 20s`——既不因为"不知道"就
+//     多缓（那等于拍脑袋吃内存/磁盘），也不因为"不知道"就少缓（那等于裸奔）。
+//     20s 的理由：介于充裕基准（30s）与下限（10s）之间；1080P 下约 8MB，落在
+//     24MiB 内存硬上限内、且高于改造前的 4MB read-ahead（不构成回归）；对常见
+//     的 1~2s CDN 抖动仍有 10 倍以上余量。
+//     码率也未知（开播最初 ~2s，消费速率还没测出来）时，"秒数 × 码率"也无从算起
+//     → 退回**配置值**（`ERIKA_HTTP_READAHEAD_BYTES` / `BACK_BYTES`），与改造前
+//     行为完全一致（这条同时保证既有单测的确定性）。
+//   - 字节：`forward_bytes = clamp(N × 码率, read_ahead, memory_share)`，
+//     `back_bytes = clamp(N_back × 码率, back, memory - forward)`，
+//     `N_back = clamp(N/2, 8s, 60s)`（回拖命中窗口）。
+//   - 内存硬上限：视频/单流 24MiB、音频 6MiB（`ERIKA_HTTP_WINDOW_MEMORY_BYTES`
+//     覆盖），且**永不低于配置的 read-ahead + back**（不许比改造前更小）。
+//   - 冷区预算：默认 256MiB（`ERIKA_HTTP_COLD_BUDGET_BYTES` 覆盖）；关掉落盘
+//     （纯内存冷区）时钳到 32MiB，避免"落盘开关一关就把内存吃回去"。
+
+/// 前向时间预算的"充裕链路"基准秒数。
+const WINDOW_FORWARD_SECS_COMFORT: f64 = 30.0;
+/// **吞吐未知时的保守回退秒数**（见文件上方说明）：不猜"充裕"、也不裸奔。
+const WINDOW_FORWARD_SECS_CONSERVATIVE: f64 = 20.0;
+/// 前向时间预算下限：任何场景前方至少攒这么多秒（保证不卡）。
+const WINDOW_FORWARD_SECS_MIN: f64 = 10.0;
+/// 前向时间预算上限：弱网堆垫上限（180s = 3 分钟）。
+///
+/// 为什么不更高：超过 3 分钟后，"多攒的秒数"边际收益极低（用户从开播到
+/// 关窗的时间尺度就是分钟级），而弱网下它已经把低码率流堆到十几 MB；再高
+/// 只会把内存/磁盘预算挤爆，反而触发冷区淘汰。
+const WINDOW_FORWARD_SECS_MAX: f64 = 180.0;
+/// 弱网增益：吞吐/码率 每降一半，前向时间预算按此系数放大（见公式）。
+const WINDOW_WEAK_GAIN: f64 = 2.0;
+/// 吞吐/码率比的下限：链路慢到只有码率的 1/10 时按 1/10 计（再低也不再加码，
+/// 交给 180s 上限兜底）。
+const WINDOW_SPEED_RATIO_MIN: f64 = 0.10;
+/// 吞吐/码率比的上限：链路远快于码率时不再放宽时间预算（省内存）。
+const WINDOW_SPEED_RATIO_MAX: f64 = 4.0;
+/// 回看（后向）时间预算 = 前向 / 此系数，并钳在 [8s, 60s]。
+const WINDOW_BACK_SECS_MIN: f64 = 8.0;
+const WINDOW_BACK_SECS_MAX: f64 = 60.0;
+/// 内存层硬上限默认值（视频/单流）。
+const WINDOW_MEMORY_BUDGET_DEFAULT: u64 = 24 * 1024 * 1024;
+/// 内存层硬上限默认值（DASH 音频流：码率低两个数量级）。
+const WINDOW_MEMORY_BUDGET_AUDIO: u64 = 6 * 1024 * 1024;
+/// 内存层里前向窗口可占的最大比例（其余留给后向回看）。
+const WINDOW_FORWARD_MEMORY_SHARE: f64 = 0.6;
+/// 冷区（磁盘层）默认预算。理由：256MiB ≈ 1080P 约 10 分钟回看窗口，
+/// 覆盖"往回拖一点/回到刚才的播放点"这类真实用法；同时它只是宿主缓存目录
+/// 上限（`PRELOAD_DIR_LIMIT_BYTES` = 4GiB）的 1/16，多开几个会话也不会撑爆盘。
+const WINDOW_COLD_BUDGET_DEFAULT: u64 = 256 * 1024 * 1024;
+/// 纯内存冷区（`ERIKA_PRELOAD_DISK=0` / `ERIKA_PRELOAD_TO_DISK=0`）时的冷区
+/// 预算上限：32MiB。落盘开关一关就该退回"小内存缓存"，而不是把 256MiB 搬进 RAM。
+const WINDOW_COLD_MEMORY_ONLY_MAX: u64 = 32 * 1024 * 1024;
+/// 冷区单段大小。段是冷区淘汰的最小粒度：8MiB 让"丢最久远的一段"既不过粗
+/// （浪费盘）也不过细（段头/文件句柄开销）。
+const COLD_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+/// 冷区交接通道容量（块）与单块大小：32 × 64KiB = 2MiB 缓冲。
+/// 通道满 = 交接方（demux 线程）**直接放弃**这一段（冷区出现空洞 → 后续
+/// 字节开新段），绝不阻塞播放线程。
+const COLD_CHANNEL_CHUNKS: usize = 32;
+const COLD_CHUNK_BYTES: usize = 64 * 1024;
+/// 拖拽时的冷区**预读**长度：seek 提示命中冷区时，由冷区线程（独立线程）
+/// 提前把目标位置这一段读进页缓存，demux 随后真正读时命中页缓存而非裸盘。
+const COLD_WARM_BYTES: u64 = 2 * 1024 * 1024;
+/// 消费速率（码率代理）的采样窗口下限：两次采样间隔超过它（长时间暂停 /
+/// 长段冷区命中，demux 没在新字节上推进）时不更新 EMA，只重置窗口——
+/// 否则一次跨越数分钟的"累计消费量"会被当成瞬时码率。
+const CONSUME_SAMPLE_MAX_GAP: Duration = Duration::from_secs(4);
+
+/// 前向时间预算（秒）：`N = clamp(max(N_COMFORT, N_MIN × GAIN / ratio), MIN, MAX)`。
+///
+/// 单调性质（本次改造的核心，勿改反）：**吞吐/码率 越低，N 越大**。
+fn window_forward_secs(bitrate_bps: f64, throughput_bps: f64) -> f64 {
+    if !(bitrate_bps.is_finite() && bitrate_bps > 0.0)
+        || !(throughput_bps.is_finite() && throughput_bps > 0.0)
+    {
+        return WINDOW_FORWARD_SECS_COMFORT;
+    }
+    let ratio =
+        (throughput_bps / bitrate_bps).clamp(WINDOW_SPEED_RATIO_MIN, WINDOW_SPEED_RATIO_MAX);
+    let weak = WINDOW_FORWARD_SECS_MIN * WINDOW_WEAK_GAIN / ratio;
+    weak.max(WINDOW_FORWARD_SECS_COMFORT)
+        .clamp(WINDOW_FORWARD_SECS_MIN, WINDOW_FORWARD_SECS_MAX)
+}
+
+/// 一次预算结算的结果（字节 + 秒，供实现与诊断共用）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WindowBudget {
+    /// 前向窗口目标（字节）：读线程允许领先 demux 消费前沿这么多字节。
+    forward_bytes: u64,
+    /// 后向保留目标（字节）：demux 消费推进后仍留在内存里的已播字节。
+    back_bytes: u64,
+    /// 内存层硬上限（字节）：forward + back 永不超过它。
+    memory_bytes: u64,
+    /// 前向时间预算（秒）。
+    forward_secs: f64,
+    /// 结算用的码率估计（字节/秒）。
+    bitrate_bps: f64,
+    /// 结算用的链路吞吐（`None` = 未知 → 走了保守固定秒数回退）。
+    throughput_bps: Option<f64>,
+}
+
+/// 结算滑动窗口预算。输入口径见文件上方"滑动窗口预算"整段注释。
+///
+/// `read_ahead` / `back` 是**配置值**（`ERIKA_HTTP_READAHEAD_BYTES` 等）：
+/// 它们是预算的**下限**——改造后窗口只可能更宽，绝不比改造前更窄。
+fn window_budget(
+    slot: usize,
+    read_ahead: u64,
+    back: u64,
+    bitrate_bps: f64,
+    throughput_bps: Option<f64>,
+) -> WindowBudget {
+    let configured_floor = read_ahead.saturating_add(back);
+    // 滴灌余量（`STREAM_DRIP_HEADROOM_BYTES`）**计在内存硬上限之内**：它也要占
+    // 内存，不能躲在预算外——所以上限先把它算进来，前向/后向份额再从中扣掉。
+    let drip = if stream_drip_enabled() {
+        STREAM_DRIP_HEADROOM_BYTES
+    } else {
+        0
+    };
+    let memory_bytes = window_memory_budget(slot)
+        .max(configured_floor.saturating_add(drip))
+        .min(u64::MAX);
+    let bitrate_known = bitrate_bps.is_finite() && bitrate_bps > 0.0;
+    // 码率未知（开播最初 ~2s，消费速率还没测出来）→ 完全退回配置值：不放大也
+    // 不缩小，**也不拿"典型 1080P 码率"之类的猜测值去代**（猜测一旦偏低就会把
+    // 窗口算窄；配置值本来就是宿主给的下限）。
+    if !bitrate_known {
+        return WindowBudget {
+            forward_bytes: read_ahead,
+            back_bytes: back,
+            memory_bytes,
+            forward_secs: 0.0,
+            bitrate_bps,
+            throughput_bps: None,
+        };
+    }
+    // 吞吐未知 → **保守的固定秒数**（不是"不知道就多缓"、也不是"少了缓"），
+    // 见文件上方"吞吐未知时"整段。字节口径与已知时完全一致（同一条 clamp 链）。
+    let forward_secs = match throughput_bps {
+        Some(throughput) if throughput.is_finite() && throughput > 0.0 => {
+            window_forward_secs(bitrate_bps, throughput)
+        }
+        _ => WINDOW_FORWARD_SECS_CONSERVATIVE,
+    };
+    let back_secs = (forward_secs / 2.0).clamp(WINDOW_BACK_SECS_MIN, WINDOW_BACK_SECS_MAX);
+    // 前向目标：时间预算换算成字节，下限 = 配置 read-ahead，上限 = 内存层
+    // 允许前向占的份额（其余留给后向回看 + 滴灌余量）。
+    let forward_share = (memory_bytes as f64 * WINDOW_FORWARD_MEMORY_SHARE) as u64;
+    let forward_ceiling = forward_share
+        .min(memory_bytes.saturating_sub(back).saturating_sub(drip))
+        .max(read_ahead.max(1));
+    let forward_bytes =
+        ((forward_secs * bitrate_bps) as u64).clamp(read_ahead.max(1), forward_ceiling);
+    // 后向保留：时间预算的一半，下限 = 配置 back，上限 = 内存层剩余额度
+    // （再扣掉滴灌余量，保证 `前向 + 后向 + 滴灌 ≤ 硬上限`）。
+    let back_ceiling = memory_bytes
+        .saturating_sub(forward_bytes)
+        .saturating_sub(drip)
+        .max(back);
+    let back_bytes = ((back_secs * bitrate_bps) as u64).clamp(back, back_ceiling);
+    WindowBudget {
+        forward_bytes,
+        back_bytes,
+        memory_bytes,
+        forward_secs,
+        bitrate_bps,
+        throughput_bps: throughput_bps.filter(|bps| bps.is_finite() && *bps > 0.0),
+    }
+}
+
+/// 内存层硬上限（字节）。`ERIKA_HTTP_WINDOW_MEMORY_BYTES` 覆盖（0 = 用默认）。
+fn window_memory_budget(slot: usize) -> u64 {
+    env::var("ERIKA_HTTP_WINDOW_MEMORY_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(if slot > 0 {
+            WINDOW_MEMORY_BUDGET_AUDIO
+        } else {
+            WINDOW_MEMORY_BUDGET_DEFAULT
+        })
+}
+
+/// 冷区（磁盘层）预算（字节）。`ERIKA_HTTP_COLD_BUDGET_BYTES` 覆盖。
+/// 落盘关闭时钳到 `WINDOW_COLD_MEMORY_ONLY_MAX`（见常量注释）。
+fn window_cold_budget(disk: bool) -> u64 {
+    let budget = env::var("ERIKA_HTTP_COLD_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(WINDOW_COLD_BUDGET_DEFAULT);
+    if disk {
+        budget
+    } else {
+        budget.min(WINDOW_COLD_MEMORY_ONLY_MAX)
+    }
+}
+
+/// 码率的显式覆盖（`ERIKA_HTTP_STREAM_BITRATE_BPS`，字节/秒）。排障/离线对照用：
+/// 生产上码率由 `HttpRangeSource::consume_bps` 实测（见预算整段注释）。
+fn window_bitrate_override() -> Option<f64> {
+    env::var("ERIKA_HTTP_STREAM_BITRATE_BPS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|bps| bps.is_finite() && *bps > 0.0)
+}
+
 /// 读取当前 `HttpRangeSource` 诊断快照（宿主轮询用；无播放时返回零值/上次刷新）。
 /// 兼容旧单槽语义：返回槽 0（主流/单流/直播）。
 pub fn source_diag_snapshot() -> SourceDiagSnapshot {
@@ -323,6 +987,16 @@ pub fn source_diag_snapshot_slot(slot: usize) -> SourceDiagSnapshot {
     let total = live_rx_bytes(slot);
     snap.downloaded_bytes = total;
     snap.est_bps = refresh_bandwidth(slot, total);
+    // 填窗期吞吐：由顺序长读线程直接写全局槽（不经过 demux 线程），这里取最新值
+    // ——宿主 500ms 轮询必须在 demux 卡住时也能读到新鲜链路吞吐（判升画质用）。
+    snap.fill_throughput_bps = load_fill_bps(slot);
+    // HTTP 请求画像同理由**读取时刻直接读**（不依赖 demux 线程发布）：这两个
+    // 量是进程级单调计数，demux 卡在长 join 上时它照样在涨（预取线程/整片
+    // 预载桶是独立线程），宿主 1s 差分拿到的就是真值。
+    if let Some(profile) = http_request_profile(slot) {
+        snap.http_requests = profile.requests.load(Ordering::Relaxed);
+        snap.http_request_bytes = profile.bytes.load(Ordering::Relaxed);
+    }
     snap
 }
 
@@ -627,6 +1301,2351 @@ fn parse_owned_fd_value(value: &str, uri: &str) -> Result<i32> {
         .ok_or_else(|| SourceError::InvalidFileDescriptorUri(uri.to_string()))
 }
 
+// ===========================================================================
+// 顺序长读（sequential stream）：把「每 256KB 一个 Range 请求」换成
+// 「一条持续读的连接」——对齐 mpv / PiliPlus / 官方客户端的访问模型
+// ===========================================================================
+//
+// ## 一、改造前的现状（实测口径，不是估算）
+//
+// 改造前 `HttpRangeSource` 的**唯一**数据通路是「一个 HTTP Range 请求下载
+// 一段」，段大小 `prefetch_segment_bytes() = clamp(est_bps × 3s, 32KB, 256KB)`，
+// 上限是**编译期常量** `SEEK_PREFETCH_SEGMENT_BYTES = 256KB`：
+//
+//   - demux 每读 32~64KB 就消费一段、消费完立刻补一段 → 段大小即"请求粒度"；
+//   - 1080P 需求约 347KB/s ⇒ 256KB 段 ≈ 0.74s ⇒ **≈1.35 次/秒**，
+//     一小时 ≈ 4700~6000 个 Range 请求（用户实测"上来就 6000 次"就是它）；
+//   - 稳态并发连接 5~6 条（视频顺序预取 2 + 整片桶 1 + 音频 2 + 音频桶 1）。
+//
+// 对照：mpv / PiliPlus 对当前播放位置只发**一个** `Range: bytes=<start>-`
+// （开放结尾）的长连接，然后**持续从 socket 读**进环形缓冲；缓冲满了就
+// **停止读**（不读 ⇒ 内核接收缓冲填满 ⇒ TCP 窗口收缩 ⇒ 服务端自然减速，
+// 这就是背压），有空位再继续读。所以顺序播放整段只有 1~3 个请求。
+//
+// ## 二、改造目标（可验收，见文件末尾的单测）
+//
+//   1. 一次连续播放（8 分钟 1080P ≈ 166MB）的请求数 = **1**（每条流），
+//      与时长、与文件大小无关；只有 seek 出窗 / 换 host / 连接被断 /
+//      瞬时错误重试才 +1。
+//   2. 稳态并发连接 = 2（video 1 + audio 1），不再是 5~6。
+//   3. 既有能力**一个不丢**：4MB read-ahead + 4MB 后向缓冲、`est_bps` EMA、
+//      多 host 自愈切换、`transient_wait` 语义、整片预载桶（已同步改成流式，
+//      见 `full_preload_stream_loop`）、诊断快照全部字段语义。
+//
+// ## 三、与历史结论「为什么用小段 256KB」的关系（重要，别再踩回去）
+//
+// `SEEK_PREFETCH_SEGMENT_BYTES` 处留着一条历史结论：慢网下大段（2MB+）
+// "join 必超时 → read 放弃预取段 → 退回同步小步拉取 → 一顿一顿"。
+// 那条结论成立的前提是**旧访问模型**：段是"一个请求换一段字节"，必须先把
+// 整段收齐（join）才能交给 demux，段越大越容易在 join 超时窗口内收不齐。
+//
+// 顺序长读**没有"join 一个段"这个概念**：字节是**边到边交付**的——socket
+// 读到一个 64KB 块就立刻 push 进窗口并唤醒 demux，demux 立刻能拿到。
+// "段大小"这个变量在新模型里根本不存在，因此那条历史结论对本路径不适用
+// （旧路径作为兜底保留，仍按它自己的约束用小段）。
+//
+// ## 四、旧路径为什么保留（而不是删掉）
+//
+// 旧的分段路径没有删，而是降级为兜底，由 `ERIKA_HTTP_SEQUENTIAL=0` 或
+// "不经 VOD 工厂直接 `HttpRangeSource::new`" 触发：
+//   - 它是"服务端不支持 open-ended Range / 忽略 Range 返回 200 全片"等异常
+//     情形的对照实现，保留零成本；
+//   - 它承载着一批既有单测（段队列、join 语义、后向缓冲、host 切换作废段…），
+//     保留它 = 保留这些回归防线。
+// 生产路径（VOD 工厂 `source_from_uri_with_hint_and_headers_slot_and_read_ahead`
+// 的 HTTP 分支）默认启用新路径。
+
+/// 冷区（磁盘分层）交接通道的发送端：热区淘汰的字节经它交给冷区。
+///
+/// 语义：**被热区淘汰的字节**（`consume_to` 裁掉的历史 / `reset` 丢弃的旧窗口）
+/// 按绝对偏移交给冷区段存储（默认落盘）。`try_send` 非阻塞——通道满就直接放弃
+/// 这一段（冷区出现空洞 → 后续字节另开新段），**绝不把 demux 线程堵在后面**。
+///
+/// 这是"已经下好的内容不丢"的载体：内存只留热区（前向 read-ahead + 后向回看），
+/// 更早的区间落到磁盘；用户回拖 / 重播命中冷区时**零网络**从盘读回。
+#[derive(Clone)]
+struct ColdSink {
+    tx: mpsc::SyncSender<ColdMessage>,
+}
+
+/// 热区 → 冷区的一条消息。
+enum ColdMessage {
+    /// 热区淘汰下来的字节（`offset` = 文件里的绝对偏移）。
+    Evicted(ColdChunk),
+    /// 拖拽预读请求（目标绝对偏移）：只预热页缓存，不产出数据。
+    Warm(u64),
+}
+
+// ============================================================================
+// **seek 出窗的跨 CDN 节点并行回填**（2026-09-15）
+//
+// 场景（本机制唯一的目标）：用户把进度条拖到还没下载过的位置（出窗）→ 松手 →
+// 现在要等约 5 秒画面才跳过去。
+//
+// 归因已由前序实测钉死：`video_seek_preroll=5103ms ≈ 4980ms「等回填字节」+
+// 120ms「解码+丢帧+调度」`，与 open 那 6 秒**同源**（都是"字节数 ÷ 单流链路
+// 速率"）。回填量恒为「`AVSEEK_FLAG_BACKWARD` 落点到目标」的那**一个 GOP
+// 窗口**（样本 GOP=5.000s/150 帧，实测 1.2~1.6MB），限速实验逐位吻合
+// （`986857B ÷ 320KB/s = 3.0118s`，实测 3.00s）。**瓶颈在"单条连接"上，不在
+// 链路带宽**：单条流实测 ≈320KB/s，而 video+audio 两条流同时下载合计 ≈1.1MB/s。
+//
+// 形态**严格限定**（用户批准的边界；改这段之前先读完它）：
+//   1. **只在 seek 出窗时触发**。唯一入口是 `stream_seek_hint` 的重设分支；
+//      **正常顺播路径一行都不碰**——"328MB 一个请求"的长连接优点原样保住。
+//   2. **跨 CDN 节点**：N 段来自 N 个**不同的候选 host**，每个节点只开**一条**
+//      正常的单次 Range 请求。**不对同一个 host 多开连接**。
+//   3. **2~4 条**，条数由实测单流通量算出（见 `seek_parallel_connections`），
+//      不是恒定开满。
+//   4. **总量 ≤ 一个回填窗口**（`SEEK_PARALLEL_FILL_BYTES`，且不超过 `front_cap`）：
+//      同一批数据换 N 个节点拉，**不是额外多拉**。
+//   5. **用完即关**：每段一条有界 Range（`bytes=<s>-<e>`），读完即 drop，
+//      不留常驻连接。
+//   6. **失败即回退**：任一段失败/超时/实体校验不过/代数变化 → 丢弃剩余分段，
+//      读线程照旧从 `write_pos` 起一条 open-ended Range 串行续传；**已 push 的
+//      前缀字节保留**（它们本来就是正确前缀，丢了反而要重下）。
+//   7. **候选只有一个 host 时不并行**（宁可慢，也不用可疑形态）：见
+//      `HttpRangeSource::seek_fill_plan` 的 `sources.len() < 2` 分支。
+//
+// **为什么"跨节点"不是绕过告警，而是另一种形态**：上游
+// `bilibili-downloader-gui` 的告警针对的是**对同一个源/节点开多条连接**——那在
+// 单个节点上确实表现为滥用。跨节点时每个节点只看到**一条与普通用户无异的单次
+// Range 请求**，总吞吐是"各节点速率之和"。而 B 站本身就是**多镜像 CDN 架构**：
+// 宿主 `playback::build_cdn_candidates` 的做法就是**保留 path+签名、只换 host**
+// （同一对象的不同镜像），官方客户端本身就在节点间调度。
+// **但结论不靠推断**：本仓库既有的一手证据（见 `http_prefetch_parallel` 注释）
+// 记录了 8 并发触发 CDN 限流惩罚的真机现象，因此这里把并发压在 2~4 且**分散在
+// 不同节点**；跨节点这一形态本身的风控结论见报告（含找不到依据的部分）。
+// ============================================================================
+
+/// **seek 出窗并行回填**的回填窗口字节数。
+///
+/// 依据 = 上面的实测：`AVSEEK_FLAG_BACKWARD` 落点到目标之间那一个 GOP 窗口就是
+/// demux 必须读回的字节量（1.2~1.6MB）。取 **1.5MiB** 覆盖该区间并留少量余量：
+/// 它**就是回填窗口本身**，不是额外多拉。
+const SEEK_PARALLEL_FILL_BYTES: u64 = 1536 * 1024;
+/// 单段下限：再小 HTTP 头开销占比失控、且分段本身失去意义（照旧单连接）。
+const SEEK_PARALLEL_MIN_SEGMENT_BYTES: u64 = 256 * 1024;
+/// **段间重叠校验字节**（跨节点字节一致性的**直接证据**）。
+///
+/// 做法：段 k（k >= 1）的请求范围**比它分配的区间往前多要这么多字节**，收到后
+/// 先把它与段 k-1 的**末尾同样多字节**逐字节比对，一致才 push 自己那份；不一致
+/// → 整批作废、回退单连接，**绝不把不一致的字节拼进播放流**。
+///
+/// 为什么是 4KiB：在 TCP 段量级之上留了充分余量，足以在"两个节点给的其实是不同
+/// 实体"时立刻暴露（那种情况下从边界起的字节几乎必然不同）；同时
+/// `(N-1) × 4KiB ≤ 12KiB`，相对 1.5MiB 的回填窗口只有 ~0.8% 的额外流量——**校验
+/// 字节不计入回填窗口配额**，但量级可忽略。
+const SEEK_PARALLEL_OVERLAP_BYTES: u64 = 4 * 1024;
+/// 并发上限（用户批准区间 2~4 的上界）。**不是默认条数**：实际条数由
+/// `seek_parallel_connections` 按实测单流通量算出来，常见落点 2~3。
+/// 上界的依据是既有真机教训（见 `http_prefetch_parallel` 注释：8 并发触发
+/// B 站 CDN 限流惩罚——在飞段集体挂死、新建连接被主动断开），4 是安全区上沿。
+const SEEK_PARALLEL_MAX_CONNECTIONS: usize = 4;
+/// 单流通量估不出来时的默认条数：前序实测 320KB/s 单流 × 3 ≈ 960KB/s，正好把
+/// 1.5MiB 压在 ~1.6s 目标内。
+const SEEK_PARALLEL_DEFAULT_CONNECTIONS: usize = 3;
+/// 目标墙钟（秒）：达到「回填窗口 ÷ 本秒数」的总吞吐就够了。
+const SEEK_PARALLEL_TARGET_SECS: f64 = 1.6;
+/// 单段等待上限：超过即放弃并行、回退单连接（与既有 `PREFETCH_JOIN_TIMEOUT`
+/// 同量级——那条超时也是"慢段不拖死 demux"的同一套判据）。
+const SEEK_PARALLEL_SEGMENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// **下载前预检**的等待上限：预检只是 1 字节 Range，正常耗时 ≈ 1 个 RTT + TTFB。
+/// 取 2s——比正常值宽得多，但**短到不惩罚用户**：万一某个节点连头部都给不出，
+/// 门禁会在这 2s 内判"证据不足"，随即回退单连接（而不是死等 5s 再回退）。
+const SEEK_PARALLEL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 并行"没有叠加"的判定比：批次实测总吞吐低于「单流估算 × 它」就算无效。
+/// 低于这个比值说明瓶颈不在单节点速率上（例如 CDN 按 IP 限速），并发只是白开
+/// 连接、白涨请求数——此时**测出来就自动关掉**（见 `SeekFillDiag::note_gain`）。
+const SEEK_PARALLEL_NO_GAIN_RATIO: f64 = 1.3;
+/// 连续多少次"实测无叠加"就关掉本次会话的并行（进程内，不回滚）。
+const SEEK_PARALLEL_NO_GAIN_LIMIT: u64 = 2;
+
+/// 一个并行分段及其**来源节点**（跨节点并行：每段一个 host、每 host 一条连接）。
+#[derive(Debug, Clone)]
+struct SeekFillSegment {
+    /// 本段在**文件里的分配区间** `[start, start + length)`（不含前向重叠）。
+    start: u64,
+    /// 分配区间长度。各段之和 = 回填窗口字节数。
+    length: u64,
+    /// 前向重叠字节数（**0 = 首段**：首段直接续在窗口前沿上，无可比对对象）。
+    overlap: u64,
+    /// 承载本段的候选 host URI（`candidates[active_idx + k]` 轮转、按 host 去重）。
+    uri: String,
+    /// host 标签（日志/诊断用；不含 path 与签名）。
+    host: String,
+}
+
+impl SeekFillSegment {
+    /// 实际请求的起点 = 分配起点 - 重叠（重叠只用于与上一段比对）。
+    fn request_start(&self) -> u64 {
+        self.start.saturating_sub(self.overlap)
+    }
+
+    /// 实际请求的字节数 = 分配长度 + 重叠。
+    fn request_length(&self) -> u64 {
+        self.length.saturating_add(self.overlap)
+    }
+}
+
+/// **seek 出窗后的一次性跨节点并行回填计划**（demux 线程写、读线程取走执行一次）。
+///
+/// 形态约束见文件上方整段；这里是它的数据形态。放进 `StreamBuffer`（与
+/// `generation` 同锁）而不是另开一把锁，是为了让"reset + 装计划"与读线程的
+/// "取计划 + 复核代数"天然互斥，不需要第二套同步论证。
+#[derive(Debug, Clone)]
+struct SeekFillPlan {
+    /// 计划对应的窗口代数：读线程执行前复核，不一致（又 seek 了）= 作废。
+    generation: u64,
+    /// 回填窗口起点（= `reset(target)` 的 target）。
+    start: u64,
+    /// 回填窗口字节数 = 各段 `length` 之和（**不含**重叠校验字节）。
+    bytes: u64,
+    /// 分段表（`len() >= 2`；1 段表示不并行，计划根本不会被建出来）。
+    segments: Vec<SeekFillSegment>,
+    /// 定条数时用的**单流通量估算**（字节/秒；0 = 未测得 → 走了默认条数）。
+    /// 存进计划是为了让"为什么是 3 条"以及"实测 vs 期望"在日志/诊断里可复核。
+    per_conn_bps: f64,
+}
+
+/// 一次冷区交接：`offset` = 这段字节在**文件里的绝对偏移**（不是段内偏移）。
+struct ColdChunk {
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+/// 顺序流字节窗口（mpv demuxer-cache 的最小等价物）。
+///
+/// 语义：`[base, write_pos())` 是一段**连续**的文件字节。
+///   - `consumed`：demux 已消费到的绝对偏移，由 [`StreamBuffer::consume_to`] 推进；
+///   - `write_pos()`：网络已经填到的绝对偏移；
+///   - `front_len() = write_pos - consumed`：**前向缓冲深度**，也是读线程唯一的
+///     节流依据（≥ `front_cap` 就停止从 socket 读 → TCP 背压）。
+///
+/// 单写者（读线程）/ 单读者（demux 线程）共享 `Arc<StreamShared>`，用
+/// `Mutex<StreamBuffer>` + `Condvar` 同步——4MB 窗口上无锁实现换不来可测收益，
+/// 却会引入一整套内存序论证，不划算。
+///
+/// 用 `VecDeque` 而不是 `Vec`：`Vec::drain(..n)` 在 4MB 窗口上是 O(n) memmove，
+/// demux 每消费 64KB 就搬 4MB 会直接吃掉一个核；VecDeque 的环形语义让头部丢弃
+/// 与尾部追加都是 O(追加量)，`as_slices()` 还能让命中拷贝保持两段 memcpy。
+struct StreamBuffer {
+    /// `bytes[0]` 对应的文件绝对偏移。
+    base: u64,
+    bytes: VecDeque<u8>,
+    /// demux 已消费前沿（绝对偏移）。**必须由读路径推进**（`consume_to`）：
+    /// 它是 `front_len` 的减数，忘记推进会令 `front_len` 永不下降 → 读线程
+    /// 认为缓冲永远是满的 → 播放直接停摆。
+    consumed: u64,
+    /// 前向缓冲上限（预算结算给出：默认对齐配置 read-ahead，弱网按时间预算放宽，
+    /// 见文件上方"滑动窗口预算"整段）。
+    front_cap: usize,
+    /// 后向保留上限（预算结算给出：默认配置 back_bytes）：消费推进后仍保留这么多
+    /// 已读字节，seek 回退命中窗口内零网络（mpv `--demuxer-max-back-bytes` 等价）。
+    back_cap: usize,
+    /// **滴灌余量**（字节）：窗口满时允许再多读这么一点点（见
+    /// `STREAM_DRIP_HEADROOM_BYTES`），让 CDN 看到"连接还在被读"而不是写空闲。
+    /// 它**计在内存硬上限之内**（预算里已扣掉），不会让常驻内存越预算。
+    drip_headroom: u64,
+    /// 冷区交接出口（`None` = 不分层，淘汰即丢——旧行为）。
+    cold: Option<ColdSink>,
+    /// 源已读到文件尾（服务端声明终点已到，或重复空读判定为尾）。
+    eof: bool,
+    /// 连接级**终局**错误（4xx / Range 被忽略 / Content-Range 违约）。
+    /// 读方取走（`take`）即上报，让宿主换源；瞬时错误不会写这里。
+    error: Option<String>,
+    /// 重设代数：`reset`（seek 出窗）时 +1。读线程每条连接记下建立时的代数，
+    /// 发现不一致即放弃该连接、从新 `write_pos` 重连——这是"seek 后只 +1
+    /// 请求"的实现方式。
+    generation: u64,
+    /// 服务端声明的文件总长（首个 206 的 Content-Range total 回填）。
+    /// 回填后 `len()` 不必再发 HEAD（旧路径的首个 206 也做同样的事）。
+    total: Option<u64>,
+    /// **seek 出窗的跨节点并行回填计划**（`None` = 没有待执行计划；
+    /// **正常顺播恒为 `None`**——计划只在 `stream_seek_hint` 的重设分支里装）。
+    ///
+    /// 与 `generation` 同锁：`reset()` 清掉它（又 seek 了 → 旧计划作废），
+    /// 调用点在**同一把锁内**"算计划 + reset + 装计划"，因此读线程看到的要么是
+    /// 与新代数配套的计划、要么什么都没有，不会出现"旧代数 + 新计划"的错配。
+    /// 读线程 `take_seek_fill_plan()` 取走即清空 → **天然一次性**：失败后不会
+    /// 自动重试（避免请求放大）。
+    fill_plan: Option<SeekFillPlan>,
+}
+
+impl StreamBuffer {
+    fn new(base: u64, front_cap: usize, back_cap: usize) -> Self {
+        Self {
+            base,
+            bytes: VecDeque::new(),
+            consumed: base,
+            front_cap,
+            back_cap,
+            drip_headroom: if stream_drip_enabled() {
+                STREAM_DRIP_HEADROOM_BYTES
+            } else {
+                0
+            },
+            cold: None,
+            eof: false,
+            error: None,
+            generation: 0,
+            fill_plan: None,
+            total: None,
+        }
+    }
+
+    /// 挂上冷区交接出口（`ensure_stream` 时按 `full_preload` 是否存在决定）。
+    fn set_cold_sink(&mut self, sink: Option<ColdSink>) {
+        self.cold = sink;
+    }
+
+    /// 预算结算后更新窗口容量。只影响后续节流判定；若窗口已超过新上限，立即
+    /// 按同一套"先交接冷区、再丢"的规则裁掉超出部分（否则"内存硬上限"要等到
+    /// 下次消费推进才生效，诊断里会看到常驻字节短暂越界）。
+    fn set_caps(&mut self, front_cap: usize, back_cap: usize) {
+        self.front_cap = front_cap;
+        self.back_cap = back_cap;
+        let keep_from =
+            self.consumed
+                .saturating_sub(self.back_cap as u64)
+                .max(self.write_pos().saturating_sub(
+                    self.front_cap as u64 + self.back_cap as u64 + self.drip_headroom,
+                ))
+                .max(self.base);
+        self.drop_below(keep_from);
+    }
+
+    /// 窗口常驻字节数（内存层热区实际占用的字节）。
+    fn resident_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    /// 网络已填充到的绝对偏移（窗口尾部）。
+    fn write_pos(&self) -> u64 {
+        self.base.saturating_add(self.bytes.len() as u64)
+    }
+
+    /// 前向缓冲深度（demux 消费前沿到网络填充前沿的距离）。
+    fn front_len(&self) -> u64 {
+        self.write_pos().saturating_sub(self.consumed)
+    }
+
+    /// 读线程是否应当继续从 socket 读。false = 背压（**旧行为：完全不读**；
+    /// 现在滴灌开启时窗口上限额外加 `drip_headroom`，见那里的注释）。
+    fn has_space(&self) -> bool {
+        !self.eof && self.front_len() < self.front_cap as u64 + self.drip_headroom
+    }
+
+    /// 前向预算是否已满（超过它之后只剩滴灌余量可用，见 `drip_headroom`）。
+    fn front_reached_budget(&self) -> bool {
+        self.front_len() >= self.front_cap as u64
+    }
+
+    /// 窗口**彻底饱和**（连滴灌余量都用尽）→ 读线程必须完全停读。
+    fn is_saturated(&self) -> bool {
+        !self.eof && self.front_len() >= self.front_cap as u64 + self.drip_headroom
+    }
+
+    /// 当前前向窗口容量（预算 + 滴灌余量），诊断里核"窗口停在预算附近"用。
+    ///
+    /// 当前无调用点，保留待用。
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn front_cap_total(&self) -> u64 {
+        self.front_cap as u64 + self.drip_headroom
+    }
+
+    /// 追加一段与窗口尾部连续的字节（唯一写入口，单写者）。
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend(chunk.iter().copied());
+    }
+
+    /// 完整命中才返回 Some（`[start, start+length)` 全在窗口内）。
+    /// 半覆盖返回 None，由调用方决定"等"还是"重设窗口"。
+    fn read(&self, start: u64, length: u64) -> Option<Vec<u8>> {
+        let end = start.checked_add(length)?;
+        if start < self.base || end > self.write_pos() {
+            return None;
+        }
+        let offset = usize::try_from(start - self.base).ok()?;
+        let want = usize::try_from(length).ok()?;
+        let mut out = Vec::with_capacity(want);
+        let (first, second) = self.bytes.as_slices();
+        if offset < first.len() {
+            let take = want.min(first.len() - offset);
+            out.extend_from_slice(&first[offset..offset + take]);
+        }
+        if out.len() < want {
+            let second_offset = offset.saturating_sub(first.len());
+            let take = (want - out.len()).min(second.len().saturating_sub(second_offset));
+            out.extend_from_slice(&second[second_offset..second_offset + take]);
+        }
+        if out.len() != want {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// `start` 处**当前可得**的字节（可以少于请求量；`start` 未覆盖时返回
+    /// `None`，窗口内但暂时无字节时返回 `Some(空)`）。文件尾与 `length == None`
+    /// 的"读到尾"路径用它。
+    fn read_available(&self, start: u64, max: usize) -> Option<Vec<u8>> {
+        if start < self.base {
+            return None;
+        }
+        let offset = usize::try_from(start - self.base).ok()?;
+        let write_pos = self.write_pos();
+        if start > write_pos {
+            return None;
+        }
+        let available = usize::try_from(write_pos - start).unwrap_or(usize::MAX);
+        let want = available.min(max);
+        if want == 0 {
+            return Some(Vec::new());
+        }
+        let (first, second) = self.bytes.as_slices();
+        let mut out = Vec::with_capacity(want);
+        if offset < first.len() {
+            let take = want.min(first.len() - offset);
+            out.extend_from_slice(&first[offset..offset + take]);
+        }
+        if out.len() < want {
+            let second_offset = offset.saturating_sub(first.len());
+            let take = (want - out.len()).min(second.len().saturating_sub(second_offset));
+            out.extend_from_slice(&second[second_offset..second_offset + take]);
+        }
+        Some(out)
+    }
+
+    /// 推进消费前沿并裁掉后向缓冲之外的历史字节。
+    ///
+    /// 裁到 `consumed - back_cap` 为止：再往前的字节已经超出回退窗口，留着
+    /// 只会让常驻内存无界（旧路径的 `cache_bytes` 正是靠窗口重设定界，这里
+    /// 改成消费驱动的前移，语义等价且不会漏）。
+    ///
+    /// **2026-09-04 改造**：裁掉之前先把这段字节交接给冷区（磁盘分层），
+    /// 于是"内存里更早的区间"不再消失，而是换了个更便宜的载体继续存在。
+    fn consume_to(&mut self, pos: u64) {
+        if pos > self.consumed {
+            self.consumed = pos;
+        }
+        let keep_from = self
+            .consumed
+            .saturating_sub(self.back_cap as u64)
+            .max(self.base);
+        self.drop_below(keep_from);
+    }
+
+    /// 丢弃 `[base, keep_from)`：先尽力交接冷区，再真丢。唯一收口点
+    /// （`consume_to` / `set_caps` 都走它），避免两套淘汰规则分叉。
+    fn drop_below(&mut self, keep_from: u64) {
+        if keep_from <= self.base {
+            return;
+        }
+        // 交接是尽力而为：通道背压时只交接了连续前缀，剩下的随窗口一起丢
+        // （那段区间之后回拖需要重新下载——诚实的代价，不阻塞播放线程）。
+        self.hand_off_to_cold(keep_from);
+        let drop = usize::try_from(keep_from - self.base)
+            .unwrap_or(usize::MAX)
+            .min(self.bytes.len());
+        if drop > 0 {
+            self.bytes.drain(..drop);
+            self.base = self.base.saturating_add(drop as u64);
+        }
+    }
+
+    /// 把 `[base, end)` 的字节按 [`COLD_CHUNK_BYTES`] 分块交给冷区（尽力而为）。
+    ///
+    /// 返回交接成功的终点。**遇到背压立即停止**：冷区收到的永远是一段连续
+    /// 前缀（不会"中间丢了、后面又收到"），因此冷区的覆盖判定永远是段内连续，
+    /// 不存在需要额外记录的洞。
+    fn hand_off_to_cold(&mut self, end: u64) -> u64 {
+        let Some(sink) = self.cold.clone() else {
+            return self.base;
+        };
+        let mut sent = self.base;
+        while sent < end {
+            let take = (end - sent).min(COLD_CHUNK_BYTES as u64) as usize;
+            let Some(relative) = usize::try_from(sent - self.base).ok() else {
+                break;
+            };
+            let Some(chunk) = self.slice(relative, take) else {
+                break;
+            };
+            if sink
+                .tx
+                .try_send(ColdMessage::Evicted(ColdChunk {
+                    offset: sent,
+                    bytes: chunk,
+                }))
+                .is_err()
+            {
+                break;
+            }
+            sent = sent.saturating_add(take as u64);
+        }
+        sent
+    }
+
+    /// 窗口内相对偏移处取 `length` 字节（冷区交接用的纯拷贝，不改窗口）。
+    fn slice(&self, offset: usize, length: usize) -> Option<Vec<u8>> {
+        if offset.checked_add(length)? > self.bytes.len() {
+            return None;
+        }
+        let (first, second) = self.bytes.as_slices();
+        let mut out = Vec::with_capacity(length);
+        if offset < first.len() {
+            let take = length.min(first.len() - offset);
+            out.extend_from_slice(&first[offset..offset + take]);
+        }
+        if out.len() < length {
+            let second_offset = offset.saturating_sub(first.len());
+            let take = (length - out.len()).min(second.len().saturating_sub(second_offset));
+            out.extend_from_slice(&second[second_offset..second_offset + take]);
+        }
+        (out.len() == length).then_some(out)
+    }
+
+    /// seek 出窗：丢弃全部已缓冲字节，从 `base` 重建窗口（代数 +1 让读线程
+    /// 放弃在飞连接）。旧位置的字节一律不可复用（错位读比多一个请求危险得多）。
+    ///
+    /// **2026-09-04 改造**：清空前先尽力把窗口内容交接给冷区——"seek 走了"不等于
+    /// "这些已下好的字节没用了"：用户拖回这段区间时应当零网络命中。交接同样是
+    /// 尽力而为（通道满即停），代价有界（≤ 通道容量），不阻塞 demux 线程。
+    fn reset(&mut self, base: u64) {
+        self.hand_off_to_cold(self.write_pos());
+        self.bytes.clear();
+        self.base = base;
+        self.consumed = base;
+        self.eof = false;
+        self.error = None;
+        self.generation = self.generation.wrapping_add(1);
+        // 又 seek 了：旧位置的并行回填计划作废（调用点在同一把锁内装新计划）。
+        self.fill_plan = None;
+    }
+
+    /// 取走待执行的并行回填计划（**一次性**：取走即清空；正常顺播恒返回 `None`）。
+    ///
+    /// 两道守卫（任一不满足都作废，退回既有单连接路径）：
+    ///   - **代数一致**：不一致说明取计划之前又发生了 `reset`（用户连拖）；
+    ///   - **窗口前沿正好落在计划起点**：不相等说明这段字节已经由别的路径
+    ///     拿到了（或窗口已被消费推进），计划没有意义。
+    fn take_seek_fill_plan(&mut self) -> Option<SeekFillPlan> {
+        let plan = self.fill_plan.take()?;
+        if plan.generation != self.generation || self.write_pos() != plan.start {
+            return None;
+        }
+        Some(plan)
+    }
+}
+
+/// 窗口 + 唤醒条件变量（读线程 push 后 notify，demux 侧分片等待）。
+struct StreamShared {
+    buf: Mutex<StreamBuffer>,
+    data_cv: Condvar,
+}
+
+/// 取窗口锁，**poison 不 panic**。
+///
+/// 调用点落在 demux 线程的 `extern "C"` AVIO 读回调内，panic 不可 unwind →
+/// 进程 fail-fast abort（实测 0xc0000409 闪退形态）。写线程已经消失时，
+/// 窗口里的字节依然是自洽的，取回内部数据继续读即可。
+fn lock_stream(shared: &StreamShared) -> std::sync::MutexGuard<'_, StreamBuffer> {
+    match shared.buf.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// demux 侧等待新字节的分片长度：与旧 `take_prefetch` 的分片轮询同构，
+/// 保证等待期间仍能推进换 host / 诊断（不退回"卡住时恰好换不了 host"的旧缺口）。
+const STREAM_WAIT_SLICE: Duration = Duration::from_millis(250);
+
+/// 读线程空闲轮询步长（背压期间 / 等写入窗口时的睡眠）。
+/// 50ms：够短（消费后最迟 50ms 恢复读），够长（不烧 CPU）。
+const STREAM_IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// 允许"等一等"的最大前跳距离：demux 读到的位置领先网络填充前沿不超过它时，
+/// 不重发请求，等读线程把字节填上来（≤64KB ≈ 0.2s @1080P）。
+/// 超过它（= 真正的 seek / 乱序跳读）就重设窗口、重发一条连接——这才是
+/// mpv 的行为：seek 到缓冲外必须重新请求，而不是把几 MB 顺着读完。
+const STREAM_FORWARD_SLACK_BYTES: u64 = 64 * 1024;
+
+/// 重连退避上限。200ms 起翻倍到 2s（与 `full_preload_loop` 的既有节奏一致）：
+/// 服务端被并发限制时的退避不应超过一次握手成本太多，否则恢复慢半拍。
+const STREAM_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+/// 窗口最小前向容量：即便上层把 read-ahead 配得很小，也要容得下一个 AVIO
+/// 读块（64KB）+ 一点余量，否则"等一下"的判定会反复触到边。
+const STREAM_MIN_FRONT_CAP: usize = 256 * 1024;
+
+/// 源析构时等待读线程退出的上限。超过即 detach（见 `Drop for HttpRangeSource`）。
+const STREAM_STOP_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 长读路径的**诊断发布节流**间隔（毫秒）：宿主 500ms 轮询一次，发布更勤只是
+/// 把进程级全局锁拉进 demux 热路径。见 `publish_diag_throttled`。
+const STREAM_DIAG_PUBLISH_MS: u64 = 500;
+
+/// 一条已建立的顺序读连接（header 已校验、body reader 已就绪）。
+struct SequentialResponse {
+    reader: Box<dyn Read + Send + Sync>,
+    /// 本连接声明的**终点**（Content-Range 的 end，含）。到它就说明文件读完，
+    /// 不必再重连（这是"1 个请求播完 8 分钟"的出口条件）。
+    end: Option<u64>,
+    /// 服务端声明的总长（Content-Range total / 200 的 Content-Length）。
+    total: Option<u64>,
+}
+
+/// 顺序长读的重连退避推进：0 → 200ms → 400ms → … → 上限
+/// [`STREAM_RECONNECT_BACKOFF_MAX`]（与旧 `RETRY_BACKOFF` 节奏一致）。
+///
+/// 注意"退避"只挂在**失败**上：连接建立成功、或连接被服务端提前收线但已经
+/// 收到整块数据时，重连必须是**立即**的——那两种情形下字节仍在正常流动，
+/// 白等 200ms 只会把 demux 拖出一次不必要的冻结。
+fn stream_retry_backoff(current: Duration) -> Duration {
+    if current.is_zero() {
+        Duration::from_millis(200)
+    } else {
+        (current * 2).min(STREAM_RECONNECT_BACKOFF_MAX)
+    }
+}
+
+/// 解析 `Content-Range: bytes start-end/total` 的 `end`。
+fn parse_content_range_end(value: &str) -> Option<u64> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (range, _) = rest.rsplit_once('/')?;
+    let (_, end) = range.trim().split_once('-')?;
+    end.trim().parse::<u64>().ok()
+}
+
+/// 顺序长读专用 HTTP agent：**只保留连接超时，无 body 总时长限制**。
+///
+/// 与 `http_live_agent` 是同一个理由（那里的注释记录了根因）：ureq 3.x 的
+/// `timeout_recv_response` / `timeout_recv_body` 是**自响应头起算的总时长**
+/// deadline。顺序长读的 body 是"从当前位置到文件尾"的无限长响应，用
+/// `http_agent()`（60s body 总时长）会变成"播满 60s 必断流"。
+/// 短请求（长度探测 / 候选测速）继续用 `http_agent()`。
+fn http_stream_agent() -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .disable_verification(true)
+        .build();
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(4)))
+        .tls_config(tls)
+        .build()
+        .into()
+}
+
+// ----------------------------------------------------------------------------
+// seek 出窗的跨节点并行回填：**执行侧**（形态约束见文件上方整段）。
+//
+// 读线程在一次 seek 出窗后执行一批**分段**（每段一个候选节点、一条有界 Range），
+// 然后**按序**把它们 push 进窗口；任一段出问题就整批放弃、回退既有的单连接串行
+// 续传。所有分段都不写窗口，写窗口的只有读线程一个（既有单写者语义不变）。
+// ----------------------------------------------------------------------------
+
+/// 并行分段专用 HTTP agent：**有界段**（几百 KB），因此可以安全地设 body 总时长
+/// 上限——段跑不完就报错退出，而不是像长读那样必须无 body 超时（长读的 body 是
+/// "到文件尾"的无限长响应，见 `http_stream_agent` 注释）。
+///
+/// 上限取 [`SEEK_PARALLEL_SEGMENT_TIMEOUT`] + 2s：比读线程的等待窗口略长，
+/// 保证**先超时的是读线程**——回退决策统一由读线程做，worker 只负责如实报错。
+/// 没有这道上限，一个挂死的分段线程会永久占着在飞配额。
+fn http_seek_fill_agent() -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .disable_verification(true)
+        .build();
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(4)))
+        .timeout_recv_response(Some(Duration::from_secs(8)))
+        .timeout_recv_body(Some(SEEK_PARALLEL_SEGMENT_TIMEOUT + Duration::from_secs(2)))
+        .tls_config(tls)
+        .build()
+        .into()
+}
+
+/// **并行回填的累计计数 + 最近一次批次明细**（诊断与日志的唯一数据源）。
+///
+/// 存在的理由（用户要的"可验证反馈"）：并行分段会让 `http_requests` 上涨，
+/// 必须能区分三种形态——**顺播一条长连接** / **seek 时的跨节点 N 段** /
+/// **seek 退化为单连接**。这组计数只在 seek 出窗时动，**顺播期间恒为 0**，
+/// 这就是判据本身（见 `SourceDiagSnapshot::seek_fill_batches`）。
+#[derive(Default)]
+struct SeekFillDiag {
+    /// 累计批次数（每次 seek 出窗尝试并行 +1；回退的批次也计）。
+    batches: AtomicU64,
+    /// 累计建立的并行分段连接数（每个节点一条）。
+    connections: AtomicU64,
+    /// 累计**真正被采用**的并行字节数（回退时丢弃的段不计）。
+    bytes: AtomicU64,
+    /// 回退到单连接的批次次数（任一段失败/超时/校验不过/代数变化）。
+    fallbacks: AtomicU64,
+    /// 最近一次批次的段数（0 = 本次会话还没并行过 → "顺播"判据）。
+    last_segments: AtomicU64,
+    /// 最近一次批次被采用的字节数。
+    last_bytes: AtomicU64,
+    /// 最近一次批次墙钟（毫秒）。
+    last_ms: AtomicU64,
+    /// 最近一次批次的**期望墙钟**（毫秒）= 采用字节 ÷ 单流通量估算，即"同一批
+    /// 数据用单连接拉要多久"。用户拿"实测 vs 期望"就能复核提速幅度，不需要信
+    /// 任何人的口头结论。
+    last_expected_ms: AtomicU64,
+    /// 定条数时用的单流通量估算（字节/秒，f64 位模式）。
+    last_per_conn_bps: AtomicU64,
+    /// 最近一次批次是否回退（0/1）。
+    last_fallback: AtomicU64,
+    /// **自适应闸门**：连续测得"并行没有叠加"的次数（见 `note_gain`）。
+    no_gain: AtomicU64,
+    /// 自适应关闭发生的次数。关掉之后 env 开关仍是"开"的状态，但本会话不再
+    /// 并发——现场要能从诊断里看出"是测出来没用才不并发，不是没生效"。
+    auto_disabled: AtomicU64,
+    /// **下载前门禁否决**的次数（凭据不足/不一致 → 退回单节点）。
+    ///
+    /// 这是"**这次没并行是因为没过校验**"的直接证据：现场看到 seek 变慢时，
+    /// 先看这个数——它涨说明门禁在工作，而不是并行没生效。
+    gate_denied: AtomicU64,
+    /// 最近一次门禁裁定的可读理由（原样展示，不重写）。
+    last_gate_reason: Mutex<String>,
+    /// **边界重叠逐字节比对失败**的批次数：**核心安全计数**。它非 0 说明确实有
+    /// 节点给的字节与邻居对不上——那一批已经被整批丢弃并回退。
+    overlap_mismatch: AtomicU64,
+    /// 边界重叠逐字节比对**全部通过**的批次数（与 `overlap_mismatch` 成对：
+    /// 两者之和 + 未走到比对就被中止的批次 = `batches`）。
+    overlap_ok: AtomicU64,
+}
+
+impl SeekFillDiag {
+    /// 本会话是否已因"实测无叠加"关掉并行。
+    fn disabled(&self) -> bool {
+        self.no_gain.load(Ordering::Relaxed) >= SEEK_PARALLEL_NO_GAIN_LIMIT
+    }
+
+    /// 把本批计数写进诊断快照（`HttpRangeSource::diag_snapshot` 调用）。
+    ///
+    /// 口径：累计量都是**进程内单调**（与 `http_requests` 同寿命，宿主差分读）；
+    /// `*_last_*` 是最近一次批次的明细，供"这次 seek 到底发生了什么"当场判读。
+    fn fill_snapshot(&self, snapshot: &mut SourceDiagSnapshot) {
+        snapshot.seek_fill_batches = self.batches.load(Ordering::Relaxed);
+        snapshot.seek_fill_connections = self.connections.load(Ordering::Relaxed);
+        snapshot.seek_fill_bytes = self.bytes.load(Ordering::Relaxed);
+        snapshot.seek_fill_gate_denied = self.gate_denied.load(Ordering::Relaxed);
+        snapshot.seek_fill_fallbacks = self.fallbacks.load(Ordering::Relaxed);
+        snapshot.seek_fill_overlap_ok = self.overlap_ok.load(Ordering::Relaxed);
+        snapshot.seek_fill_overlap_mismatch = self.overlap_mismatch.load(Ordering::Relaxed);
+        snapshot.seek_fill_last_segments = self.last_segments.load(Ordering::Relaxed);
+        snapshot.seek_fill_last_bytes = self.last_bytes.load(Ordering::Relaxed);
+        snapshot.seek_fill_last_ms = self.last_ms.load(Ordering::Relaxed);
+        snapshot.seek_fill_last_expected_ms = self.last_expected_ms.load(Ordering::Relaxed);
+        snapshot.seek_fill_last_fallback = self.last_fallback.load(Ordering::Relaxed) != 0;
+        snapshot.seek_fill_disabled =
+            self.disabled() || self.auto_disabled.load(Ordering::Relaxed) > 0;
+        if let Ok(reason) = self.last_gate_reason.lock() {
+            snapshot.seek_fill_last_gate_reason = reason.clone();
+        }
+    }
+
+    /// 最近一次批次用的单流通量估算（**测试断言用**；生产路径只写不读）。
+    ///
+    /// 当前无调用点，保留待用。
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn last_per_conn_bps(&self) -> f64 {
+        f64::from_bits(self.last_per_conn_bps.load(Ordering::Relaxed))
+    }
+
+    /// 记录一次批次的实测吞吐，判定"并行到底有没有叠加"。
+    ///
+    /// 判据：`实测总吞吐 < 单流估算 × SEEK_PARALLEL_NO_GAIN_RATIO` ⇒ 通了但**没
+    /// 叠加**（例如 CDN 按出口 IP 限速、或几个候选其实落在同一出口）。连续
+    /// [`SEEK_PARALLEL_NO_GAIN_LIMIT`] 次就关掉本会话的并行——**宁可慢，也不做
+    /// 只涨请求数、不涨吞吐的事**。任何一次测到有叠加就归零。
+    fn note_gain(&self, achieved_bps: f64, per_conn_bps: f64) {
+        if !(achieved_bps > 0.0) || !(per_conn_bps > 0.0) {
+            return;
+        }
+        if achieved_bps >= per_conn_bps * SEEK_PARALLEL_NO_GAIN_RATIO {
+            self.no_gain.store(0, Ordering::Relaxed);
+            return;
+        }
+        let previous = self.no_gain.fetch_add(1, Ordering::Relaxed);
+        if previous + 1 == SEEK_PARALLEL_NO_GAIN_LIMIT {
+            self.auto_disabled.fetch_add(1, Ordering::Relaxed);
+            trace::diagnostic(format!(
+                "[erika seek-parallel] 实测并行无叠加（{:.0}KB/s vs 单流 {:.0}KB/s）：本会话不再并发，seek 回到单连接串行",
+                achieved_bps / 1024.0,
+                per_conn_bps / 1024.0,
+            ));
+        }
+    }
+}
+
+/// 一个节点的**预检结果**：下载前能拿到的全部凭据（1 字节 Range 的响应头）。
+///
+/// 为什么必须有这一步：用户的原话是"你真的能在下载、也就是在流下来之前，就确定
+/// 那个视频是一致的吗？"——预检就是回答它的那一枪。**没有通过门禁的节点，一个
+/// body 字节都不会被读**（见 [`SeekFillGate`]）。
+#[derive(Debug, Clone, Default)]
+struct SeekFillProbe {
+    /// 服务端声明的**文件总长**（`Content-Range` total / `Content-Length`）。
+    /// 跨节点一致性的**必要条件**。
+    total: Option<u64>,
+    /// `ETag` 原文（**强证据**：实测 B 站官方 upos 镜像节点跨节点同值）。
+    etag: Option<String>,
+    /// `Last-Modified` 原文（**弱证据，门禁不作依据**）。
+    ///
+    /// 实测反例（2026-09-15，同一 cid 的三个节点）：MCDN 节点给
+    /// `Mon, 14 Sep 2026 15:15:20 GMT`，两个官方镜像给
+    /// `Sun, 31 Mar 2024 20:54:03 GMT`——**同一份内容、不同 Last-Modified**。
+    /// 所以它只能进日志/诊断供人看，不能当一致性判据。
+    last_modified: Option<String>,
+    /// 预检本身耗时（诊断：这一步的代价有多大）。
+    elapsed: Duration,
+}
+
+/// 一个并行分段交回的结果。
+struct SeekFillResponse {
+    /// 收到的完整字节（= 请求长度；长度不符的段在 worker 里就被判失败）。
+    bytes: Vec<u8>,
+    /// 本段自身耗时（worker 侧计时；日志/诊断用）。
+    elapsed: Duration,
+}
+
+/// 门禁裁定结果（读线程裁定、各 worker 读取）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeekFillVerdict {
+    /// 放行：跨节点凭据一致（下载后仍有重叠比对兜底）。
+    Allow,
+    /// 作废：凭据不足/不一致 → **退回单节点**（宁可慢，不冒数据损坏的险）。
+    Deny,
+}
+
+/// slot 的两阶段状态机：`Pending → Probed(预检) → Done(数据/失败)`。
+///
+/// 之所以两阶段而不是"一个结果位"：门禁必须在**任何 body 被读之前**裁定，而裁定
+/// 需要各节点的预检头部——所以 worker 把"头部"与"数据"分两次交回。
+enum SeekFillSlotState {
+    Pending,
+    Probed(SeekFillProbe),
+    Done(std::result::Result<SeekFillResponse, String>),
+}
+
+/// 一个分段槽：worker 分两次写入，读线程**按序**取走（取走即释放内存）。
+struct SeekFillSlot {
+    segment: SeekFillSegment,
+    state: Mutex<SeekFillSlotState>,
+    ready: Condvar,
+}
+
+impl SeekFillSlot {
+    fn new(segment: SeekFillSegment) -> Self {
+        Self {
+            segment,
+            state: Mutex::new(SeekFillSlotState::Pending),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// 取槽锁，**poison 不 panic**（与 `lock_stream` 同一套理由：调用点落在 demux
+    /// 线程的等待循环里，panic 越过 `extern "C"` 边界会 fail-fast abort）。
+    fn lock(&self) -> std::sync::MutexGuard<'_, SeekFillSlotState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn publish_probe(&self, probe: SeekFillProbe) {
+        let mut guard = self.lock();
+        if matches!(*guard, SeekFillSlotState::Pending) {
+            *guard = SeekFillSlotState::Probed(probe);
+        }
+        drop(guard);
+        self.ready.notify_all();
+    }
+
+    fn publish_done(&self, value: std::result::Result<SeekFillResponse, String>) {
+        let mut guard = self.lock();
+        *guard = SeekFillSlotState::Done(value);
+        drop(guard);
+        self.ready.notify_all();
+    }
+}
+
+/// **下载前门禁**：各节点的预检头部齐了之后由读线程裁定"放行 / 作废"，各 worker
+/// 在这里等结果；作废时 worker 直接退出——**一个 body 字节都不读**。
+struct SeekFillGate {
+    decision: Mutex<Option<SeekFillVerdict>>,
+    ready: Condvar,
+}
+
+impl SeekFillGate {
+    fn new() -> Self {
+        Self {
+            decision: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn release(&self, verdict: SeekFillVerdict) {
+        let mut guard = self
+            .decision
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(verdict);
+        drop(guard);
+        self.ready.notify_all();
+    }
+
+    /// 等裁定；超时或源已停止一律按**作废**处理（宁可慢，不冒风险）。
+    fn wait(&self, timeout: Duration, stop: &AtomicBool) -> SeekFillVerdict {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self
+            .decision
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(verdict) = *guard {
+                return verdict;
+            }
+            if stop.load(Ordering::Relaxed) {
+                return SeekFillVerdict::Deny;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return SeekFillVerdict::Deny;
+            }
+            let (next, _) = self
+                .ready
+                .wait_timeout(guard, remaining.min(Duration::from_millis(250)))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next;
+        }
+    }
+}
+
+/// 在飞配额的 RAII 归还：worker 无论从哪条路径退出（预检失败 / 门禁拒绝 /
+/// 超时 / 正常完成）都会归还，不会漏。
+struct SeekFillQuota(Arc<AtomicUsize>);
+
+impl Drop for SeekFillQuota {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 是否允许"凭据不足也跨节点"（用户显式接受风险）。默认**否**。
+///
+/// 默认行为是"证据不足就退回单节点"——用户的原话是"静默的数据损坏比慢 5 秒糟
+/// 得多"。打开这个开关意味着：只剩**下载后的段间重叠逐字节比对**兜底，而它
+/// **覆盖不到段内部**（段内部只有单一节点的数据，没有对照物）。
+fn seek_parallel_trust_nodes() -> bool {
+    env::var("ERIKA_SEEK_PARALLEL_TRUST_NODES")
+        .map(|value| {
+            let v = value.trim();
+            v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
+}
+
+/// **跨节点一致性门禁**（纯函数，可单测）。
+///
+/// 判据（用户定的硬要求：宁慢不脏；每一条都对应一次可复核的实测）：
+///   1. 每个节点都必须给出**文件总长**，且**全部相同** —— 否则多半不是同一个对象；
+///   2. **`ETag` 全部存在且逐字相同**才放行。这是唯一被实测支持为"强证据"的
+///      凭据：同一 cid 的 `upos-sz-mirrorcoso1` 与 `upos-sz-mirrorcos` 给的是
+///      同一个 `"c3925abf0154d98095b824a712641d23"`，且重复请求稳定；
+///   3. `ETag` 缺失或各节点不同 → **默认作废、退回单节点**。只有用户显式设
+///      `ERIKA_SEEK_PARALLEL_TRUST_NODES=1`（接受风险）才放行；
+///   4. `Last-Modified`**不作为依据**（实测已证伪：同一内容在不同节点上不同）；
+///   5. 接口侧（`playurl`）**没有内容哈希可用**——真实响应里 `dash.video[]` /
+///      `dash.audio[]` 只有 `id/baseUrl/backupUrl/bandwidth/mimeType/codecs/
+///      width/height/frameRate/sar/startWithSap/SegmentBase/codecid`，
+///      **没有 md5/hash/checksum/size**。能用的凭据只有 HTTP 头部。
+///
+/// 返回 `(裁定, 可读理由)`——理由原样进日志与诊断，现场据此核对"为什么没并行"。
+fn seek_fill_gate(probes: &[SeekFillProbe], trust_nodes: bool) -> (SeekFillVerdict, String) {
+    let Some(first) = probes.first() else {
+        return (SeekFillVerdict::Deny, "无预检结果".to_string());
+    };
+    if probes.iter().any(|probe| probe.total.is_none()) {
+        return (
+            SeekFillVerdict::Deny,
+            "有节点未给出文件总长（Content-Length/Content-Range）".to_string(),
+        );
+    }
+    if probes.iter().any(|probe| probe.total != first.total) {
+        return (
+            SeekFillVerdict::Deny,
+            "各节点声明的文件总长不一致".to_string(),
+        );
+    }
+    let total = first.total.unwrap_or(0);
+    let etags: Vec<&str> = probes
+        .iter()
+        .filter_map(|probe| probe.etag.as_deref())
+        .collect();
+    if etags.len() == probes.len() && etags.iter().all(|etag| *etag == etags[0]) {
+        return (
+            SeekFillVerdict::Allow,
+            format!(
+                "{} 个节点 ETag 一致（{}）、总长一致 {total}B",
+                probes.len(),
+                etags[0]
+            ),
+        );
+    }
+    let detail = if etags.len() < probes.len() {
+        format!("{}/{} 个节点给出了 ETag", etags.len(), probes.len())
+    } else {
+        format!("{} 个节点 ETag 各不相同", etags.len())
+    };
+    if trust_nodes {
+        return (
+            SeekFillVerdict::Allow,
+            format!(
+                "{detail}；用户显式接受风险（ERIKA_SEEK_PARALLEL_TRUST_NODES=1），仅重叠比对兜底"
+            ),
+        );
+    }
+    (
+        SeekFillVerdict::Deny,
+        format!(
+            "{detail}，证据不足 → 默认退回单节点（可设 ERIKA_SEEK_PARALLEL_TRUST_NODES=1 显式接受风险）"
+        ),
+    )
+}
+
+/// 并行回填的共享上下文（读线程持有；worker 线程 clone 一份）。
+///
+/// 存在的理由：worker 是独立 `std::thread`，拿不到源实例与读线程局部量——与旧
+/// 路径的 `PendingHttpFetch::spawn` 同一处境（那里也是把 uri/headers/progress/
+/// diag_slot 逐个传进去）。这里把同一组量打包，避免七八个参数逐个透传。
+#[derive(Clone)]
+struct SeekFillContext {
+    shared: Arc<StreamShared>,
+    http_headers: Vec<(String, String)>,
+    /// 实时到达字节计数器（`fetch_http_range` 的 `progress`）：分段的字节在
+    /// **到达时**就计入宿主的下载量/带宽估算，与其它路径同口径。
+    arrived: Arc<AtomicU64>,
+    /// 「最近一次收到字节」时间戳：分段 push 后刷新，让换源判据看到的仍是
+    /// "链路在给字节"（**不会被误判成多连接异常**）。
+    last_arrival_ms: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    diag_slot: usize,
+    /// 读线程的 `in_flight` 标志（诊断 `prefetch_in_flight`：并行期间为 1）。
+    reader_in_flight: Arc<AtomicU64>,
+    /// **在飞分段配额**（硬上限）：连续拖动时靠它保证并发连接数不被推高——
+    /// 新一批看到配额已被占满就整批放弃、回退单连接（那是既有的安全形态）。
+    /// 配额在 worker **真正结束时**归还（超时被放弃的段仍占着一条连接）。
+    quota: Arc<AtomicUsize>,
+    /// 累计计数与最近一次明细。
+    diag: Arc<SeekFillDiag>,
+}
+
+/// 等到本段就绪（或超时 / 源停止）。`Err(原因码)` = 本批应当回退到单连接。
+///
+/// 分片等待（250ms）而不是一次等到超时：期间仍能响应 `stop`（源析构不拖 5s）。
+/// 等本段的**预检**（下载前凭据）。`None` = 失败/超时/源已停止 → 本批作废。
+///
+/// 分片等待（250ms）而不是一次等到超时：期间仍能响应 `stop`（源析构不拖满）。
+fn wait_seek_fill_probe(ctx: &SeekFillContext, slot: &SeekFillSlot) -> Option<SeekFillProbe> {
+    let deadline = Instant::now() + SEEK_PARALLEL_PROBE_TIMEOUT;
+    let mut guard = slot.lock();
+    loop {
+        match &*guard {
+            SeekFillSlotState::Probed(probe) => return Some(probe.clone()),
+            SeekFillSlotState::Done(_) => return None,
+            SeekFillSlotState::Pending => {}
+        }
+        if ctx.stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let (next, _) = slot
+            .ready
+            .wait_timeout(guard, remaining.min(Duration::from_millis(250)))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard = next;
+    }
+}
+
+/// 等本段**数据**就绪（门禁放行之后才有意义）。`Err(原因码)` = 本批应当回退。
+fn wait_seek_fill_data(
+    ctx: &SeekFillContext,
+    slot: &SeekFillSlot,
+) -> std::result::Result<SeekFillResponse, &'static str> {
+    let deadline = Instant::now() + SEEK_PARALLEL_SEGMENT_TIMEOUT;
+    let mut guard = slot.lock();
+    loop {
+        if matches!(*guard, SeekFillSlotState::Done(_)) {
+            // 取走即释放内存（一段可能几百 KB）。
+            let previous = std::mem::replace(&mut *guard, SeekFillSlotState::Pending);
+            return match previous {
+                SeekFillSlotState::Done(Ok(response)) => Ok(response),
+                _ => Err("segment_error"),
+            };
+        }
+        if ctx.stop.load(Ordering::Relaxed) {
+            return Err("stopped");
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("segment_timeout");
+        }
+        let (next, _) = slot
+            .ready
+            .wait_timeout(guard, remaining.min(Duration::from_millis(250)))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard = next;
+    }
+}
+
+/// 起一个分段 worker：**一条连接、一个节点、读完即关**。
+///
+/// 三个阶段的顺序是**安全性的载体**，不能重排：
+///   1. **预检**（1 字节 Range）→ 把响应头交回槽里，供读线程做下载前门禁；
+///   2. **等门禁**：没通过就**一个 body 字节都不读**地退出；
+///   3. **下载本段**（含前向重叠）→ 交回数据，由读线程按序 push。
+///
+/// worker 只负责"把这一段字节正确取回并交回槽里"；**不碰窗口**——push 由读线程
+/// 按序做（见 `run_seek_fill`），所以既有"窗口只有一个写者"的语义没有被打破，
+/// 也就不存在两个写者乱序写入的竞态。
+///
+/// 预检与下载用的是**同一个 `ureq::Agent`**（同一个连接池）→ 同一节点上实际只有
+/// **一条 TCP 连接上的两个单次 Range 请求**（用完即断），形态与普通用户无异。
+fn spawn_seek_fill_worker(
+    context: &SeekFillContext,
+    slot: Arc<SeekFillSlot>,
+    gate: Arc<SeekFillGate>,
+) {
+    let ctx = context.clone();
+    let worker_slot = Arc::clone(&slot);
+    let segment = slot.segment.clone();
+    let spawned = thread::Builder::new()
+        .name(format!("erika-seek-fill-{}", ctx.diag_slot))
+        .spawn(move || {
+            // 配额由 RAII guard 归还：预检失败 / 门禁拒绝 / 超时 / 完成，都跑不掉。
+            let _quota = SeekFillQuota(Arc::clone(&ctx.quota));
+            let agent = http_seek_fill_agent();
+            // ---- 阶段 1：下载前预检（1 字节）----
+            let probe_started = Instant::now();
+            let probe = match fetch_http_range(
+                &agent,
+                &segment.uri,
+                &ctx.http_headers,
+                ByteRange {
+                    start: segment.start,
+                    length: Some(1),
+                },
+                "http_seek_parallel_probe",
+                None,
+                http_request_profile(ctx.diag_slot),
+            ) {
+                Ok(response) => SeekFillProbe {
+                    total: response.total_length,
+                    etag: response.etag,
+                    last_modified: response.last_modified,
+                    elapsed: probe_started.elapsed(),
+                },
+                Err(error) => {
+                    worker_slot.publish_done(Err(format!("probe failed: {error}")));
+                    return;
+                }
+            };
+            worker_slot.publish_probe(probe);
+            // ---- 阶段 2：等下载前门禁裁定 ----
+            if gate.wait(SEEK_PARALLEL_PROBE_TIMEOUT, &ctx.stop) != SeekFillVerdict::Allow {
+                worker_slot.publish_done(Err("gate denied".to_string()));
+                return;
+            }
+            if ctx.stop.load(Ordering::Relaxed) {
+                worker_slot.publish_done(Err("stopped".to_string()));
+                return;
+            }
+            // ---- 阶段 3：下载本段（含前向重叠）----
+            let started = Instant::now();
+            let request = ByteRange {
+                start: segment.request_start(),
+                length: Some(segment.request_length()),
+            };
+            // 复用既有的 `fetch_http_range`（**不另造一套取数逻辑**）：它自带
+            // 重试/断点续传、`Content-Range` 起点校验、`If-Range` 实体校验，
+            // 并把到达字节实时计入 `arrived`/请求画像。
+            let result = fetch_http_range(
+                &agent,
+                &segment.uri,
+                &ctx.http_headers,
+                request,
+                "http_seek_parallel_range",
+                Some(ctx.arrived.as_ref()),
+                http_request_profile(ctx.diag_slot),
+            );
+            // **长度校验是字节正确性的第一道闸**（第二道是读线程 push 前的
+            // 代数/位置复核，第三道是段间重叠的逐字节比对）。长度不符一律判失败
+            // ——宁可回退单连接，也不拼接来路不明的字节。
+            let value = match result {
+                Ok(response) if response.bytes.len() as u64 == segment.request_length() => {
+                    Ok(SeekFillResponse {
+                        bytes: response.bytes,
+                        elapsed: started.elapsed(),
+                    })
+                }
+                Ok(response) => Err(format!(
+                    "short segment: {} of {} bytes",
+                    response.bytes.len(),
+                    segment.request_length(),
+                )),
+                Err(error) => Err(error.to_string()),
+            };
+            worker_slot.publish_done(value);
+        });
+    if let Err(error) = spawned {
+        context.quota.fetch_sub(1, Ordering::Relaxed);
+        slot.publish_done(Err(format!("worker spawn failed: {error}")));
+    }
+}
+
+/// 回退原因码 → 可读文本（日志用）。
+fn seek_fill_reason_text(code: &str) -> String {
+    match code {
+        "none" => "全部按序采用".to_string(),
+        "segment_timeout" => "分段超时".to_string(),
+        "segment_error" => "分段失败".to_string(),
+        "stopped" => "源已停止".to_string(),
+        "generation_changed" => "期间又 seek 了".to_string(),
+        "window_moved" => "窗口位置已变".to_string(),
+        "window_full" => "窗口已满".to_string(),
+        "entity_total_mismatch" => "跨节点文件总长不一致".to_string(),
+        "overlap_mismatch" => "跨节点边界字节比对失败".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// **执行一次 seek 出窗的跨节点并行回填**（阻塞读线程，直到结束或回退）。
+///
+/// 控制流只有两种出口：
+///   - 全部段**按序** push 成功 → 返回，读线程回到正常循环，从新前沿续一条
+///     open-ended Range（"用完即关"：N 条分段连接在这一刻全部结束）；
+///   - 任一段失败/超时/校验不过/代数变化 → 中止，读线程照旧从 `write_pos` 起
+///     open-ended 串行续传；**已 push 的前缀保留**（正确前缀，丢了只会重下）。
+///
+/// 正常顺播永不进入本函数（`take_seek_fill_plan` 恒为 `None`）。
+fn run_seek_fill(ctx: &SeekFillContext, plan: &SeekFillPlan) {
+    let started = Instant::now();
+    let segment_count = plan.segments.len();
+    // ---- 硬上限：本批要不要开？----
+    let already = ctx.quota.fetch_add(segment_count, Ordering::Relaxed);
+    if already + segment_count > SEEK_PARALLEL_MAX_CONNECTIONS {
+        ctx.quota.fetch_sub(segment_count, Ordering::Relaxed);
+        ctx.diag.batches.fetch_add(1, Ordering::Relaxed);
+        ctx.diag.fallbacks.fetch_add(1, Ordering::Relaxed);
+        ctx.diag.last_fallback.store(1, Ordering::Relaxed);
+        trace::diagnostic(format!(
+            "[erika seek-parallel] slot={} target={} 放弃并行：上批仍有 {} 段在飞（上限 {}）→ 回退单连接串行",
+            ctx.diag_slot, plan.start, already, SEEK_PARALLEL_MAX_CONNECTIONS,
+        ));
+        return;
+    }
+    ctx.reader_in_flight.store(1, Ordering::Relaxed);
+    let slots: Vec<Arc<SeekFillSlot>> = plan
+        .segments
+        .iter()
+        .cloned()
+        .map(|segment| Arc::new(SeekFillSlot::new(segment)))
+        .collect();
+    let gate = Arc::new(SeekFillGate::new());
+    for slot in &slots {
+        spawn_seek_fill_worker(ctx, Arc::clone(slot), Arc::clone(&gate));
+    }
+    // ---- 下载前门禁：收齐各节点预检头部 → 裁定 ----
+    //
+    // **这一步是"流下来之前就确定一致"的实现**：预检只发 1 字节 Range，拿到
+    // Content-Length/Content-Range total + ETag；任一个节点没通过就放它走人，
+    // 它的 body 一个字节都不会被读（worker 在 gate 上等到 Deny 直接退出）。
+    let probes: Vec<Option<SeekFillProbe>> = slots
+        .iter()
+        .map(|slot| wait_seek_fill_probe(ctx, slot))
+        .collect();
+    let (verdict, gate_reason) = if probes.iter().any(|probe| probe.is_none()) {
+        (
+            SeekFillVerdict::Deny,
+            "有节点的预检失败/超时（1 字节 Range 都拿不到）".to_string(),
+        )
+    } else {
+        let ready: Vec<SeekFillProbe> = probes.into_iter().flatten().collect();
+        seek_fill_gate(&ready, seek_parallel_trust_nodes())
+    };
+    gate.release(verdict);
+    let gate_log: String = slots
+        .iter()
+        .map(|slot| {
+            let state = slot.lock();
+            match &*state {
+                SeekFillSlotState::Probed(probe) => format!(
+                    "{}:total={} etag={} LM={} 预检={}ms",
+                    slot.segment.host,
+                    probe
+                        .total
+                        .map_or_else(|| "?".to_string(), |value| value.to_string()),
+                    probe.etag.as_deref().unwrap_or("无"),
+                    probe.last_modified.as_deref().unwrap_or("-"),
+                    probe.elapsed.as_millis(),
+                ),
+                _ => format!("{}:未交回预检", slot.segment.host),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    trace::diagnostic(format!(
+        "[erika seek-parallel] 下载前门禁 slot={} target={}：{} → {}｜{}",
+        ctx.diag_slot,
+        plan.start,
+        gate_reason,
+        if verdict == SeekFillVerdict::Allow {
+            "放行跨节点并行"
+        } else {
+            "作废，退回单节点串行"
+        },
+        gate_log,
+    ));
+    if verdict == SeekFillVerdict::Deny {
+        ctx.reader_in_flight.store(0, Ordering::Relaxed);
+        ctx.diag.batches.fetch_add(1, Ordering::Relaxed);
+        ctx.diag.gate_denied.fetch_add(1, Ordering::Relaxed);
+        ctx.diag.fallbacks.fetch_add(1, Ordering::Relaxed);
+        ctx.diag.last_fallback.store(1, Ordering::Relaxed);
+        ctx.diag
+            .last_segments
+            .store(segment_count as u64, Ordering::Relaxed);
+        ctx.diag
+            .last_gate_reason
+            .lock()
+            .map(|mut slot| *slot = gate_reason)
+            .ok();
+        return;
+    }
+    // ---- 按序采用 ----
+    let mut pushed_bytes = 0u64;
+    let mut pushed_segments = 0usize;
+    let mut fallback = "none";
+    let mut reports: Vec<String> = Vec::with_capacity(segment_count);
+    let mut tail: Vec<u8> = Vec::new();
+    // 注：`ETag`/文件总长的一致性判定已经在**下载前**做过（见上面的 `gate`），
+    // 这里只剩"下载后"的两道校验：边界重叠逐字节比对 + 按序 push 前的窗口复核。
+    let mut overlap_mismatch = false;
+    for (index, slot) in slots.iter().enumerate() {
+        let response = match wait_seek_fill_data(ctx, slot) {
+            Ok(response) => response,
+            Err(reason) => {
+                fallback = reason;
+                break;
+            }
+        };
+        let segment = &slot.segment;
+        // ① **边界重叠逐字节比对**（跨节点字节一致性的**直接证据**，也是
+        //    "下载后再验一次"的那道闸）。不一致 → 整批作废：
+        //    **绝不把对不上的字节拼进播放流**。
+        let overlap = usize::try_from(segment.overlap).unwrap_or(0);
+        if overlap > 0
+            && (response.bytes.len() < overlap
+                || tail.len() < overlap
+                || response.bytes[..overlap] != tail[..overlap])
+        {
+            overlap_mismatch = true;
+            fallback = "overlap_mismatch";
+            break;
+        }
+        // ② **按序 push**：只 push 自己那一份（重叠字节已经随前一段进窗口了）。
+        //    三道守卫全部在**同一把窗口锁内**判定——与既有读循环的"读取—判定—
+        //    写入必须原子"是同一条教训（旧实现踩过静默错位）。
+        let rejected = {
+            let mut g = lock_stream(&ctx.shared);
+            if g.generation != plan.generation {
+                Some("generation_changed")
+            } else if g.write_pos() != segment.start {
+                Some("window_moved")
+            } else if !g.has_space() {
+                Some("window_full")
+            } else {
+                g.push(&response.bytes[overlap..]);
+                None
+            }
+        };
+        if let Some(reason) = rejected {
+            fallback = reason;
+            break;
+        }
+        ctx.shared.data_cv.notify_all();
+        ctx.last_arrival_ms.store(now_ms(), Ordering::Relaxed);
+        pushed_bytes = pushed_bytes.saturating_add((response.bytes.len() - overlap) as u64);
+        pushed_segments += 1;
+        reports.push(format!(
+            "#{} host={} start={} len={}B 耗时={}ms",
+            index,
+            segment.host,
+            segment.start,
+            response.bytes.len() - overlap,
+            response.elapsed.as_millis(),
+        ));
+        // 保留本段末尾（长度 = 下一段的前向重叠量），供下一段比对。
+        let next_overlap = plan
+            .segments
+            .get(index + 1)
+            .and_then(|next| usize::try_from(next.overlap).ok())
+            .unwrap_or(0);
+        tail = if next_overlap > 0 {
+            let take = response.bytes.len().min(next_overlap);
+            response.bytes[response.bytes.len() - take..].to_vec()
+        } else {
+            Vec::new()
+        };
+    }
+    ctx.reader_in_flight.store(0, Ordering::Relaxed);
+
+    // ---- 结算：计数 + 最近一次明细 ----
+    let elapsed = started.elapsed();
+    let diag = ctx.diag.as_ref();
+    let expected_ms = if plan.per_conn_bps > 0.0 {
+        (pushed_bytes as f64 / plan.per_conn_bps * 1000.0) as u64
+    } else {
+        0
+    };
+    diag.batches.fetch_add(1, Ordering::Relaxed);
+    diag.connections
+        .fetch_add(segment_count as u64, Ordering::Relaxed);
+    diag.bytes.fetch_add(pushed_bytes, Ordering::Relaxed);
+    diag.last_segments
+        .store(segment_count as u64, Ordering::Relaxed);
+    diag.last_bytes.store(pushed_bytes, Ordering::Relaxed);
+    diag.last_ms
+        .store(elapsed.as_millis() as u64, Ordering::Relaxed);
+    diag.last_expected_ms.store(expected_ms, Ordering::Relaxed);
+    diag.last_per_conn_bps
+        .store(plan.per_conn_bps.to_bits(), Ordering::Relaxed);
+    diag.last_fallback
+        .store(u64::from(fallback != "none"), Ordering::Relaxed);
+    if fallback != "none" {
+        diag.fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+    if overlap_mismatch {
+        diag.overlap_mismatch.fetch_add(1, Ordering::Relaxed);
+    }
+    diag.overlap_ok.fetch_add(
+        u64::from(overlap_mismatch == false && pushed_segments == segment_count),
+        Ordering::Relaxed,
+    );
+    if fallback == "none" && pushed_bytes > 0 {
+        diag.note_gain(
+            pushed_bytes as f64 / elapsed.as_secs_f64(),
+            plan.per_conn_bps,
+        );
+    }
+
+    // ---- 日志：**无条件输出**的运营诊断通道（`trace::diagnostic`），用户拖一次
+    //      进度条就能在日志里看到这一行，不需要开任何 trace 开关 ----
+    let hosts = plan
+        .segments
+        .iter()
+        .map(|segment| segment.host.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let single_conn_ms = if plan.per_conn_bps > 0.0 {
+        (plan.bytes as f64 / plan.per_conn_bps * 1000.0) as u64
+    } else {
+        0
+    };
+    trace::diagnostic(format!(
+        "[erika seek-parallel] slot={} target={} 跨节点 {} 段（{}）共采用 {}B/{}B 用时 {}ms；同一批数据单连接预计 {}ms（期望 {}ms @ 单流 {:.0}KB/s）；结果={}",
+        ctx.diag_slot,
+        plan.start,
+        segment_count,
+        hosts,
+        pushed_bytes,
+        plan.bytes,
+        elapsed.as_millis(),
+        single_conn_ms,
+        expected_ms,
+        plan.per_conn_bps / 1024.0,
+        seek_fill_reason_text(fallback),
+    ));
+    if fallback != "none" {
+        trace::diagnostic(format!(
+            "[erika seek-parallel] 已回退单连接串行续传（已采用 {}/{} 段）；段明细（按序）: {}",
+            pushed_segments,
+            segment_count,
+            if reports.is_empty() {
+                "（无）".to_string()
+            } else {
+                reports.join(" | ")
+            },
+        ));
+    } else {
+        trace::diagnostic(format!(
+            "[erika seek-parallel] 段明细（按序）: {}",
+            reports.join(" | ")
+        ));
+    }
+}
+
+/// 发一条 `Range: bytes=<start>-`（开放结尾）并校验响应头。
+///
+/// **请求计数点与 `fetch_http_range` 同口径**：在唯一真正发请求的那一处
+/// （`call()` 之前）记 1，因此每次重连/续传都如实各记 1（见
+/// [`SourceDiagSnapshot::http_requests`]）。
+///
+/// 头校验（与 `fetch_http_range` 的守卫语义一致，防止静默错位）：
+///   - 206：`Content-Range` 起点必须等于请求起点（换实体/换分片会违约）；
+///   - 200：只在 `start == 0` 时接受（服务端忽略 Range 返回全片），
+///     `start > 0` 直接判终局错误——把整片从头当续传字节拼接是静默数据损坏。
+fn open_sequential_response(
+    agent: &ureq::Agent,
+    uri: &str,
+    http_headers: &[(String, String)],
+    start: u64,
+    diag_slot: usize,
+) -> Result<SequentialResponse> {
+    let header = http_range_header(ByteRange {
+        start,
+        length: None,
+    });
+    let mut request = agent.get(uri).header("Range", &header);
+    for (name, value) in http_headers {
+        request = request.header(name, value);
+    }
+    http_trace_log(format!(
+        "{{\"event\":\"http_stream_open\",\"start\":{},\"range\":\"{}\"}}",
+        start,
+        json_escape(&header),
+    ));
+    if let Some(profile) = http_request_profile(diag_slot) {
+        profile.record_request();
+    }
+    let response = request.call().map_err(|error| {
+        http_trace_log(format!(
+            "{{\"event\":\"http_stream_open_error\",\"phase\":\"request\",\"start\":{},\"error\":\"{}\"}}",
+            start,
+            json_escape(&error.to_string()),
+        ));
+        http_failure_after_retries(&error)
+    })?;
+    let status = response.status().as_u16();
+    let content_range = response
+        .headers()
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let content_length = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let mut total = content_range.as_deref().and_then(parse_content_range_total);
+    let mut end = content_range.as_deref().and_then(parse_content_range_end);
+    match status {
+        206 => {
+            if let Some(served) = content_range.as_deref().and_then(parse_content_range_start)
+                && served != start
+            {
+                return Err(SourceError::Http(format!(
+                    "sequential stream served range from {served}, expected {start}"
+                )));
+            }
+            if total.is_none() {
+                // 没有 Content-Range 的 206：用 Content-Length 反推总长。
+                total = content_length.map(|length| start.saturating_add(length));
+            }
+            if end.is_none() {
+                end = total.map(|total| total.saturating_sub(1));
+            }
+        }
+        200 => {
+            if start > 0 {
+                return Err(SourceError::Http(
+                    "server ignored Range request (status 200)".to_string(),
+                ));
+            }
+            if total.is_none() {
+                total = content_length;
+            }
+            end = total.map(|total| total.saturating_sub(1));
+        }
+        _ => {
+            return Err(SourceError::Http(format!(
+                "unexpected HTTP status {status} for Range request"
+            )));
+        }
+    }
+    http_trace_log(format!(
+        "{{\"event\":\"http_stream_open_ok\",\"start\":{},\"status\":{},\"end\":{},\"total\":{}}}",
+        start,
+        status,
+        end.map_or_else(|| "null".to_string(), |value| value.to_string()),
+        total.map_or_else(|| "null".to_string(), |value| value.to_string()),
+    ));
+    Ok(SequentialResponse {
+        reader: Box::new(response.into_body().into_reader()),
+        end,
+        total,
+    })
+}
+
+/// 顺序长读线程（**一条持续读的连接**）。
+///
+/// 与旧模型的分界就在"缓冲满时做什么"：
+///   - 旧模型：关掉连接，等下次需要时再发一个新的 256KB Range
+///     → 请求数 ∝ 播放时长（一小时几千次）；
+///   - 本模型：**只是不再调 `read()`** → 内核接收缓冲填满 → TCP 窗口收缩 →
+///     服务端自然降速。连接不动、请求不发。mpv / 浏览器 / 官方客户端都这样。
+///
+/// **会重发请求的情形（穷举；正常顺序播放期间一条都不该命中）**：
+///   1. **seek 到窗口外**：读路径 `reset()` 令 `generation` +1，线程在下一个
+///      64KB 块边界发现代数变了 → 放弃当前连接，从新 `write_pos` 重发；
+///   2. **换 host**：`maybe_switch_host` 改写共享 uri 并把 `host_epoch` +1，
+///      线程发现 epoch 变了 → 断开、用新 host 从 `write_pos` 续（已收字节全在
+///      窗口里，不丢）；
+///   3. **服务端断开 / 读到 EOF**：连接级 `Ok(0)`。若已到服务端声明的终点
+///      （或 `total`）→ 标 `eof` 收工（**不再重连**）；否则视为提前收线，
+///      从 `write_pos` 静默续传（+1 请求，字节不丢）；
+///   4. **瞬时错误重试**：`Err(_)` / 连接失败。分类沿用
+///      `http_error_is_retryable`（5xx 与传输错误 = 瞬时）与
+///      `http_failure_after_retries`（4xx = 终局，写进窗口让宿主换源）；
+///      退避 200ms 起翻倍、上限 2s（既有 `RETRY_BACKOFF` 节奏）。
+///
+/// 另外两个"不再无限打请求"的守卫：
+///   - **连续两次连接都 0 字节** → 认定文件到尾（服务端对 open-ended Range
+///     立刻收线时，无限重连会退化成 200ms 一个请求的**请求风暴**）；
+///   - 起点已 ≥ `total` → 直接标 `eof`，连都不连。
+fn sequential_reader_loop(
+    shared: Arc<StreamShared>,
+    uri: Arc<Mutex<String>>,
+    http_headers: Vec<(String, String)>,
+    host_epoch: Arc<AtomicU64>,
+    arrived: Arc<AtomicU64>,
+    in_flight: Arc<AtomicU64>,
+    reconnects: Arc<StreamReconnects>,
+    stop: Arc<AtomicBool>,
+    diag_slot: usize,
+    fill: Arc<AtomicU64>,
+    journal: Arc<RangeJournal>,
+    last_arrival_ms: Arc<AtomicU64>,
+    done: mpsc::Sender<()>,
+    seek_fill: Arc<SeekFillDiag>,
+    seek_fill_quota: Arc<AtomicUsize>,
+) {
+    let agent = http_stream_agent();
+    let mut backoff = Duration::from_millis(200);
+    let mut empty_connects = 0u32;
+    // 填窗期吞吐计量（口径见 `FillMeter` / `fill_throughput_bps` 注释）。
+    let mut meter = FillMeter::new(diag_slot, fill);
+    // **判决实验**用：请求起点序列 + 与上一次前沿的关系（见 `RangeJournal`）。
+    let mut requests_sent = 0u64;
+    let mut last_front = 0u64;
+    // 滴灌节奏（窗口满时的小口读）。
+    let mut last_drip = Instant::now();
+    // **seek 出窗的跨节点并行回填**上下文（每批一个，见 `run_seek_fill`）。
+    // 只在 `take_seek_fill_plan()` 拿到计划时才会被用到——正常顺播全程零开销。
+    let seek_fill_ctx = SeekFillContext {
+        shared: Arc::clone(&shared),
+        http_headers: http_headers.clone(),
+        arrived: Arc::clone(&arrived),
+        last_arrival_ms: Arc::clone(&last_arrival_ms),
+        stop: Arc::clone(&stop),
+        diag_slot,
+        reader_in_flight: Arc::clone(&in_flight),
+        quota: Arc::clone(&seek_fill_quota),
+        diag: Arc::clone(&seek_fill),
+    };
+    while !stop.load(Ordering::Relaxed) {
+        // ---- 0. seek 出窗的跨节点并行回填（**一次性**：顺播恒取不到计划）----
+        //
+        // 计划由 demux 线程在 `stream_seek_hint` 的重设分支里装上（同一把锁内
+        // 完成 reset + 装计划）。取不到 = 正常顺播 → 下面一行代码都不受影响。
+        let plan = lock_stream(&shared).take_seek_fill_plan();
+        if let Some(plan) = plan.as_ref() {
+            // 预检 + 门禁 + 下载 + 按序 push 全在这一个调用里（阻塞到结束或回退）。
+            run_seek_fill(&seek_fill_ctx, plan);
+            // 结算链路吞吐基线：并行刚结束，别让"上批的旧速率"污染随后的填窗采样。
+            meter.pause();
+            continue;
+        }
+        // ---- 1. 背压：没有空位就不连（更不发请求）----
+        let (start, generation, total) = {
+            let g = lock_stream(&shared);
+            if !g.has_space() {
+                // 窗口满 → 不采样链路吞吐（否则会被"故意不读"钳成消费速率），
+                // 只重置基线（见 `FillMeter::pause`）。
+                meter.pause();
+                drop(g);
+                thread::sleep(STREAM_IDLE_POLL);
+                continue;
+            }
+            (g.write_pos(), g.generation, g.total)
+        };
+        if let Some(total) = total
+            && start >= total
+        {
+            let mut g = lock_stream(&shared);
+            g.eof = true;
+            drop(g);
+            shared.data_cv.notify_all();
+            continue;
+        }
+        let uri_now = match uri.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let epoch_now = host_epoch.load(Ordering::Relaxed);
+        if !backoff.is_zero() {
+            thread::sleep(backoff);
+            // 睡过即清：退避是"这一次重连要等多久"，不是常驻状态——正常续传
+            // 必须立刻重连（见 `stream_retry_backoff`）。
+            backoff = Duration::ZERO;
+        }
+        // ---- 2. 一条 open-ended Range 连接 ----
+        //
+        // **判决实验的取证点**：每次真正发请求前，把"起点 vs 上一次连接结束时的
+        // 前沿"记进 `RangeJournal`（限频日志 + 诊断分桶）。单调递增 = 断点续传
+        // （服务端/传输侧断我们）；前后跳跃 = demux 在 seek（与 CDN 无关）。
+        // 首个请求没有前沿，不分类。
+        let front_before = (requests_sent > 0).then_some(last_front);
+        journal.note_request(start, front_before, diag_slot);
+        requests_sent = requests_sent.saturating_add(1);
+        let opened =
+            match open_sequential_response(&agent, &uri_now, &http_headers, start, diag_slot) {
+                Ok(opened) => {
+                    backoff = Duration::ZERO; // 连接建立成功：后续若断，立即续传
+                    opened
+                }
+                Err(error) => {
+                    if let SourceError::Http(message) = error {
+                        // 终局（4xx / Range 被忽略 / Content-Range 违约）：写进窗口，
+                        // 读方取走即上报宿主换源。本线程继续退避重试——换 host 后
+                        // epoch 变化会让我们用新 uri 重来。
+                        lock_stream(&shared).error = Some(message);
+                        shared.data_cv.notify_all();
+                    }
+                    reconnects.bump(ReconnectCause::Empty);
+                    backoff = stream_retry_backoff(backoff);
+                    continue;
+                }
+            };
+        {
+            let mut g = lock_stream(&shared);
+            if g.total.is_none() {
+                g.total = opened.total;
+            }
+        }
+        shared.data_cv.notify_all();
+        // ---- 3. 持续读：每块之前重新判背压 / 代数 / host ----
+        in_flight.store(1, Ordering::Relaxed);
+        let mut body = opened.reader;
+        let mut chunk = [0u8; HTTP_RECV_CHUNK_BYTES];
+        let mut received_here = 0u64;
+        let mut restart = false;
+        let mut cause = ReconnectCause::EarlyClose;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                in_flight.store(0, Ordering::Relaxed);
+                let _ = done.send(());
+                return;
+            }
+            // ---- 背压 / 滴灌判定（一次加锁）----
+            let budget_full;
+            {
+                let g = lock_stream(&shared);
+                if g.generation != generation {
+                    cause = ReconnectCause::Reset;
+                    restart = true;
+                    break;
+                }
+                if g.eof {
+                    break;
+                }
+                if g.is_saturated() {
+                    // **彻底饱和**（预算 + 滴灌余量都用尽）→ 完全不读。
+                    // 这时连接会进入"写空闲"（若用户长时间暂停/消费停滞），
+                    // 但内存硬上限优先；恢复消费后立刻继续读。
+                    drop(g);
+                    meter.pause();
+                    thread::sleep(STREAM_IDLE_POLL);
+                    continue;
+                }
+                // 前向预算已满、但还有滴灌余量 → 只按滴灌节奏小口读
+                // （见 `STREAM_DRIP_*`：不让 CDN 看到写空闲而重置连接）。
+                budget_full = g.front_reached_budget();
+            }
+            if budget_full {
+                let elapsed = last_drip.elapsed();
+                if !stream_drip_enabled() || elapsed < STREAM_DRIP_INTERVAL {
+                    // 滴灌关闭（`ERIKA_HTTP_DRIP=0`）→ 回到旧的"完全不读"行为。
+                    thread::sleep(STREAM_IDLE_POLL);
+                    continue;
+                }
+                last_drip = Instant::now();
+                // 滴灌期间不采链路吞吐（刻意的小口慢读不代表链路能力）。
+                meter.pause();
+            }
+            if host_epoch.load(Ordering::Relaxed) != epoch_now {
+                cause = ReconnectCause::HostSwitch;
+                restart = true;
+                break;
+            }
+            // 滴灌只读一小块；正常填窗读满块。
+            let limit = if budget_full {
+                STREAM_DRIP_BYTES
+            } else {
+                HTTP_RECV_CHUNK_BYTES
+            };
+            match body.read(&mut chunk[..limit]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // **推送前必须在同一把锁内复核代数**：seek 可能恰好落在
+                    // `read()` 在途期间（`reset` 把窗口挪到了新起点），此时这块
+                    // 字节属于**旧位置**——直接 push 会被当成新起点的数据，造成
+                    // 静默错位（本文件历史上"坏包"的同类陷阱）。同锁复核把
+                    // "读取—判定—写入"变成原子步骤，彻底堵死这条路径。
+                    let write_pos = {
+                        let mut g = lock_stream(&shared);
+                        if g.generation != generation || g.eof {
+                            None
+                        } else {
+                            g.push(&chunk[..n]);
+                            Some(g.write_pos())
+                        }
+                    };
+                    let Some(write_pos) = write_pos else {
+                        cause = ReconnectCause::Reset;
+                        restart = true;
+                        break;
+                    };
+                    arrived.fetch_add(n as u64, Ordering::Relaxed);
+                    // 换源判据的"有字节到达"时间戳（顺序长读路径的唯一维护点）。
+                    last_arrival_ms.store(now_ms(), Ordering::Relaxed);
+                    // 填窗期样本：**滴灌的小口慢读不算**（那是刻意的，不代表
+                    // 链路能力；记进去会把宿主的升画质依据拖低）。
+                    if !budget_full {
+                        meter.record(n as u64);
+                    }
+                    if let Some(profile) = http_request_profile(diag_slot) {
+                        profile.record_bytes(n as u64);
+                    }
+                    shared.data_cv.notify_all();
+                    received_here = received_here.saturating_add(n as u64);
+                    empty_connects = 0;
+                    let reached_total = lock_stream(&shared)
+                        .total
+                        .is_some_and(|total| write_pos >= total);
+                    let reached_end = opened.end.is_some_and(|end| write_pos > end);
+                    if reached_total || reached_end {
+                        break;
+                    }
+                }
+                // 瞬时：已收字节留在窗口里，退避后从 write_pos 续传。
+                Err(_) => break,
+            }
+        }
+        in_flight.store(0, Ordering::Relaxed);
+        if stop.load(Ordering::Relaxed) {
+            let _ = done.send(());
+            return;
+        }
+        let (write_pos, total, already_eof) = {
+            let g = lock_stream(&shared);
+            (g.write_pos(), g.total, g.eof)
+        };
+        // 判决实验的基线：**本次连接自己**把前沿推到了哪里（`请求起点 + 本次收到
+        // 字节数`）。不能用窗口的 `write_pos`：seek 可能在连接间隙里把窗口
+        // `reset` 到更低的偏移，那样"回拖"会被误判成 contiguous（本测试第一版
+        // 就踩了这个坑）。用连接自身的账才对得上"上一次看到的下载前沿"。
+        last_front = start.saturating_add(received_here);
+        // 每次连接给了多少字节：这是"断点位置分布"（疑问 1）最直接的一手数据。
+        reconnects.note_connection(received_here);
+        if already_eof {
+            continue;
+        }
+        if restart {
+            // seek / 换 host：立即重连（不退避）——这正是"一次 seek 只 +1 请求"。
+            reconnects.bump(cause);
+            continue;
+        }
+        let reached_end = opened.end.is_some_and(|end| write_pos > end);
+        let reached_total = total.is_some_and(|total| write_pos >= total);
+        // **有界分片判定**（2026-09-04）：服务端用 `Content-Range: bytes <start>-<end>/<total>`
+        // 明确表示"这次只给这一段"（`end + 1 < total`）。这不是"到文件尾"，而是
+        // 分片式 CDN 的正常形态：必须从 `write_pos` 续传，**绝不能把流判成 EOF**
+        // （旧实现会在分片末尾直接 `eof = true`，音频就这样停在 2.7MB/8MB 再也回不来）。
+        // `total` 未知时（`Content-Range: bytes x-y/*`）也按分片处理：宁可多要一次，
+        // 也不能凭空把流截断。
+        let chunked_span = match (opened.end, total) {
+            (Some(end), Some(total)) => end.saturating_add(1) < total,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if reached_total || (reached_end && !chunked_span) {
+            // 服务端声明的**文件终点**已到：**不再重连**。
+            let mut g = lock_stream(&shared);
+            g.eof = true;
+            drop(g);
+            shared.data_cv.notify_all();
+            continue;
+        }
+        if chunked_span && reached_end {
+            // **服务端给的片到期**（我们发的是开放结尾，片是服务端切的）→ 立即
+            // 从 `write_pos` 续下一片：+1 请求，字节不丢、窗口不动、demux 无感。
+            reconnects.bump(ReconnectCause::PlannedChunk);
+            backoff = Duration::ZERO;
+            continue;
+        }
+        if received_here == 0 {
+            empty_connects = empty_connects.saturating_add(1);
+            // 连续两次连接一个字节都没收到 + **总长未知**：判定服务端对 open-ended
+            // Range 立刻收线（或已到尾），标 eof 收工——否则就是 200ms 一个请求的
+            // **请求风暴**（这条守卫保留）。
+            //
+            // 但**总长已知且还没读到尾**时绝不这样收工（2026-09-04 订正）：那多半是
+            // 限流/瞬时错误，标 eof 会让这条流永远停在半途（真机实测的音频
+            // 2.7MB/8MB 停滞），宿主只能靠整源重建自愈。改为退避重试，由上层的
+            // 等待窗口（`transient_wait`）与宿主换源策略兜底。
+            if empty_connects >= 2 && total.is_none() {
+                let mut g = lock_stream(&shared);
+                g.eof = true;
+                drop(g);
+                shared.data_cv.notify_all();
+                continue;
+            }
+            // 一个字节都没收到：退避后再试（限流/瞬时错误）。
+            reconnects.bump(ReconnectCause::Empty);
+            backoff = stream_retry_backoff(backoff);
+            continue;
+        }
+        empty_connects = 0;
+        // 服务端提前收线：从 `write_pos` 静默续传（+1 请求，字节不丢）。
+        // 只在"收到的字节连一个块都不到"时才退避——那种形态下无限立即重连
+        // 就是请求风暴；正常跑到一半被掐断则立即续上，demux 侧无感。
+        reconnects.bump(ReconnectCause::EarlyClose);
+        if received_here < HTTP_RECV_CHUNK_BYTES as u64 {
+            backoff = stream_retry_backoff(backoff);
+        } else {
+            backoff = Duration::ZERO;
+        }
+    }
+    let _ = done.send(());
+}
+
+/// 顺序长读**连接重建的原因**（诊断分桶用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectCause {
+    /// 服务端/传输侧提前收线（**没到本次请求声明的片尾**）：CDN 或中间链路。
+    EarlyClose,
+    /// 连接建立了但一个字节都没收到（限流/瞬时错误）。
+    Empty,
+    /// 本地 `reset()`（`generation` 变化）：seek 出窗 / 回拖超出后向窗口。
+    Reset,
+    /// 换 host（`host_epoch` 变化）。
+    HostSwitch,
+    /// **按计划到的片尾**（有界 Range 的这一片读完了）→ 正常续下一片。
+    PlannedChunk,
+}
+
+/// 顺序长读的连接重建计数（**按原因分桶**，单调递增）。
+///
+/// 存在的理由（用户真机实测暴露）：一条长连接被反复重建时，光看"请求数"分不清
+/// 是谁的锅——我们的 `reset()`（seek/回拖/乱序读）、换 host、**服务端自己提前
+/// 收线**，还是**我们自己按计划切片**。五个桶把原因分开，宿主与现场一眼可判，
+/// 也是"顺序播放期间不该重建"这条验收的判据（见诊断 `stream_reconnects_*`）。
+#[derive(Default)]
+struct StreamReconnects {
+    early_close: AtomicU64,
+    empty: AtomicU64,
+    reset: AtomicU64,
+    host_switch: AtomicU64,
+    planned_chunk: AtomicU64,
+    /// 最近一次连接实际收到的字节数（"断点位置分布"的一手数据）。
+    last_connection_bytes: AtomicU64,
+    /// 连接收到字节数的最大值（看有没有长连接成功跑出过大块）。
+    max_connection_bytes: AtomicU64,
+}
+
+impl StreamReconnects {
+    /// 每条连接结束时记一次"这次给了多少字节"。
+    fn note_connection(&self, bytes: u64) {
+        self.last_connection_bytes.store(bytes, Ordering::Relaxed);
+        let mut current = self.max_connection_bytes.load(Ordering::Relaxed);
+        while bytes > current {
+            match self.max_connection_bytes.compare_exchange_weak(
+                current,
+                bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn last_connection_bytes(&self) -> u64 {
+        self.last_connection_bytes.load(Ordering::Relaxed)
+    }
+
+    fn max_connection_bytes(&self) -> u64 {
+        self.max_connection_bytes.load(Ordering::Relaxed)
+    }
+
+    fn bump(&self, cause: ReconnectCause) {
+        let counter = match cause {
+            ReconnectCause::EarlyClose => &self.early_close,
+            ReconnectCause::Empty => &self.empty,
+            ReconnectCause::Reset => &self.reset,
+            ReconnectCause::HostSwitch => &self.host_switch,
+            ReconnectCause::PlannedChunk => &self.planned_chunk,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn get(&self, cause: ReconnectCause) -> u64 {
+        let counter = match cause {
+            ReconnectCause::EarlyClose => &self.early_close,
+            ReconnectCause::Empty => &self.empty,
+            ReconnectCause::Reset => &self.reset,
+            ReconnectCause::HostSwitch => &self.host_switch,
+            ReconnectCause::PlannedChunk => &self.planned_chunk,
+        };
+        counter.load(Ordering::Relaxed)
+    }
+
+    /// 全部原因之和 = 这条流的连接重建总次数（= 除首个请求外多出来的请求数）。
+    fn total(&self) -> u64 {
+        self.early_close
+            .load(Ordering::Relaxed)
+            .saturating_add(self.empty.load(Ordering::Relaxed))
+            .saturating_add(self.reset.load(Ordering::Relaxed))
+            .saturating_add(self.host_switch.load(Ordering::Relaxed))
+            .saturating_add(self.planned_chunk.load(Ordering::Relaxed))
+    }
+}
+
+/// 一次 Range 请求相对**上一次连接结束时的前沿**的形态分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeKind {
+    /// 起点 == 前沿：**断点续传**（服务端/传输侧结束了连接，我们从断点接上）。
+    Contiguous,
+    /// 起点 > 前沿：前向跳读（demuxer 往前 seek / 我们自己跳窗）。
+    ForwardJump,
+    /// 起点 < 前沿：**回拖/后退读**（demux 在 seek）——这类请求与 CDN 无关。
+    BackwardJump,
+}
+
+impl RangeKind {
+    fn label(self) -> &'static str {
+        match self {
+            RangeKind::Contiguous => "contiguous",
+            RangeKind::ForwardJump => "forward_jump",
+            RangeKind::BackwardJump => "backward_jump",
+        }
+    }
+}
+
+/// **请求起点序列日志**（"每 ~1MB 重建一次"的判决实验载体）。
+///
+/// 每次**真正发出** Range 请求时记一条，按"与上一次前沿的关系"分三类：
+///   - `Contiguous`：起点 == 前沿 → **断点续传**（服务端/传输侧结束了连接）；
+///   - `ForwardJump`：起点 > 前沿 → 前向跳读；
+///   - `BackwardJump`：起点 < 前沿 → **回拖/后退读 = demux 在 seek**。
+///
+/// **判据**（对外调研的一手案例：`blog.dreamfever.me` 那篇 22MB mp4 → 1585 个
+/// 开放结尾请求，根因是 demux 前后跳读、起点序列 `1562133 → 1999391 → 1577362`
+/// 来回跳）：
+///   - 只要 `BackwardJump`/`ForwardJump` 明显 → 请求放大来自 **demux 的前后跳读**，
+///     与 CDN 无关，**先不要动请求模型**（改分片只会让请求更多）；
+///   - 只有 `Contiguous` 占绝对多数 → 才是"连接被断、我们从断点续"。
+///
+/// 日志限频：最多 1 秒一条，不刷爆现场日志。
+#[derive(Default)]
+struct RangeJournal {
+    contiguous: AtomicU64,
+    forward_jump: AtomicU64,
+    backward_jump: AtomicU64,
+    /// 最近一次请求的起点（0 = 还没发过请求）。
+    last_start: AtomicU64,
+    /// 最近若干次请求起点（限频日志里打出来，便于事后看形态）。
+    recent: Mutex<VecDeque<u64>>,
+    /// 限频用：上次打日志的 epoch 毫秒。
+    last_log_ms: AtomicU64,
+}
+
+/// 最近请求起点的保留个数（日志里一次打出这么多，够看出"单调/跳跃"）。
+const RANGE_JOURNAL_RECENT: usize = 8;
+/// 请求起点日志的限频间隔（毫秒）。
+const RANGE_JOURNAL_LOG_MS: u64 = 1000;
+
+impl RangeJournal {
+    /// 记一次即将发出的 Range 请求。`front` = 上一次连接结束时的已收前沿
+    /// （`None` = 首个请求，不分类）。返回分类结果供 trace 使用。
+    fn note_request(&self, start: u64, front: Option<u64>, slot: usize) -> Option<RangeKind> {
+        let kind = front.map(|front| {
+            if start == front {
+                self.contiguous.fetch_add(1, Ordering::Relaxed);
+                RangeKind::Contiguous
+            } else if start > front {
+                self.forward_jump.fetch_add(1, Ordering::Relaxed);
+                RangeKind::ForwardJump
+            } else {
+                self.backward_jump.fetch_add(1, Ordering::Relaxed);
+                RangeKind::BackwardJump
+            }
+        });
+        self.last_start.store(start, Ordering::Relaxed);
+        if let Ok(mut recent) = self.recent.lock() {
+            if recent.len() == RANGE_JOURNAL_RECENT {
+                recent.pop_front();
+            }
+            recent.push_back(start);
+        }
+        // 限频日志：≥1s 一条，把最近起点序列与三个分桶一起打出来——这是
+        // "判决假说 D（demux 跳读 vs 断点续传）"最直接的现场证据。
+        let now = now_ms();
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= RANGE_JOURNAL_LOG_MS
+            && self
+                .last_log_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let recent = self
+                .recent
+                .lock()
+                .map(|recent| {
+                    recent
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            http_trace_log(format!(
+                "{{\"event\":\"stream_range_journal\",\"slot\":{slot},\"kind\":\"{}\",\"start\":{start},\"front\":{},\"recent_starts\":\"[{recent}]\",\"contiguous\":{},\"forward_jump\":{},\"backward_jump\":{}}}",
+                kind.map(RangeKind::label).unwrap_or("first"),
+                front.map_or_else(|| "null".to_string(), |front| front.to_string()),
+                self.contiguous.load(Ordering::Relaxed),
+                self.forward_jump.load(Ordering::Relaxed),
+                self.backward_jump.load(Ordering::Relaxed),
+            ));
+        }
+        kind
+    }
+}
+
+/// **填窗期吞吐计量器**（读线程私有）。
+///
+/// 口径（与诊断字段 [`SourceDiagSnapshot::fill_throughput_bps`] 的注释严格一致）：
+/// 只在窗口**未满**、读线程真的在读 socket 的时间片上累计字节与时长，按
+/// 500ms 结算成瞬时速率并做 0.3/0.7 EMA；窗口满（背压）时**不采样、不衰减**。
+///
+/// 为什么可信：读循环里能走到 `body.read()` 就说明刚刚判过 `has_space()`
+/// （窗口没满），所以计进来的字节不受"客户端故意不读"的钳制——它反映的是
+/// **链路能推多快**，而不是消费速率。宿主要判"能不能升画质"要的正是这个口径
+/// （`est_bps` 在窗口满时会被消费速率带偏，是另一个口径：全部到达字节的速率）。
+struct FillMeter {
+    /// 本采样窗口起点（`pause` 会重置它，见下）。
+    at: Instant,
+    /// 本采样窗口内累计的字节。
+    bytes: u64,
+    /// EMA 结果（字节/秒）。
+    ema: f64,
+    /// 对外发布出口（源实例持有的原子量，测试可精确断言；同时写全局槽，
+    /// 宿主 500ms 轮询读的就是全局槽）。
+    out: Arc<AtomicU64>,
+    slot: usize,
+}
+
+/// 填窗期采样窗口：与宿主 500ms 轮询同拍，保证每次 poll 都能读到新鲜值。
+const FILL_METER_WINDOW: Duration = Duration::from_millis(500);
+/// 结束一次填窗期（进入背压）时，短于它的样本**不作数**：几十微秒级的窗口
+/// 只会量到进程内 memcpy 速度，不是链路速度。20ms 是"至少跨了几个 TCP 往返"
+/// 的量级，同时让"快链路上几 MB 的填充"也能留下一个真实样本。
+const FILL_METER_MIN_WINDOW: Duration = Duration::from_millis(20);
+
+impl FillMeter {
+    fn new(slot: usize, out: Arc<AtomicU64>) -> Self {
+        Self {
+            at: Instant::now(),
+            bytes: 0,
+            ema: 0.0,
+            out,
+            slot,
+        }
+    }
+
+    /// 进入背压（窗口满）：把本次填窗期**结算掉**（否则短促但真实的填窗样本
+    /// 会被直接丢掉、读数永远是 0），然后重置基线——这样恢复读取后的第一个
+    /// 样本才不会被"整段背压时长"稀释成假低速。
+    fn pause(&mut self) {
+        if self.bytes > 0 && self.at.elapsed() >= FILL_METER_MIN_WINDOW {
+            self.settle();
+        }
+        self.bytes = 0;
+        self.at = Instant::now();
+    }
+
+    /// 记下"窗口未满时"真正从 socket 收到的字节。
+    fn record(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.at.elapsed() >= FILL_METER_WINDOW {
+            self.settle();
+        }
+    }
+
+    /// 结算本采样窗口：瞬时速率 → 0.3/0.7 EMA → 发布（实例原子 + 全局槽）。
+    fn settle(&mut self) {
+        let elapsed = self.at.elapsed();
+        if elapsed.is_zero() {
+            return;
+        }
+        let inst = self.bytes as f64 / elapsed.as_secs_f64();
+        let mut ema = if self.ema > 0.0 {
+            self.ema * (1.0 - BANDWIDTH_EMA_NEW) + inst * BANDWIDTH_EMA_NEW
+        } else {
+            inst
+        };
+        if !ema.is_finite() || ema < 1.0 {
+            ema = 0.0; // 与 est_bps 同一套"零供给地板"语义（0 = 未测得）
+        }
+        self.ema = ema;
+        self.bytes = 0;
+        self.at = Instant::now();
+        self.out.store(ema.to_bits(), Ordering::Relaxed);
+        store_fill_bps(self.slot, ema);
+    }
+}
+
+/// **窗口满时的"滴灌"**：不把 socket 读彻底停掉，而是每
+/// [`STREAM_DRIP_INTERVAL`] 读一小块（[`STREAM_DRIP_BYTES`]），把连接保持"活着"。
+///
+/// **依据（对外调研，一手）**：`bilibili-downloader-gui` 的限速器注释明确记录了
+/// **"CDN write-idle resets"** —— 客户端长时间不读（TCP 窗口压到 0）会被 CDN
+/// 因"写空闲"重置连接；该项目的对策是"保证每次睡眠都是亚秒级、缓冲保持浅"。
+/// 我们旧实现是"窗口满 → 完全不读 socket 直到被消费"，**恰好在招致这一行为**。
+///
+/// **参数选择**：16KiB / 200ms = **80KB/s** 的滴灌速率——典型 1080P 码率（≈400KB/s）
+/// 的 1/5，不会明显拖慢缓冲；睡眠 200ms 满足"亚秒级"；16KiB 是 64KiB 读块的四分之一，
+/// 对 TCP/HTTP 层足够"看起来在读"。
+///
+/// **为什么不越内存预算**：滴灌的字节仍然进热窗口，但预算里给了它一块**独立余量**
+/// （[`STREAM_DRIP_HEADROOM_BYTES`] = 1MiB，且这 1MiB **计在内存硬上限之内**，
+/// 见 `window_budget`）；余量用尽（窗口满且已久无消费）就退回"完全不读"，
+/// 因此常驻内存仍被硬上限钉住。滴灌字节**不计入填窗期吞吐**（见读线程注释），
+/// 否则会把"我们刻意的小口慢读"误当成链路能力，拖低宿主判升画质的依据。
+/// `ERIKA_HTTP_DRIP=0` 可关回旧的"完全停读"行为（现场 A/B 对照用）。
+const STREAM_DRIP_BYTES: usize = 16 * 1024;
+const STREAM_DRIP_INTERVAL: Duration = Duration::from_millis(200);
+const STREAM_DRIP_HEADROOM_BYTES: u64 = 1024 * 1024;
+
+/// 是否启用窗口满时的滴灌（默认开；`ERIKA_HTTP_DRIP=0` 关闭）。
+fn stream_drip_enabled() -> bool {
+    env::var("ERIKA_HTTP_DRIP")
+        .map(|value| value != "0" && value != "false")
+        .unwrap_or(true)
+}
+
+/// 是否启用 **seek 出窗的跨节点并行回填**（默认开）。
+///
+/// `ERIKA_SEEK_PARALLEL=0/false/off` 一行回退到改造前的行为：seek 出窗 = 重设
+/// 窗口 + **一条** open-ended Range 串行拉（逐字节等价的旧路径，现场 A/B 用）。
+fn seek_parallel_enabled() -> bool {
+    env::var("ERIKA_SEEK_PARALLEL")
+        .map(|value| {
+            let v = value.trim();
+            v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(true)
+}
+
+/// 现场覆盖并行条数（`ERIKA_SEEK_PARALLEL_CONNS`，钳制 1..=4）。
+/// `1` = 不并行（等价于关闭），`2`/`3`/`4` = 固定条数（跳过自适应估算）。
+fn seek_parallel_connections_override() -> Option<usize> {
+    env::var("ERIKA_SEEK_PARALLEL_CONNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, SEEK_PARALLEL_MAX_CONNECTIONS))
+}
+
+/// 算出并行条数（`1` = 不并行）。
+///
+/// **依据**（可复核，不是拍脑袋）：真机实测单条长连接 ≈320KB/s
+/// （`tests/open_stages_diag.rs` 的限速对照），而 video+audio 两条流同时下载
+/// 合计 ≈1.1MB/s ⇒ **瓶颈在"单条连接"上，不在链路带宽**。把回填窗口拆到 N 个
+/// **不同节点**上，期望总吞吐 ≈ N × 单节点速率；达到目标墙钟
+/// （[`SEEK_PARALLEL_TARGET_SECS`]）所需的总吞吐 = 回填窗口 ÷ 目标秒数，于是
+/// `N = ceil(所需总吞吐 ÷ 实测单流速率)`：
+///   - 320KB/s 单流 + 1.5MiB 窗口 + 1.6s 目标 → **N = 3**（与实测吻合的默认档）；
+///   - 快链路（单流已 ≥ 所需总吞吐）→ N = 1 → **不并行**（本来就够快，白开连接
+///     只会多涨请求数）；
+///   - 极慢链路 → 顶到上限 [`SEEK_PARALLEL_MAX_CONNECTIONS`]。
+///
+/// 上限 4 的依据是既有真机教训（见 `http_prefetch_parallel` 注释）：B 站 CDN 对
+/// 单 IP 并发连接数有限制，8 并发触发限流惩罚（在飞段集体挂死、新建连接被主动
+/// 断开）；2~4 是安全区。
+fn seek_parallel_connections(fill_bytes: u64, per_conn_bps: f64) -> usize {
+    // 窗口本身就得放得下 ≥2 个达标段，否则分段没有意义（照旧单连接）。
+    let max_by_size = (fill_bytes / SEEK_PARALLEL_MIN_SEGMENT_BYTES) as usize;
+    if max_by_size < 2 {
+        return 1;
+    }
+    let wanted = match seek_parallel_connections_override() {
+        Some(overridden) => overridden,
+        // 单流通量未知（刚开播、尚未完成一次填窗）→ 用实测标定的默认档。
+        None if !(per_conn_bps > 0.0) => SEEK_PARALLEL_DEFAULT_CONNECTIONS,
+        None => {
+            let need_bps = fill_bytes as f64 / SEEK_PARALLEL_TARGET_SECS;
+            let raw = (need_bps / per_conn_bps).ceil();
+            if !raw.is_finite() || raw <= 0.0 {
+                SEEK_PARALLEL_DEFAULT_CONNECTIONS
+            } else {
+                raw as usize
+            }
+        }
+    };
+    wanted
+        .clamp(1, SEEK_PARALLEL_MAX_CONNECTIONS)
+        .min(max_by_size)
+}
+
+/// 顺序长读的运行时句柄（源持有；线程持有它的一份 Arc 副本）。
+struct SequentialReader {
+    shared: Arc<StreamShared>,
+    /// 实时已收字节计数器：登记进全局 `SOURCE_RX`，供 `downloaded_bytes` /
+    /// `est_bps` 使用（与旧路径的 `rx` 同口径：线路上到达即计）。
+    arrived: Arc<AtomicU64>,
+    /// **填窗期实测吞吐**（字节/秒，f64 位模式）：读线程写，诊断/测试读。
+    /// 口径见 [`SourceDiagSnapshot::fill_throughput_bps`]。
+    fill_bps: Arc<AtomicU64>,
+    /// 0/1：当前是否有一条连接在飞（诊断 `prefetch_in_flight`）。
+    in_flight: Arc<AtomicU64>,
+    /// 累计连接重建次数（按原因分桶；`total()` 即"多出来的请求数"）。
+    reconnects: Arc<StreamReconnects>,
+    /// 请求起点序列日志（判决实验载体：断点续传 vs demux 跳读）。
+    journal: Arc<RangeJournal>,
+    /// **最近一次收到字节的 epoch 毫秒**（顺序长读自己维护）。
+    ///
+    /// 这是一处真 bug 的修复：旧实现里"最后收到字节"的时间戳只由旧分段路径
+    /// （`record_downloaded`）维护，顺序长读从不更新 → 换源的死连判据在开播
+    /// 6 秒后恒真 → 每 ~6 秒换一次 host（用户实测 87 秒 14 次）。
+    last_arrival_ms: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    /// 线程退出信号（bounded join 用，见 `Drop`）。
+    done: mpsc::Receiver<()>,
+    handle: Option<JoinHandle<()>>,
+    /// **seek 出窗的跨节点并行回填**：累计计数 + 最近一次批次明细。
+    /// `stream_seek_hint` 侧（demux 线程）读它的自适应闸门，`diag_snapshot` 读它
+    /// 发布诊断，执行侧（读线程 + worker）写它。
+    seek_fill: Arc<SeekFillDiag>,
+    /// 在飞分段配额（硬上限 [`SEEK_PARALLEL_MAX_CONNECTIONS`]；连续拖动时靠它
+    /// 保证并发连接数不会被推高）。
+    seek_fill_quota: Arc<AtomicUsize>,
+}
+
 pub struct HttpRangeSource {
     uri: Arc<Mutex<String>>,
     /// 打开时登记的主 URI（首候选）。多源换 host 时只变 `uri`（活跃 fetch
@@ -657,6 +3676,18 @@ pub struct HttpRangeSource {
     /// 都累计进 `est_window_bytes`，因此并行下载的叠加吞吐被正确计入。
     last_est_at: Instant,
     est_window_bytes: u64,
+    /// **实测消费速率**（字节/秒，2s 窗口 EMA）：demux 消费前沿的推进速度。
+    /// 稳态播放（缓冲被背压钳住）时它就是当前档位的有效码率，是滑动窗口
+    /// 预算公式里"码率"这一项的输入（见文件上方"滑动窗口预算"整段）。
+    /// 0 = 未测得（用配置值兜底，行为与改造前一致）。
+    consume_bps: f64,
+    /// 消费速率窗口累计字节与窗口起点（与 `note_consumed` 配对）。
+    consume_window_bytes: u64,
+    last_consume_at: Instant,
+    /// 最近一次记录的消费前沿（绝对偏移），用于算推进量、识别回拖。
+    last_consumed_pos: u64,
+    /// 最近一次结算出的滑动窗口预算（时间/字节），诊断与读窗口同步共用。
+    window: WindowBudget,
     /// 多段并行预取队列。窗口重设（cache_start/cache_bytes 变更）时清空，
     /// `maybe_start_prefetch` 按需从 cache_end 向后填充多段 in-flight 下载。
     prefetch: Vec<PendingHttpFetch>,
@@ -681,6 +3712,10 @@ pub struct HttpRangeSource {
     /// 阻塞任何调用方。句柄留在这里仅用于 drop 时显式 `drop(handle)` 让线程
     /// 在 stop 后自然结束、不被提前 detach 成 leaked（保持可观测）。
     preload_thread: Option<std::thread::JoinHandle<()>>,
+    /// 桶/冷区目录覆写。生产恒为 `None`（目录由 `preload_dir()` 决定）；
+    /// 单测用它指向自己的临时目录——单测改 `ERIKA_PRELOAD_DIR` 会与并行用例
+    /// 互相污染（桶文件被别的用例清掉 / 复用）。
+    preload_dir_override: Option<PathBuf>,
     /// 多 host 候选（按快→慢排序；index 0 最优）。Option A 无缝换 host：
     /// 当前 host 慢/死时，无需重建 source、缓存零丢失地切到下一个候选，
     /// 循环回到起点。空 = 单源模式（沿用旧行为）。
@@ -695,6 +3730,19 @@ pub struct HttpRangeSource {
     last_read_call_ms: u64,
     /// 换 host 冷却截止时刻：避免一轮内对同一死连反复横跳。
     switch_cooldown_until: Instant,
+    /// **自发换源的时间戳环**（epoch 毫秒，最多 [`MULTI_HOST_SWITCH_WINDOW_MS`]
+    /// 内的滑动限流）：窗口内超过 [`MULTI_HOST_MAX_SWITCHES`] 次就不再自发换，
+    /// 停在当前 host 让宿主自愈链接手。
+    switch_times: VecDeque<u64>,
+    /// 当前这一次自发换源的冷却时长（复发退避：每次翻倍，上限
+    /// [`MULTI_HOST_COOLDOWN_MAX`]）。成功读到字节（供给恢复）时归位。
+    switch_backoff: Duration,
+    /// 饥饿起始时刻（epoch 毫秒；0 = 当前不饥饿）。用于"持续
+    /// [`MULTI_HOST_STARVE_PERSIST_MS`] 才算真饥饿"的迟滞。
+    starve_since_ms: u64,
+    /// **最近一次换源的可读原因**（诊断浮窗/日志用：宿主直接显示这一行，
+    /// 用户就不用猜"为什么又换了"）。空串 = 本轮还没换过。
+    last_switch_reason: String,
     /// 源 host 代数：每次 `maybe_switch_host` 实际切换时 +1。在飞预取段记录
     /// spawn 时刻的代数，代数不匹配 = 段落在旧 host 上 → 作废（K1）。
     host_epoch: u64,
@@ -706,6 +3754,37 @@ pub struct HttpRangeSource {
     /// `publish_diag` → 回到 `maybe_switch_host`。护栏让重入调用直接返回
     /// （切后已有冷却兜底，护栏只是不让重入路径再做无谓判定）。
     switching_host: bool,
+    /// 本源的读路径是否正处在「暂时读不到数据、退避重试」的等待窗口。
+    /// 由 [`HttpRangeSource::read_range_with_transient_wait`] 维护，
+    /// 经 `publish_diag` 发布到诊断槽的 `transient_wait` 字段。
+    transient_wait: bool,
+    /// **此刻是否有一次 `read_range` 正在等待数据**（demux 正卡在读上）。
+    ///
+    /// 换源判据要区分三态：**在播且饿着**（应该恢复）、**暂停**（什么都不该做）、
+    /// **在播且供给充足**。只看"最近有没有调用 read_range"不够：一次读调用可能
+    /// 在等待循环里挂 20 秒，期间时间戳早就过期 → 真饥饿反而被判成"暂停"而
+    /// 按住不动（真机现象：`vstall=16s→21s` 却一直 `Hold`）。这个标志由读路径
+    /// 显式维护：读调用进入时置位、返回时清除。
+    read_in_flight: bool,
+    /// **顺序长读**（见文件上方的大段说明）：true 时正常前进播放全部由一条
+    /// 持续读的长连接覆盖，不再按 256KB 分段发请求。
+    ///
+    /// 由 VOD 工厂 `enable_sequential_stream()` 打开（生产默认路径），
+    /// `ERIKA_HTTP_SEQUENTIAL=0` 可整体关回旧分段路径。直接
+    /// `HttpRangeSource::new(...)` 构造的源保持旧路径（既有单测的对照基线）。
+    sequential_enabled: bool,
+    /// 顺序长读的运行时句柄。`None` = 尚未启动（懒启动：第一次读/第一条 seek
+    /// 提示时才建，起点取当时的位置，避免"从 0 起一条连接"被立刻 seek 掉）。
+    stream: Option<SequentialReader>,
+    /// 与读线程共享的 host 代数（`maybe_switch_host` 每次切换 +1）。读线程据此
+    /// 在块边界上放弃旧 host 的连接、用新 host 从 `write_pos` 续传。
+    stream_epoch: Arc<AtomicU64>,
+    /// 上一次发布诊断时读到的长读重连次数（用于把"每次重连"打成一条 trace，
+    /// 这是现场核对"一次播放到底发了几个请求"的直接证据）。
+    stream_reconnects_seen: u64,
+    /// 长读路径上一次发布诊断的 epoch 毫秒（发布节流，见
+    /// [`HttpRangeSource::publish_diag_throttled`]）。
+    last_stream_publish_ms: u64,
 }
 
 /// 多 host 候选（Option A 无缝换 host 用）。
@@ -734,6 +3813,13 @@ struct PendingHttpFetch {
 struct HttpRangeResponse {
     bytes: Vec<u8>,
     total_length: Option<u64>,
+    /// `ETag` 原样（**跨 CDN 节点一致性门禁的强证据**；见 `seek_fill_gate`）。
+    /// 实测：B 站官方 upos 镜像节点会给同一个值，MCDN/PCDN 节点不给——
+    /// "缺 ETag" 因此在门禁里等同"证据不足"。
+    etag: Option<String>,
+    /// `Last-Modified` 原样（ETag 缺失时的**弱**证据；门禁里只做展示，
+    /// 因为不同节点的 Last-Modified 可能因回源/打包时间而不同）。
+    last_modified: Option<String>,
 }
 
 /// 后台整片预载存储（用户定规 2026-08-30：打开播放页就应持续缓冲直到整片
@@ -766,6 +3852,29 @@ struct FullPreloadState {
     /// 是否正在消费（播放中）——活跃时桶让路，见 `demux_active`。
     last_demux_read_ms: AtomicU64,
     inner: Mutex<FullPreloadInner>,
+    // ---- 冷区（滑动窗口的磁盘分层）----
+    /// 冷区段文件目录（`None` = 测试构造的纯内存状态，段一律内存）。
+    dir: Option<PathBuf>,
+    /// 段文件名的摘要基（与 `preload_key(uri, slot)` 同源；活动段沿用原名，
+    /// 后续段用唯一后缀，见 `DiskStore::create_fresh`）。
+    key: u64,
+    /// 冷区预算（字节）：超过即从**最久远**的段开始淘汰（`evict_cold_to_budget`）。
+    cold_budget: AtomicU64,
+    /// 冷区当前字节总量（所有段之和，含活动段）。诊断与预算共用。
+    stored: AtomicU64,
+    /// 冷区覆盖区间的下界（最小段起点；`u64::MAX` = 空）。
+    /// 只用于 `might_cover` 的**无锁预筛**，见那里的注释。
+    cold_low: AtomicU64,
+    /// 冷区交接通道发送端。`Some` = **归档模式**：本状态不再自己发网络请求，
+    /// 只接收热区淘汰下来的字节（"已经有了就留下、而不是丢掉"）。
+    /// 由 `HttpRangeSource::enable_full_preload` 在顺序长读路径上装配。
+    cold: Mutex<Option<ColdSink>>,
+    /// 归档模式标志（诊断/日志用：说明这条桶当前不下载、只做冷区分层）。
+    archive: AtomicBool,
+    /// 冷区（磁盘层）命中计数与命中字节数：**因为冷区命中而省下的网络请求**。
+    /// 宿主轮询差分之；也是"回拖/重播零网络"现场验收的直接证据。
+    cold_hits: AtomicU64,
+    cold_hit_bytes: AtomicU64,
 }
 
 // ---------------------------------------------------------------------------
@@ -932,10 +4041,7 @@ impl DiskStore {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         for _ in 0..8 {
             let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = dir.join(format!(
-                "{key:016x}-{}-{sequence}.part",
-                std::process::id()
-            ));
+            let path = dir.join(format!("{key:016x}-{}-{sequence}.part", std::process::id()));
             if let Ok(store) = Self::open_file(&path, cap) {
                 return Ok(store);
             }
@@ -949,9 +4055,7 @@ impl DiskStore {
         // 写着，任何"顺手重建"都是破坏。
         let mut file = match PreloadFile::open_existing(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                PreloadFile::create_new(path)?
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => PreloadFile::create_new(path)?,
             Err(error) => return Err(error),
         };
         let (data_start, data_len) = Self::recover(&mut file, cap)?;
@@ -964,6 +4068,37 @@ impl DiskStore {
         };
         store.write_header()?;
         Ok(store)
+    }
+
+    /// 新建一个**全新**的段文件（绝不复用残留文件）。
+    ///
+    /// 与 `open` 的区别是刻意的：`open` 允许复用同名残片（"重开同一集不用重下"），
+    /// 而冷区**段**必须与自己记录的逻辑起点严格对齐——复用一份起点不同的旧文件
+    /// 会让"段内连续"的判定失准（读出来的是错位字节，比少几个缓存字节严重得多）。
+    /// 所以段一律新建，名字取进程内唯一后缀；再次打开同一逻辑区间只会得到新文件。
+    fn create_fresh(dir: &Path, key: u64) -> io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..8 {
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(
+                "{key:016x}s-{}-{sequence}.part",
+                std::process::id()
+            ));
+            let Ok(file) = PreloadFile::create_new(&path) else {
+                continue;
+            };
+            let mut store = Self {
+                file,
+                data_start: 0,
+                data_len: 0,
+                tail: Vec::new(),
+                tail_offset: 0,
+            };
+            store.write_header()?;
+            return Ok(store);
+        }
+        Err(io::Error::other("preload: no usable segment file name"))
     }
 
     /// 校验头部、恢复可复用窗口，返回 `(data_start, data_len)`。
@@ -1064,7 +4199,11 @@ impl DiskStore {
         Some(self.tail[start..end].to_vec())
     }
 
-    /// 窗口整体前移到 `new_start`：逻辑窗口清空 + 数据区截断（见布局注释）。
+    /// **2026-09-04 起本方法不再是"丢弃已有字节"那条路径的一部分**：整片预载桶
+    /// 与冷区都改成"封存旧段 + 另开新段"（见 `FullPreloadState::seal_and_open`），
+    /// 旧字节一律保留。现在它只剩**测试**在用——`preload_disk_bucket_round_trips_and_shifts_offsets`
+    /// 用它验证"改写物理布局后绝不留空洞"（段文件布局的回归防线）。
+    #[cfg(test)]
     fn reset_at(&mut self, new_start: u64) -> io::Result<()> {
         self.file.file_mut().set_len(DISK_HEADER_BYTES)?;
         self.data_start = new_start;
@@ -1146,14 +4285,15 @@ impl PreloadStore {
         }
     }
 
-    /// 窗口整体前移到 `new_start`（`[start, new_start)` 的字节作废）。
-    fn reset_at(&mut self, new_start: u64) -> io::Result<()> {
-        match self {
-            Self::Memory(buffer) => {
-                buffer.clear();
-                Ok(())
-            }
-            Self::Disk(disk) => disk.reset_at(new_start),
+    /// 封存段时释放段内尾部内存窗口（见 `DiskStore::tail`）。
+    ///
+    /// 只有**活动段**会被顺序追加/尾部读取；封存段是冷数据，留着那 1MiB
+    /// 常驻内存会随段数线性增长（32 段 = 32MiB），把"冷区靠磁盘、不占内存"
+    /// 这条承诺吃掉。释放只是少一层优化，读路径自动退回文件读（页缓存）。
+    fn release_tail(&mut self) {
+        if let Self::Disk(disk) = self {
+            disk.tail = Vec::new();
+            disk.tail_offset = 0;
         }
     }
 }
@@ -1201,14 +4341,25 @@ fn preload_key(uri: &str, slot: usize) -> u64 {
     hash
 }
 
-/// 是否把整片预载桶落到磁盘。默认**开**，`ERIKA_PRELOAD_TO_DISK=0` 关闭
-/// （退回全内存桶，即落盘改造前的行为）。
+/// 是否把冷区/整片预载桶落到磁盘。默认**开**。
+///
+/// 两个等价的名字都接受（任一个为 `0/false/off/空` 即关闭）：
+///   - `ERIKA_PRELOAD_DISK=0` —— 本次改造新增的名字（冷区分层落盘的总开关）；
+///   - `ERIKA_PRELOAD_TO_DISK=0` —— 落盘改造时的旧名字，保留兼容。
+///
+/// 关闭后走**纯内存**冷区：缓存照常分层、命中照常零网络，但冷区预算会被钳到
+/// `WINDOW_COLD_MEMORY_ONLY_MAX`（32MiB），避免"关掉落盘"变成"把 256MiB 搬进
+/// 内存"。异常/对照排查时用它一行关掉整条落盘链路。
 fn preload_to_disk_enabled() -> bool {
     // 与 `trace::env_flag` 同一套字面量，但默认相反（这条开关默认开）。
-    !matches!(
-        env::var("ERIKA_PRELOAD_TO_DISK").ok().as_deref(),
-        Some("0" | "false" | "FALSE" | "off" | "OFF" | "")
-    )
+    !["ERIKA_PRELOAD_DISK", "ERIKA_PRELOAD_TO_DISK"]
+        .iter()
+        .any(|name| {
+            matches!(
+                env::var(name).ok().as_deref(),
+                Some("0" | "false" | "FALSE" | "off" | "OFF" | "")
+            )
+        })
 }
 
 /// 陈旧桶文件的保留时长（`ERIKA_PRELOAD_RETENTION_DAYS` 覆盖，默认 3 天）。
@@ -1294,19 +4445,104 @@ fn sweep_stale_preload(dir: &Path) {
 /// 路径真正的启动时刻。
 static PRELOAD_SWEEP: LazyLock<()> = LazyLock::new(|| sweep_stale_preload(&preload_dir()));
 
-struct FullPreloadInner {
-    /// 文件总长（由首个成功响应的 total 回填；None = 未探测到，线程等待）。
-    total: Option<u64>,
-    /// 桶存储区间的**绝对起点**，初始 0。demux 预取跑赢桶时整体前移到
-    /// `floor` 并丢弃旧字节——那些字节 demux cache 里已有一份，桶里再留
-    /// 就是重复下载（纯浪费带宽）。前移后桶表示 [start, end)。
+/// 冷区里一个**已封存**的段：不再追加，只读。
+///
+/// 段是冷区的存储/淘汰单位：先按 §`COLD_SEGMENT_BYTES` 切，整段淘汰（丢最久远
+/// 的一段）就等价于"滑出回看窗口"，且淘汰 = 段存储 `Drop` = **文件真的被删掉**。
+struct SealedSegment {
+    /// 段内首字节的绝对文件偏移。
     start: u64,
-    /// 存储桶：文件 [start, end) 的连续字节。落盘改造前这里是 `Vec<u8>`，
-    /// 现在默认是文件；`PreloadStore::Memory` 只在关闭落盘或落盘失败时启用。
     store: PreloadStore,
 }
 
+impl SealedSegment {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.store.len())
+    }
+
+    fn covers(&self, offset: u64, end: u64) -> bool {
+        offset >= self.start && end <= self.end()
+    }
+}
+
+struct FullPreloadInner {
+    /// 文件总长（由首个成功响应的 total 回填；None = 未探测到，线程等待）。
+    total: Option<u64>,
+    /// **活动段**的绝对起点（可追加的那一段）。本次改造后冷区是"多段"结构：
+    /// 活动段 + 已封存段（`sealed`）。
+    start: u64,
+    /// 活动段存储：文件 `[start, start + store.len())` 的连续字节。
+    store: PreloadStore,
+    /// 已封存的历史段（按逻辑起点升序，互不重叠）。
+    ///
+    /// **段间允许有洞**：洞表示那段确实没能保住（交接通道背压 / 磁盘写失败），
+    /// 回拖到洞里需要重新下载——诚实且不会读出错位字节。段**内**永远连续
+    /// （写入路径只允许在段尾追加，见 `FullPreloadState::ingest_evicted`）。
+    sealed: Vec<SealedSegment>,
+}
+
 impl FullPreloadInner {
+    /// 活动段终点（= 冷区当前的最前覆盖）。
+    fn active_end(&self) -> u64 {
+        self.start.saturating_add(self.store.len())
+    }
+
+    /// 全部段（活动 + 封存）的字节总量。诊断与预算判定都用它。
+    fn stored_bytes(&self) -> u64 {
+        self.sealed
+            .iter()
+            .map(|segment| segment.store.len())
+            .fold(self.store.len(), u64::saturating_add)
+    }
+
+    /// 在**任意**段里定位 `[offset, end)`，返回命中段的起点（供算段内偏移）。
+    fn locate(&self, offset: u64, end: u64) -> Option<u64> {
+        if offset >= self.start && end <= self.active_end() {
+            return Some(self.start);
+        }
+        // 从最新的段往前找：回拖命中的通常是最近封存的那几段。
+        self.sealed
+            .iter()
+            .rev()
+            .find(|segment| segment.covers(offset, end))
+            .map(|segment| segment.start)
+    }
+
+    /// 含 `offset` 的段的**终点**（`None` = 没有任何段含它）。用于"能取多少
+    /// 取多少"的前缀命中（跨冷/热边界的读）。
+    fn containing_end(&self, offset: u64) -> Option<u64> {
+        if offset >= self.start && offset < self.active_end() {
+            return Some(self.active_end());
+        }
+        self.sealed
+            .iter()
+            .rev()
+            .find(|segment| offset >= segment.start && offset < segment.end())
+            .map(SealedSegment::end)
+    }
+
+    /// 复制命中区间（调用方先 `locate` 成功；本方法内部再定位一次，保证
+    /// "绝对偏移 → 段内偏移"的换算与命中判定用的是同一段）。
+    fn copy(&mut self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        let end = offset.checked_add(length)?;
+        let base = self.locate(offset, end)?;
+        let rel_start = usize::try_from(offset.checked_sub(base)?).ok()?;
+        // 注意是 `end - offset`（请求长度），不是 `end - base`（段内终点）：
+        // 段起点可能远在请求起点之前（回拖命中的是段中间），差一个偏移就是
+        // "读越界报错"或"读到相邻区间的字节"。
+        let rel_len = usize::try_from(end - offset).ok()?;
+        let store = if base == self.start {
+            &mut self.store
+        } else {
+            &mut self
+                .sealed
+                .iter_mut()
+                .find(|segment| segment.start == base)?
+                .store
+        };
+        store.read(rel_start as u64, rel_len).ok()
+    }
+
     /// 把一段与窗口尾部连续的字节追加进桶。
     ///
     /// 落盘写失败时就地**降级到内存桶**并把这批字节补进内存——磁盘满 / 权限 /
@@ -1336,24 +4572,37 @@ impl FullPreloadInner {
         Err(error)
     }
 
-    /// 桶整体前移到 `new_start`：逻辑窗口清空、起点换到 `new_start`，落盘后端
-    /// 同时截断数据区。失败不致命——调用方换成空的内存桶即可（前移本来就是要
-    /// 丢掉全部旧字节，这条路径没有任何额外数据损失）。
-    fn reset_at(&mut self, new_start: u64) -> io::Result<()> {
-        self.start = new_start;
-        self.store.reset_at(new_start)
+    /// **封存**当前活动段（不再追加、释放尾部内存窗口），并让调用方随后用
+    /// `open_segment` 起一个新段。空段直接丢掉（不占位、不占盘）。
+    fn seal_active(&mut self) {
+        let store = std::mem::replace(&mut self.store, PreloadStore::Memory(Vec::new()));
+        if store.len() == 0 {
+            return;
+        }
+        let mut store = store;
+        store.release_tail();
+        self.sealed.push(SealedSegment {
+            start: self.start,
+            store,
+        });
     }
 
-    /// 前移失败时的兜底：换成空的内存桶（见 `reset_at` 注释）。
-    fn fallback_to_memory_at(&mut self, new_start: u64) {
-        self.start = new_start;
-        self.store = PreloadStore::Memory(Vec::new());
+    /// 起一个新段（活动段起点换成 `start`）。
+    fn open_segment(&mut self, start: u64, store: PreloadStore) {
+        self.start = start;
+        self.store = store;
     }
 }
 
 /// 整片预载单步：从当前 `end` 下载一段（≤256KB）追加进桶。返回 true 表示
 /// 已完成（总量已知且到顶/达上限）或被停止；false 表示还有后续（调用方循
 /// 环）。失败时不前进、由调用方退避重试——瞬时断流在这里被消化，不升级。
+///
+/// **注意（2026-09-03）**：这已经是**兜底实现**。生产路径走
+/// [`full_preload_stream_loop`]——一条 open-ended Range 连接读到尾，请求数
+/// 从"每 256KB 一个"降到 O(暂停次数)。本函数保留有两个用途：①
+/// `ERIKA_PRELOAD_STREAM=0` 时的对照路径；② 桶"整体前移"那一步无网络动作，
+/// 流式循环直接复用它，避免两套前移语义（含落盘后端的截断/降级）。
 fn full_preload_step(
     state: &FullPreloadState,
     agent: &ureq::Agent,
@@ -1372,25 +4621,19 @@ fn full_preload_step(
     let Some(total) = total else {
         return false; // 总长未探测到：等待（调用方退避后重试）
     };
-    // demux 并行预取已跑赢桶：整体前移到 floor 并丢弃旧字节，下一步从 floor
-    // 起下载。旧字节 demux cache 里已持有一份，桶再从 0 追就是与 demux 重复
-    // 下载同一区间——实测这会把有效供给砍半（23KB/s 中一半是重复字节），缓冲
-    // 永远建不起来 → 一路饥渴换源。前移 = 放弃追赶、只补 demux 前方，是带宽
-    // 受限下的正确取舍（暂停后 demux 停止推进，桶随即接管并持续补到文件尾）。
+    // demux 并行预取已跑赢桶（floor > end）：**2026-09-04 起不再丢弃桶里的旧字节**，
+    // 而是把它**封存**成一个独立段（只在冷区里躺一份，回拖/重播零网络命中），
+    // 再从 floor 起另开新段继续补 demux 前方——"查重后跳过，而不是丢掉"。
+    //
+    // 旧实现的"整体前移 = 丢弃 [start, floor)"正是用户实测缺陷 ⑤ 的根因：
+    // 已下好的区间被主动丢弃后，回拖那段只能重新下载（"这东西等于已经有了，
+    // 就不需要再向网络请求"）。段结构让"跳过"与"保留"不再互斥：跳过的是
+    // **下载动作**（floor 之前的区间不重复下），保留的是**已有字节**（封存段）。
     if floor > end {
-        let mut g = state.inner.lock().expect("full preload poisoned");
-        // 前移要改写物理布局（落盘后端会截断数据区）。重置失败也不致命：旧
-        // 字节本来就要丢，换成空的内存桶即可，不把磁盘问题升级成播放失败。
-        if let Err(error) = g.reset_at(floor) {
-            trace::diagnostic(format!(
-                "{{\"event\":\"erika_preload_disk_reset_failed\",\"slot\":{},\"start\":{},\"error\":\"{}\"}}",
-                state.slot,
-                floor,
-                json_escape(&error.to_string()),
-            ));
-            g.fallback_to_memory_at(floor);
+        {
+            let mut g = state.inner.lock().expect("full preload poisoned");
+            state.seal_and_open(&mut g, floor);
         }
-        drop(g);
         state.end.store(floor, Ordering::Relaxed);
         return false; // 无网络动作，下一步直接从 floor 下载
     }
@@ -1415,6 +4658,9 @@ fn full_preload_step(
         range,
         "http_full_preload",
         Some(state.downloaded.as_ref()),
+        // 整片预载桶的请求要记到**本条流自己的槽**（桶有 `slot`；音频桶
+        // diag_slot=1，不能混进视频的计数）。
+        http_request_profile(state.slot),
     ) {
         Ok(response) => {
             let n = response.bytes.len() as u64;
@@ -1434,6 +4680,8 @@ fn full_preload_step(
             // 落盘写失败（磁盘满/权限/杀软锁）已就地降级到内存桶：慢一拍，
             // 但内存桶照样把这段字节收下，播放不受影响。
             let degraded = g.append_chunk(&response.bytes).err();
+            state.refresh_cold_low(&g);
+            state.stored.store(g.stored_bytes(), Ordering::Relaxed);
             drop(g);
             if let Some(reason) = degraded {
                 // diag 是无条件通道（不受 trace 开关影响）：宿主必须知道这条流
@@ -1456,7 +4704,8 @@ fn full_preload_step(
     }
 }
 
-/// 后台整片预载线程循环。独立 `OS` 线程，与 demux/runtime/UI 都无关联——
+/// 后台整片预载线程循环（**分段实现，兜底路径**，见 [`full_preload_step`]）。
+/// 独立 `OS` 线程，与 demux/runtime/UI 都无关联——
 /// `core::time` 自然带，`AtomicBool::load(Relaxed)` 唤醒，单调追加直到
 /// `step` 返回 true（end ≥ total 或 ≥ cap 或被 stop）。失败退避 200ms 后重试
 /// 同一段续传（HTTP range 服务器天然支持），不会破坏桶的连续性。退出条件：
@@ -1503,14 +4752,7 @@ fn full_preload_loop(
         let done = full_preload_step(state, agent, &uri_str, headers, cap);
         // 音频桶把预载进度上报到协调器，供视频源判定相位。
         if report_audio_first {
-            if let Some(total) = state.len() {
-                AUDIO_FIRST.audio_total_known.store(true, Ordering::Relaxed);
-                let covered = state.covered_until();
-                let permille = covered.saturating_mul(1000) / total.max(1);
-                AUDIO_FIRST
-                    .audio_permille
-                    .store(permille.min(1000), Ordering::Relaxed);
-            }
+            report_audio_first_progress(state);
         }
         if done {
             break;
@@ -1528,11 +4770,155 @@ fn full_preload_loop(
     }
 }
 
+/// 把整片预载进度上报到「音频优先」协调器（仅音频桶用）。
+fn report_audio_first_progress(state: &FullPreloadState) {
+    if let Some(total) = state.len() {
+        AUDIO_FIRST.audio_total_known.store(true, Ordering::Relaxed);
+        let covered = state.covered_until();
+        let permille = covered.saturating_mul(1000) / total.max(1);
+        AUDIO_FIRST
+            .audio_permille
+            .store(permille.min(1000), Ordering::Relaxed);
+    }
+}
+
+/// 整片预载桶的**流式**下载循环（2026-09-03 顺序长读改造）。
+///
+/// 旧实现（`full_preload_loop` + `full_preload_step`）是"每步一个 256KB Range
+/// 请求"：一整部 300MB 的片子 = **1200 个请求**，与 demux 侧的分段预取叠加
+/// 正是用户实测的"一小时几千次"。这里换成与 demux 侧同构的顺序长读：
+/// **一条 open-ended Range 连接从当前位置一直读到文件尾/上限**，逐块 append
+/// 进桶。请求量级从 O(文件大小 / 256KB) 降到 **O(暂停次数)**——一次连续播放
+/// 通常是 1~3 个请求。
+///
+/// 与 demux 那条长流的分工（**任一时刻只有一个下载者，不重复下同一区间**）：
+///   - demux 活跃（播放中）→ 桶**不建连接**，把带宽完整留给 demux 那条长流；
+///   - demux 空闲（暂停/缓冲充足）→ 桶从 demux 已覆盖前沿（`floor`）起一条长
+///     连接补到文件尾/上限。
+/// 被播放抢回、发生前移、换 host 时都会断开重连（每次 +1 请求）。
+///
+/// `ERIKA_PRELOAD_STREAM=0` 回退到旧的分段实现（对照/排障用）。
+fn full_preload_stream_loop(
+    agent: &ureq::Agent,
+    uri: Arc<Mutex<String>>,
+    headers: &[(String, String)],
+    state: &FullPreloadState,
+    cap: u64,
+    // 激进模式（仅音频优先桶）：不向 demux 让路（必须抢在 demux 之前拉完音轨）。
+    eager: bool,
+    // 是否把预载进度上报到音频优先协调器（仅音频桶）。
+    report_audio_first: bool,
+    // 是否为视频桶：音频优先激活期间让路。
+    video_bucket: bool,
+) {
+    const IDLE_POLL: Duration = Duration::from_millis(100);
+    let mut backoff = Duration::from_millis(200);
+    while !state.stop.load(Ordering::Relaxed) {
+        if video_bucket && audio_first_throttle_video() {
+            thread::sleep(IDLE_POLL);
+            continue;
+        }
+        // demux 正在消费（播放中）→ 桶让路：本轮不建连接。两路同时下载同一
+        // 区间会把有效供给砍半；demux 那条长流才是播放期的数据通路。
+        if !eager && state.demux_active() {
+            thread::sleep(IDLE_POLL);
+            continue;
+        }
+        let Some(total) = state.len() else {
+            thread::sleep(IDLE_POLL); // 总长未探测到：等首个响应回填
+            continue;
+        };
+        let end = state.covered_until();
+        // demux 跑赢桶（floor > end）：整体前移，**无网络动作**。复用既有 step
+        // 实现，避免两套前移语义（含落盘后端的截断与降级）。
+        if state.floor.load(Ordering::Relaxed) > end {
+            let uri_now = match uri.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            let _ = full_preload_step(state, agent, &uri_now, headers, cap);
+            continue;
+        }
+        if end >= total.min(cap) {
+            return; // 已到文件尾或上限 → 线程收工
+        }
+        let uri_now = match uri.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let mut conn = match open_sequential_response(agent, &uri_now, headers, end, state.slot) {
+            Ok(conn) => {
+                backoff = Duration::from_millis(200);
+                conn
+            }
+            Err(_) => {
+                // 失败退避后重试（同一段续传：HTTP Range 天然支持）。
+                thread::sleep(backoff);
+                backoff = stream_retry_backoff(backoff);
+                continue;
+            }
+        };
+        if let Some(total) = conn.total {
+            state.learn_total(total);
+        }
+        let mut chunk = [0u8; HTTP_RECV_CHUNK_BYTES];
+        let mut gained = 0u64;
+        loop {
+            if state.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            // 播放抢回带宽 / 前移：断开重连（下次从新的 floor 续）。
+            if !eager && state.demux_active() {
+                break;
+            }
+            if video_bucket && audio_first_throttle_video() {
+                break;
+            }
+            let end_now = state.covered_until();
+            if state.floor.load(Ordering::Relaxed) > end_now {
+                break;
+            }
+            if end_now >= cap || end_now >= state.len().unwrap_or(u64::MAX) {
+                return;
+            }
+            match conn.reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // 「线路上到达即计」——与旧路径把计数器交给分块读循环同一口径
+                    // （含被完整性守卫丢弃的字节：它们确实到过网络）。
+                    state.downloaded.fetch_add(n as u64, Ordering::Relaxed);
+                    let accepted = state.append_streamed(end_now, &chunk[..n]);
+                    if accepted > 0 {
+                        gained = gained.saturating_add(accepted);
+                        backoff = Duration::from_millis(200);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if report_audio_first {
+            report_audio_first_progress(state);
+        }
+        if gained == 0 {
+            thread::sleep(backoff);
+            backoff = stream_retry_backoff(backoff);
+        }
+    }
+}
+
 fn full_preload_cap() -> u64 {
     std::env::var("ERIKA_HTTP_FULLPRELOAD_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(512 * 1024 * 1024)
+}
+
+/// 整片预载桶是否走**流式**实现（默认是）。`ERIKA_PRELOAD_STREAM=0` 关回旧的
+/// "每步一个 256KB 请求"实现——同样作为一行环境变量的回退开关保留。
+fn preload_stream_enabled() -> bool {
+    std::env::var("ERIKA_PRELOAD_STREAM")
+        .map(|value| value != "0" && value != "false")
+        .unwrap_or(true)
 }
 
 /// demux 活跃判定窗口：最近该时长内有 read 即视为"正在播放"，桶让路。
@@ -1563,7 +4949,11 @@ impl FullPreloadState {
                 total: None,
                 start: 0,
                 store: PreloadStore::Memory(Vec::new()),
+                sealed: Vec::new(),
             },
+            None,
+            0,
+            false,
         )
     }
 
@@ -1594,6 +4984,7 @@ impl FullPreloadState {
         } else {
             PreloadStore::Memory(Vec::new())
         };
+        let disk = matches!(store, PreloadStore::Disk(_));
         Self::build(
             slot,
             FullPreloadInner {
@@ -1602,14 +4993,38 @@ impl FullPreloadState {
                 // 跟着文件头走，见 `PreloadStore::window_start`。
                 start: store.window_start().unwrap_or(0),
                 store,
+                sealed: Vec::new(),
             },
+            Some(dir.to_path_buf()),
+            preload_key(uri, slot),
+            disk,
         )
     }
 
-    fn build(slot: usize, inner: FullPreloadInner) -> Arc<Self> {
+    fn build(
+        slot: usize,
+        inner: FullPreloadInner,
+        dir: Option<PathBuf>,
+        key: u64,
+        disk: bool,
+    ) -> Arc<Self> {
         // 复用残留文件时窗口可能非空：`end` 必须从窗口终点起步，否则
         // `covered_until` 会谎报 0，桶会把已经躺在盘上的字节重下一遍。
-        let covered = inner.start + inner.store.len();
+        let covered = inner.active_end();
+        let stored = inner.stored_bytes();
+        let inner_low = {
+            let mut low = if inner.store.len() > 0 {
+                inner.start
+            } else {
+                u64::MAX
+            };
+            for segment in &inner.sealed {
+                if segment.store.len() > 0 {
+                    low = low.min(segment.start);
+                }
+            }
+            low
+        };
         Arc::new(Self {
             slot,
             stop: AtomicBool::new(false),
@@ -1618,12 +5033,68 @@ impl FullPreloadState {
             floor: AtomicU64::new(0),
             last_demux_read_ms: AtomicU64::new(0),
             inner: Mutex::new(inner),
+            dir,
+            key,
+            cold_budget: AtomicU64::new(window_cold_budget(disk)),
+            stored: AtomicU64::new(stored),
+            cold_low: AtomicU64::new(if stored > 0 { inner_low } else { u64::MAX }),
+            cold: Mutex::new(None),
+            archive: AtomicBool::new(false),
+            cold_hits: AtomicU64::new(0),
+            cold_hit_bytes: AtomicU64::new(0),
         })
     }
 
     /// 全文件总长（首个成功响应回填）。None 表示尚未探测完成。
     fn len(&self) -> Option<u64> {
         self.inner.lock().ok().and_then(|g| g.total)
+    }
+
+    /// 回填总长（流式下载的首个 206 的 Content-Range）。已知道时不动。
+    fn learn_total(&self, total: u64) {
+        let mut g = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if g.total.is_none() {
+            g.total = Some(total);
+        }
+    }
+
+    /// **流式**下载用：把一段与新字节连续的字节追加进桶。返回接受的字节数
+    /// （0 = 期间发生前移/并发写入，本次作废，调用方应断开重连）。
+    ///
+    /// 顺序完整性守卫与 `full_preload_step` 同一套：写入偏移必须与快照一致——
+    /// 其间若发生窗口前移（`start` 变化）或并发写入，丢弃本次，绝不产生空洞，
+    /// 也绝不把新字节追加到已前移的桶上造成错位（那是静默数据损坏）。
+    fn append_streamed(&self, expected_end: u64, bytes: &[u8]) -> u64 {
+        if bytes.is_empty() {
+            return 0;
+        }
+        let mut g = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.end.load(Ordering::Relaxed) != expected_end {
+            return 0;
+        }
+        // 落盘写失败（磁盘满/权限/杀软锁）已就地降级到内存桶：慢一拍，但字节
+        // 照样收下，播放不受影响。
+        let degraded = g.append_chunk(bytes).err();
+        self.refresh_cold_low(&g);
+        self.stored.store(g.stored_bytes(), Ordering::Relaxed);
+        drop(g);
+        if let Some(reason) = degraded {
+            trace::diagnostic(format!(
+                "{{\"event\":\"erika_preload_disk_fallback\",\"slot\":{},\"start\":{},\"length\":{},\"error\":\"{}\"}}",
+                self.slot,
+                expected_end,
+                bytes.len(),
+                json_escape(&reason),
+            ));
+        }
+        self.end.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        bytes.len() as u64
     }
 
     /// 已覆盖到的最大文件偏移。0 表示尚未下载任何字节。
@@ -1647,6 +5118,11 @@ impl FullPreloadState {
     /// 实际没有下载在飞，此前恒返回 1 导致宿主「prefetch_in_flight == 0」
     /// 判据永不成立（源空闲检测退化为单一字节停滞条件）。
     fn in_flight_segments(&self) -> u32 {
+        if self.archive_mode() {
+            // 归档模式：本状态**不发任何网络请求**（数据全部来自热区交接），
+            // 因此"桶的在飞段"恒为 0——宿主看到的在飞连接只有那条顺序长流。
+            return 0;
+        }
         if self.is_complete() || self.demux_active() {
             0
         } else if self.stop.load(Ordering::Relaxed) {
@@ -1690,18 +5166,17 @@ impl FullPreloadState {
     }
 
     /// 桶是否完整覆盖给定 [offset, offset+length) 范围。满足时调用方复制返回，
-    /// 走零网络直返路径。桶表示 [start, end)：起点会随 demux 前沿前移，故必须
-    /// 同时判定下界——只判 `end >= offset+length` 会在桶已前移时把低地址请求
-    /// 误判为覆盖（那些字节已随前移丢弃），`copy_range` 会 copy 出错位数据。
-    /// 未覆盖的走原 demux 链路（互不干扰）。
+    /// 走零网络直返路径。
+    ///
+    /// 覆盖判定改为**按段**（`FullPreloadInner::locate`）：冷区现在是"多段 +
+    /// 段间允许有洞"的结构，任何一段完整包住请求区间即命中；段外的地址绝不
+    /// 谎报命中（谎报 = 读出错位字节或半截数据，比 miss 严重得多）。
     fn covers(&self, offset: u64, length: u64) -> bool {
-        // 一次加锁同时取 total 与 start：covers 在 read 热路径上每次都调，
-        // 两次 lock 无谓（无竞争但仍是两次原子操作）。
-        let (total, start) = match self.inner.lock() {
-            Ok(g) => (g.total, g.start),
+        let guard = match self.inner.lock() {
+            Ok(guard) => guard,
             Err(_) => return false,
         };
-        let Some(total) = total else {
+        let Some(total) = guard.total else {
             return false;
         };
         if offset >= total {
@@ -1712,31 +5187,345 @@ impl FullPreloadState {
             Some(e) => e,
             None => return false,
         };
-        offset >= start && self.covered_until() >= end
+        guard.locate(offset, end).is_some()
     }
 
-    /// 复制 [offset, offset+length) 字节出桶。调用方必须先 `covers()` 返回 true。
-    /// 绝对偏移需减去桶起点 `start` 才是桶内下标。
+    /// 复制 [offset, offset+length) 字节出冷区。调用方必须先 `covers()` 返回 true。
+    /// 绝对偏移需减去命中段的起点才是段内下标。
     fn copy_range(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
-        // 读全程持锁（**含磁盘读**）：前移会重置落盘后端的物理布局，锁外读会
+        // 读全程持锁（**含磁盘读**）：段的封存/淘汰会改动存储布局，锁外读会
         // 撞上被截断/被重写的区间而读到错位字节——静默数据损坏比"这次回退到
         // demux 自己的路径"严重得多。锁内代价可忽略：命中尾部窗口是纯内存拷贝，
         // 其余也基本落在 page cache 上。
-        let mut g = self.inner.lock().ok()?;
-        if g.total.is_none() {
-            return None;
-        }
-        let end = offset.checked_add(length)?;
-        // 绝对 → 桶内相对偏移（checked_sub 覆盖 offset < start 的情况）
-        let rel_start = offset.checked_sub(g.start)?;
-        let rel_end = end.checked_sub(g.start)?;
-        if rel_end > g.store.len() {
+        let mut guard = self.inner.lock().ok()?;
+        if guard.total.is_none() {
             return None;
         }
         // 读失败（越界 / IO 错）一律 None：调用方会回退到 demux 自己的缓存与
         // 网络路径，绝不把半截或错位的字节交出去。
-        g.store.read(rel_start, (rel_end - rel_start) as usize).ok()
+        guard.copy(offset, length)
     }
+
+    // ---- 冷区（滑动窗口的磁盘分层，2026-09-04）----
+
+    /// 冷区入口（热区交接通道的发送端）。`None` = 本状态不进归档模式。
+    fn cold_sink(&self) -> Option<ColdSink> {
+        self.cold.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// 装配**归档模式**：此后本状态不再自己发网络请求，只接收热区淘汰下来的
+    /// 字节（"已有的就留下，而不是丢掉"）。由 `enable_full_preload` 在顺序长读
+    /// 路径上调用（音频优先的 eager 桶除外：那是刻意的优先下载者）。
+    fn set_cold_sink(&self, sink: ColdSink) {
+        if let Ok(mut guard) = self.cold.lock() {
+            *guard = Some(sink);
+        }
+        self.archive.store(true, Ordering::Relaxed);
+    }
+
+    fn archive_mode(&self) -> bool {
+        self.archive.load(Ordering::Relaxed)
+    }
+
+    /// 冷区当前字节总量（所有段之和，含活动段）。
+    fn cold_bytes(&self) -> u64 {
+        self.stored.load(Ordering::Relaxed)
+    }
+
+    /// 冷区覆盖区间的**下界**（最小段起点；`u64::MAX` = 冷区为空）。
+    fn cold_low(&self) -> u64 {
+        self.cold_low.load(Ordering::Relaxed)
+    }
+
+    /// 冷区可能覆盖 `offset` 吗？（**两次原子读、无锁**的廉价预筛。）
+    ///
+    /// 冷区检查挂在每次 32KB demux 读的热路径上，正常前进播放时读位置一直在
+    /// 冷区前沿之后，这一步就把绝大多数读挡在锁外；真正可能命中时才走
+    /// `covers` / `copy_range` 的加锁定位。
+    fn might_cover(&self, offset: u64) -> bool {
+        let low = self.cold_low();
+        low != u64::MAX && offset >= low && offset < self.covered_until()
+    }
+
+    /// 重算覆盖下界（段封存 / 淘汰 / 写入后调用，全部在 `inner` 锁内）。
+    fn refresh_cold_low(&self, guard: &FullPreloadInner) {
+        let mut low = if guard.store.len() > 0 {
+            guard.start
+        } else {
+            u64::MAX
+        };
+        for segment in &guard.sealed {
+            if segment.store.len() > 0 {
+                low = low.min(segment.start);
+            }
+        }
+        self.cold_low.store(low, Ordering::Relaxed);
+    }
+
+    fn cold_budget_bytes(&self) -> u64 {
+        self.cold_budget.load(Ordering::Relaxed)
+    }
+
+    /// 冷区命中次数 / 命中字节（累计单调）：**因为冷区命中而免掉的网络读**。
+    fn cold_hit_count(&self) -> u64 {
+        self.cold_hits.load(Ordering::Relaxed)
+    }
+
+    fn cold_hit_total_bytes(&self) -> u64 {
+        self.cold_hit_bytes.load(Ordering::Relaxed)
+    }
+
+    /// 冷区**零网络**命中：完整覆盖时复制返回并计数。
+    ///
+    /// 命中计数只统计"真的省下一次网络读"的命中（完整覆盖），半覆盖不算——
+    /// 后者最终仍要走网络，计进命中会把"绝不重下"的证据稀释掉。
+    fn read_cached(&self, offset: u64, length: u64) -> Option<Vec<u8>> {
+        if !self.covers(offset, length) {
+            return None;
+        }
+        let bytes = self.copy_range(offset, length)?;
+        self.cold_hits.fetch_add(1, Ordering::Relaxed);
+        self.cold_hit_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Some(bytes)
+    }
+
+    /// `offset` 处**至少一个字节**在冷区里（seek 提示用：目标已在盘上就不该
+    /// 重发网络请求——这正是"回拖到已缓冲区域零请求"的判据）。
+    fn covers_at(&self, offset: u64) -> bool {
+        self.covers(offset, 1)
+    }
+
+    /// 冷区里 `offset` 处**当前可得**的字节（可以少于请求量，最多 `max`）。
+    ///
+    /// 用途：跨越冷/热边界的读（回拖后播放推进到冷区末端时一定有这种读）
+    /// 只需要一次"冷区前缀"，剩下的交给上层继续——这样既不会因为"没整段命中"
+    /// 而触发一次多余的网络请求，也不会读出错位字节。命中同样计数。
+    fn read_available_at(&self, offset: u64, max: u64) -> Option<Vec<u8>> {
+        if max == 0 {
+            return Some(Vec::new());
+        }
+        let mut guard = self.inner.lock().ok()?;
+        if guard.total.is_none() {
+            return None;
+        }
+        let end_available = guard.containing_end(offset)?;
+        let length = end_available.saturating_sub(offset).min(max);
+        if length == 0 {
+            return None;
+        }
+        let bytes = guard.copy(offset, length)?;
+        self.cold_hits.fetch_add(1, Ordering::Relaxed);
+        self.cold_hit_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Some(bytes)
+    }
+
+    /// 请求一次**拖拽预读**（页缓存预热）。非阻塞：通道满即放弃（预读只是优化）。
+    fn request_warm(&self, offset: u64) {
+        if let Some(sink) = self.cold_sink()
+            && sink.tx.try_send(ColdMessage::Warm(offset)).is_err()
+        {
+            // 背压：放弃这次预读（真实读路径仍会命中冷区，只是少一次预热）。
+        }
+    }
+
+    /// 收下一段**热区淘汰下来的**字节（零网络），按绝对偏移归入段存储。
+    ///
+    /// 规则（保证**段内**永远连续、无洞）：
+    ///   - `chunk_end <= 活动段终点`：完全已有（回拖后重放同一区间的交接）→
+    ///     **查重后跳过**，不写第二份；
+    ///   - `chunk_start > 活动段终点`：中间有洞（交接通道背压 / 写失败）→
+    ///     封存活动段、另开新段（段间允许有洞，但**绝不把不懂的字节硬接上**）；
+    ///   - 否则：只写活动段终点之后的那部分（重叠前缀跳过）。
+    ///
+    /// 返回实际存下的字节数。写入失败（磁盘满/权限/杀软锁）就地降级到内存段，
+    /// 与既有整片预载桶的降级语义一致：落盘是省内存的优化，不是可用性依赖。
+    fn ingest_evicted(&self, offset: u64, bytes: &[u8]) -> u64 {
+        if bytes.is_empty() {
+            return 0;
+        }
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let active_end = guard.active_end();
+        let chunk_end = offset.saturating_add(bytes.len() as u64);
+        if chunk_end <= active_end {
+            return 0; // 已有 → 跳过（绝不重写、绝不覆盖）
+        }
+        if offset > active_end {
+            self.seal_and_open(&mut guard, offset);
+        }
+        let write_from = guard.active_end().max(offset);
+        let skip = usize::try_from(write_from - offset).unwrap_or(usize::MAX);
+        let Some(tail) = bytes.get(skip..) else {
+            return 0;
+        };
+        let degraded = guard.append_chunk(tail).err();
+        let stored = guard.stored_bytes();
+        let end = guard.active_end();
+        self.stored.store(stored, Ordering::Relaxed);
+        self.end.store(end, Ordering::Relaxed);
+        // 段写满 → 封存 + 另开新段（起点就是当前终点，覆盖依然连续）。
+        if guard.store.len() >= COLD_SEGMENT_BYTES {
+            self.seal_and_open(&mut guard, end);
+            self.end.store(guard.active_end(), Ordering::Relaxed);
+        }
+        self.refresh_cold_low(&guard);
+        drop(guard);
+        if let Some(reason) = degraded {
+            // diag 是无条件通道（不受 trace 开关影响）：宿主必须知道这条流
+            // 已经退回"冷区常驻内存"了。
+            trace::diagnostic(format!(
+                "{{\"event\":\"erika_preload_disk_fallback\",\"slot\":{},\"start\":{},\"length\":{},\"error\":\"{}\"}}",
+                self.slot,
+                offset,
+                bytes.len(),
+                json_escape(&reason),
+            ));
+        }
+        // 超预算 → 丢最久远的段（**保持不丢已有的最近回看区间**）。
+        self.evict_cold_to_budget();
+        tail.len() as u64
+    }
+
+    /// 封存当前活动段，并从 `start` 起一个新段。
+    ///
+    /// 磁盘模式开新文件（`DiskStore::create_fresh`，绝不复用残留文件——段必须与
+    /// 自己的逻辑起点严格对齐）；开不出来就退回内存段，冷区降级绝不影响播放。
+    fn seal_and_open(&self, guard: &mut FullPreloadInner, start: u64) {
+        guard.seal_active();
+        let store = match &self.dir {
+            Some(dir) => match DiskStore::create_fresh(dir, self.key) {
+                Ok(disk) => PreloadStore::Disk(disk),
+                Err(error) => {
+                    trace::diagnostic(format!(
+                        "{{\"event\":\"erika_cold_segment_unavailable\",\"slot\":{},\"start\":{},\"error\":\"{}\"}}",
+                        self.slot,
+                        start,
+                        json_escape(&error.to_string()),
+                    ));
+                    PreloadStore::Memory(Vec::new())
+                }
+            },
+            None => PreloadStore::Memory(Vec::new()),
+        };
+        guard.open_segment(start, store);
+    }
+
+    /// 冷区超预算 → 丢**最久远**的段（起点最小的封存段）。
+    ///
+    /// 策略理由（见文件上方预算整段）：回看命中的价值随时间单调下降
+    /// ——"拖回刚才的位置"远多于"拖回片子开头"，所以淘汰必须从最旧的一端开始；
+    /// 且淘汰**只动冷区**，永不影响读线程的前向推进（读多少由时间预算决定），
+    /// 因此不会退化成"弱网缓冲变薄"。淘汰即整段丢弃 → `PreloadFile::Drop`
+    /// **真的删除文件**（不留残渣）。
+    fn evict_cold_to_budget(&self) -> u64 {
+        let budget = self.cold_budget_bytes();
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut stored = guard.stored_bytes();
+        let mut evicted = 0u64;
+        while stored > budget && !guard.sealed.is_empty() {
+            let Some(index) = guard
+                .sealed
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, segment)| segment.start)
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            let segment = guard.sealed.remove(index);
+            let length = segment.store.len();
+            stored = stored.saturating_sub(length);
+            evicted = evicted.saturating_add(length);
+            // 整段丢弃：Disk 后端在 Drop 里关句柄并删文件。
+            drop(segment);
+        }
+        self.stored.store(stored, Ordering::Relaxed);
+        self.refresh_cold_low(&guard);
+        evicted
+    }
+
+    /// 拖拽预读：把 `[offset, offset + COLD_WARM_BYTES)` 读进页缓存后丢弃。
+    ///
+    /// 由**冷区线程**调用（不在 demux 线程上）：真正播放时的冷区读因此命中页
+    /// 缓存，"从盘读回"的开销被压到一次 memcpy 量级，而不是一次裸盘随机读。
+    fn warm_range(&self, offset: u64) -> u64 {
+        const STEPS: u64 = COLD_WARM_BYTES / COLD_CHUNK_BYTES as u64;
+        let mut warmed = 0u64;
+        for step in 0..STEPS {
+            let chunk_offset = offset.saturating_add(step * COLD_CHUNK_BYTES as u64);
+            match self.copy_range(chunk_offset, COLD_CHUNK_BYTES as u64) {
+                Some(_) => warmed = warmed.saturating_add(COLD_CHUNK_BYTES as u64),
+                None => break,
+            }
+        }
+        warmed
+    }
+
+    /// 冷区归档线程主体：消费热区交接的字节 + 处理拖拽预读请求。
+    ///
+    /// 独立线程的意义：磁盘写与页缓存预热都不落在 demux 线程上（关窗/拖拽时
+    /// 播放线程只做一次非阻塞 `try_send`）。
+    fn run_cold_archive(&self, rx: mpsc::Receiver<ColdMessage>) {
+        const TICK: Duration = Duration::from_millis(100);
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            match rx.recv_timeout(TICK) {
+                Ok(ColdMessage::Evicted(chunk)) => {
+                    let stored = self.ingest_evicted(chunk.offset, &chunk.bytes);
+                    http_trace_log(format!(
+                        "{{\"event\":\"cold_ingest\",\"slot\":{},\"offset\":{},\"bytes\":{},\"stored\":{},\"cold_bytes\":{}}}",
+                        self.slot,
+                        chunk.offset,
+                        chunk.bytes.len(),
+                        stored,
+                        self.cold_bytes(),
+                    ));
+                }
+                Ok(ColdMessage::Warm(offset)) => {
+                    let warmed = self.warm_range(offset);
+                    http_trace_log(format!(
+                        "{{\"event\":\"cold_warm\",\"slot\":{},\"offset\":{},\"warmed\":{}}}",
+                        self.slot, offset, warmed,
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+}
+
+/// 顺序长读的**供给健康度**（换源判据的输入，见 `maybe_switch_host`）。
+#[derive(Debug, Clone, Copy)]
+struct StreamHealth {
+    /// 前向可播秒数 = 前向缓冲字节 ÷ 实测码率估计。
+    forward_secs: f64,
+    /// 前向窗口是否已达预算（**供给充足的正面证据**：demux 消费得比读得慢）。
+    window_full: bool,
+    /// 有没有可用的窗口观测（旧分段路径没有长流窗口 → false：只能用
+    /// "长时间没字节到达"判死连，**不能**用"前向秒数"判饥饿）。
+    measurable: bool,
+    /// **网络填充前沿已经到达服务端声明的文件终点**（本片已完整缓冲）。
+    ///
+    /// 真机事故（2026-09-15）：整片下完之后 `write_pos` 不再前进 →「距上次
+    /// 收到字节」涨到 596 秒，与"链路死了"在**任何只看到达字节的指标上完全
+    /// 同形**。旧判据因此会把"已经下完了"当成死连证据去换源。
+    ///
+    /// 特别要注意：`window_full` **挡不住这种情况**。它是 `front_len >=
+    /// front_cap`，而 `front_cap` 的下界是宿主配置的 `read_ahead`
+    /// （bili-rs 设 32MiB）——**短片子的整片都装不满这个窗口**，
+    /// 于是 `window_full` 恒为 false、`!window_full` 这道守卫等于不存在。
+    /// 必须用本字段（"不需要更多字节"）独立表达，见 `maybe_switch_host`。
+    source_complete: bool,
 }
 
 /// 多源无缝换 host（Option A）参数。
@@ -1746,8 +5535,36 @@ const MULTI_HOST_STALL_MS: u64 = 6_000;
 /// 活跃窗口：read_range 最近被调用的时间须落在此窗口内，才判定"在播"
 /// （暂停时不误换）。
 const MULTI_HOST_ACTIVE_MS: u64 = 6_000;
-/// 慢速提早换阈值：带宽持续低于此值（字节/秒）即切，不等完全死。
-const MULTI_HOST_LOW_BPS: f64 = 25_000.0;
+/// **恢复余量（秒）：前向可播秒数掉到它以下并持续一段时间 → 触发恢复（换源）。**
+///
+/// **为什么必须是"十几秒"而不是 2 秒**（2026-09-04 第二次订正，真机日志驱动）：
+/// 从"判饥"到"用户看不到卡住"要付四笔时间成本，2 秒的余量根本不够付：
+///   1. **检测迟滞** `MULTI_HOST_STARVE_PERSIST_MS`（3s）——防瞬时抖动误判；
+///   2. **换源 + 首字节**：新连接 RTT+TTFB 实测量级 0.2~4s（弱网取上限）；
+///   3. **重新加速 + 填回安全深度**：调研一手证据是"新连接会重新加速、随后衰减"，
+///      但把余量填回去本身就是十几秒的量级；
+///   4. **下一轮抖动余量**：CDN 抖动常见量级几秒到十几秒。
+/// 取 **20 秒**：① 最坏情形（供给为 0、缓冲按 1× 消耗）下仍给播放留 20 秒，
+/// 覆盖上面 1+2+3 的最坏叠加；② 余量不小于"判饥→恢复完成"的最坏耗时
+/// （≈3s 迟滞 + 1~4s 首字节 + 15~20s 填回 ≈ 20~27s），才不会"先卡住再恢复"。
+/// 真机反例（旧值 2.0s）：`buf=57.7s vstall=16s→21s` 时判据一直 `Hold`——
+/// 要等到第 56 秒才动作，而那时用户早就看到卡住了。
+///
+/// 与 `MULTI_HOST_STALL_MS`（6s 无字节）配合：**连接真死走 6 秒快通路**（与缓冲
+/// 多深无关，越早动作越好），**供给跟不上走这条 20 秒余量线**。
+const MULTI_HOST_RECOVERY_MARGIN_SECS: f64 = 20.0;
+/// 饥饿判定的持续时间要求（迟滞：瞬时抖动不算）。
+const MULTI_HOST_STARVE_PERSIST_MS: u64 = 3_000;
+/// **健康阈值**：前向可播秒数 ≥ 恢复余量（= 窗口满）就视为"供给充足"，
+/// **绝不自发换源**（同时也让复发退避归位）。
+const MULTI_HOST_HEALTHY_SECS: f64 = MULTI_HOST_RECOVERY_MARGIN_SECS;
+/// 自发换源的**滑动窗口限流**：`MULTI_HOST_SWITCH_WINDOW_MS` 内最多
+/// `MULTI_HOST_MAX_SWITCHES` 次；超过就停在当前 host 走自愈链（宿主换源/
+/// 重开），而不是继续轮换——用户实测"89 秒 14 次"就是没有这道闸的后果。
+const MULTI_HOST_SWITCH_WINDOW_MS: u64 = 300_000;
+const MULTI_HOST_MAX_SWITCHES: usize = 5;
+/// 复发退避：同一轮里换得越勤，冷却越长（4s 起翻倍，上限 32s）。
+const MULTI_HOST_COOLDOWN_MAX: Duration = Duration::from_secs(32);
 /// 换 host 后冷却：避免一轮内对同一死连反复横跳。
 const MULTI_HOST_COOLDOWN: Duration = Duration::from_secs(4);
 /// 宿主强制切换（`request_host_switch`）的冷却。比自发切换短——宿主只在
@@ -1782,6 +5599,19 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 是否 B 站媒体 host（`*.bilivideo.com` / `*.bilivideo.cn` / `*.bilibili.com`）。
+/// 用于给这类源补上防盗链必需的 `Referer`（见构造器里的注释）。
+fn is_bilibili_media_host(uri: &str) -> bool {
+    let host = host_of(uri)
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ["bilivideo.com", "bilivideo.cn", "bilibili.com"]
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
 /// 从 URL 提取 host（仅用于诊断日志，不触及签名）。
 fn host_of(uri: &str) -> &str {
     uri.split("://")
@@ -1812,6 +5642,13 @@ impl HttpRangeSource {
     /// 超时（5s），多段滚动叠加带宽后总吞吐远超播放消费，窗口持续向前大步
     /// 缓冲（对齐 PiliPlus：看一点、缓冲一大截）。段小也让 seek 后目标段
     /// 更快就绪（256KB ≈ 慢网 1-2s）。
+    ///
+    /// **适用范围（2026-09-03 订正）**：这条结论只对**旧的分段路径**成立
+    /// ——那里"段"是"一个请求换一段字节"，必须先整段收齐（join）才能交给
+    /// demux，段越大越容易撞上 join 超时。**顺序长读没有"join 一个段"这个
+    /// 概念**（socket 读到一个 64KB 块就立刻交付给 demux），"段大小"这个
+    /// 变量在新路径里根本不存在，因此本常量对新路径无意义（它只剩两个用途：
+    /// 旧路径的段大小上限，以及 `stream_seek_hint` 的前向 seek 防抖粒度）。
     const SEEK_PREFETCH_SEGMENT_BYTES: u64 = 256 * 1024;
     /// 预取段 join 上限。超过即放弃该段（read_range 走同步小范围 fetch 兜底），
     /// 防止慢段无限阻塞 demux 线程（日志实测 seek 后 join 11MB 段卡 28.9s）。
@@ -1874,6 +5711,20 @@ impl HttpRangeSource {
         }
         let uri: String = uri.into();
         let primary = uri.clone();
+        // **防盗链 Referer**（对外调研：一手实测"带 UA 不带 Referer → 403"，
+        // BBDown/bbgui/yt-dlp 全部无条件带 `Referer: https://www.bilibili.com`）。
+        // 只在**确实是 B 站媒体 host** 且宿主没给 Referer 时补，避免污染其它源。
+        let mut http_headers = http_headers;
+        if is_bilibili_media_host(&uri)
+            && !http_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("referer"))
+        {
+            http_headers.push((
+                "Referer".to_string(),
+                "https://www.bilibili.com".to_string(),
+            ));
+        }
         Self {
             uri: Arc::new(Mutex::new(uri)),
             primary_uri: primary,
@@ -1890,6 +5741,20 @@ impl HttpRangeSource {
             est_bps: 0.0,
             last_est_at: Instant::now(),
             est_window_bytes: 0,
+            consume_bps: 0.0,
+            consume_window_bytes: 0,
+            last_consume_at: Instant::now(),
+            last_consumed_pos: 0,
+            // 冷启动预算 = 配置值（码率/吞吐都还没测到，见 `window_budget`）。
+            window: window_budget(
+                diag_slot,
+                read_ahead
+                    .filter(|bytes| *bytes > 0)
+                    .unwrap_or_else(|| http_read_ahead_bytes(diag_slot)),
+                http_back_bytes(diag_slot),
+                0.0,
+                None,
+            ),
             prefetch: Vec::new(),
             prefetch_target: None,
             downloaded_bytes: 0,
@@ -1898,11 +5763,16 @@ impl HttpRangeSource {
             // 由上层在需要时通过 `set_full_preload` 注入 `FullPreloadState`。
             full_preload: None,
             preload_thread: None,
+            preload_dir_override: None,
             candidates: Vec::new(),
             active_idx: 0,
             last_byte_ms: now_ms(),
             last_read_call_ms: now_ms(),
             switch_cooldown_until: Instant::now(),
+            switch_times: VecDeque::new(),
+            switch_backoff: MULTI_HOST_COOLDOWN,
+            starve_since_ms: 0,
+            last_switch_reason: String::new(),
             // 新源不消费旧请求：同步为当前计数，宿主的 stale 请求不触发切换
             host_epoch: 0,
             last_switch_req: HOST_SWITCH_REQ
@@ -1910,6 +5780,17 @@ impl HttpRangeSource {
                 .map(|c| c.load(Ordering::Relaxed))
                 .unwrap_or(0),
             switching_host: false,
+            // 新源一开播不在等待窗口里；只有真正读不到数据时才置位。
+            transient_wait: false,
+            read_in_flight: false,
+            // 顺序长读默认关：由 VOD 工厂 `enable_sequential_stream()` 显式打开
+            // （生产路径默认开；直接 new 出来的源走旧分段路径，见字段注释）。
+            sequential_enabled: false,
+            stream: None,
+            stream_epoch: Arc::new(AtomicU64::new(0)),
+            stream_reconnects_seen: 0,
+            // 0 = 从未发布过 → 第一次读立刻发布（见 publish_diag_throttled）
+            last_stream_publish_ms: 0,
         }
     }
 
@@ -1971,39 +5852,180 @@ impl HttpRangeSource {
             return;
         }
         let t = now_ms();
-        // 死连：长时间无字节，但 demux 仍在调用 read_range（播放活跃）。
-        let stalled = t.saturating_sub(self.last_byte_ms) > MULTI_HOST_STALL_MS
-            && t.saturating_sub(self.last_read_call_ms) < MULTI_HOST_ACTIVE_MS;
-        // 慢速：带宽过低（提早换，不等完全死）。
-        let slow = self.est_bps > 1_000.0 && self.est_bps < MULTI_HOST_LOW_BPS;
-        if !forced && !stalled && !slow {
+        // ---- 「最后收到字节」必须取两条路径的较新者 ----
+        //
+        // 这是一处**真 bug 的修复**（用户实测：87 秒换源 14 次 ≈ 每 6 秒一次）：
+        // `self.last_byte_ms` 只在旧分段路径的 `record_downloaded` 里更新，
+        // **顺序长读路径从不刷新它** → `stalled` 在开播 6 秒后恒为真 →
+        // 每个冷却周期（4s）都触发一次"自发换源" → 新连接重新加速 → 再变老 →
+        // 再换……正好是 6 秒一次。现在顺序长读线程自己维护 `last_arrival_ms`。
+        let stream_last_byte = self
+            .stream
+            .as_ref()
+            .map(|stream| stream.last_arrival_ms.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let last_byte_ms = self.last_byte_ms.max(stream_last_byte);
+        // ---- 供给健康度：**正面证据优先** ----
+        //
+        // 顺序长读的背压语义是"窗口满就（几乎）不读 socket"，此时吞吐数字必然
+        // 收敛到消费速率——**低吞吐不代表链路差**。因此只要前向缓冲还厚
+        // （≥ `MULTI_HOST_HEALTHY_SECS` 可播秒数）或窗口压根没满，就判"供给充足"，
+        // **绝不**自发换源。只有"这条链路正在饿死我们"才换：前向可播秒数掉到
+        // `MULTI_HOST_STARVE_SECS` 以下并持续 `MULTI_HOST_STARVE_PERSIST_MS`，
+        // 或真的长时间没有字节到达。
+        let consuming =
+            self.read_in_flight || t.saturating_sub(self.last_read_call_ms) < MULTI_HOST_ACTIVE_MS;
+        let health = self.stream_health();
+        // ---- 「整片已缓冲完」必须显式排除，两道守卫都挡不住它 ----
+        //
+        // 真机事故（2026-09-15）：`vstall=596s` 配 `缓冲 前沿18.9/19MB`——
+        // 视频整片都快下完了，网络前沿自然不再前进，"距上次字节"自然一路涨。
+        // 旧判据里唯一还站着的是 `!window_full`，而它是
+        // `front_len >= front_cap`，`front_cap` 下界 = 宿主配的 `read_ahead`
+        // （bili-rs 32MiB）——**短片子的整片都装不满它**，于是这道守卫恒真、
+        // 等于不存在。只要 demux 有一次读活动（`consuming` 为真），判据就会拿
+        // "下完了"当死连证据去换源，并给健康 host 记失败分。
+        let eating = consuming
+            && health.measurable
+            && !health.source_complete
+            && !health.window_full
+            && health.forward_secs < MULTI_HOST_RECOVERY_MARGIN_SECS;
+        let starving_now = eating;
+        if starving_now {
+            if self.starve_since_ms == 0 {
+                self.starve_since_ms = t;
+            }
+        } else {
+            self.starve_since_ms = 0;
+        }
+        let starving = self.starve_since_ms != 0
+            && t.saturating_sub(self.starve_since_ms) >= MULTI_HOST_STARVE_PERSIST_MS;
+        // 「长时间没有字节到达」**只在"还要字节、且窗口没满"时才成立**：
+        // · 窗口满 = 我们**刻意不读**（背压语义），"没字节"是预期行为；
+        // · `source_complete` = 后边**没有字节可要**了（整片已下完），
+        //   "没字节"同样是预期行为，且这一条**不是**被"窗口满"覆盖的
+        //   （短片子的整片比 `front_cap` 还小，`window_full` 恒 false）。
+        // 这两条都是本次修复的核心：旧判据把它们统统当成了换源理由。
+        let no_bytes = consuming
+            && !health.source_complete
+            && !health.window_full
+            && t.saturating_sub(last_byte_ms) > MULTI_HOST_STALL_MS;
+        // 供给充足（窗口满 / 前向秒数 ≥ 恢复余量 / **整片已下完**）→ 复发退避
+        // 归位，下次真需要时不至于还在长冷却里。"整片已下完"要单列：那时前向
+        // 秒数会被消费吃掉（`front_len` 只减不增），拿它判"不充足"会让退避
+        // 一直停在长冷却上。
+        let supplied = health.measurable
+            && (health.window_full
+                || health.source_complete
+                || health.forward_secs >= MULTI_HOST_HEALTHY_SECS);
+        if !forced && !starving && !no_bytes {
+            if supplied {
+                self.switch_backoff = MULTI_HOST_COOLDOWN;
+            }
+            return;
+        }
+        // ---- 抖动闸：滑动窗口限流 + 复发退避 ----
+        let recent_switches = self
+            .switch_times
+            .iter()
+            .filter(|stamp| t.saturating_sub(**stamp) < MULTI_HOST_SWITCH_WINDOW_MS)
+            .count();
+        if !forced && recent_switches >= MULTI_HOST_MAX_SWITCHES {
+            // 窗口内换得够多了：**停在当前 host**，把"再换一次"的决策交回宿主
+            // 自愈链（宿主有整源重建/换画质等更强的手段），而不是继续轮换把
+            // 用户拖进无休止抖动。
+            http_trace_log(format!(
+                "{{\"event\":\"mhost_switch_suppressed\",\"reason\":\"rate_limited\",\"recent\":{recent_switches},\"window_ms\":{MULTI_HOST_SWITCH_WINDOW_MS},\"starving\":{starving},\"no_bytes\":{no_bytes}}}",
+            ));
+            trace::diagnostic(format!(
+                "[erika-host-switch] slot={} 抑制自发换源：最近 {} 分钟内已换 {} 次（上限 {}）——停在当前 host，交给宿主自愈链",
+                self.diag_slot,
+                MULTI_HOST_SWITCH_WINDOW_MS / 60_000,
+                recent_switches,
+                MULTI_HOST_MAX_SWITCHES
+            ));
+            // 抑制也要有冷却，否则每个 read 都来问一次。
+            self.switch_cooldown_until = now + MULTI_HOST_COOLDOWN;
             return;
         }
         let next = (self.active_idx + 1) % self.candidates.len();
         if next == self.active_idx {
             return;
         }
+        let reason = if forced {
+            "host_requested".to_string()
+        } else if starving {
+            format!(
+                "starving(前向{:.1}s<恢复余量{:.1}s 持续{:.1}s)",
+                health.forward_secs,
+                MULTI_HOST_RECOVERY_MARGIN_SECS,
+                t.saturating_sub(self.starve_since_ms) as f64 / 1000.0
+            )
+        } else {
+            format!("no_bytes({}ms 无字节到达)", t.saturating_sub(last_byte_ms))
+        };
+        // 可读的一行：切前/切后 host、原因、当时的缓冲/停滞/吞吐——用户"看得见
+        // 才算数"，面板与日志都吃这条。
+        let from_host = self.active_host_label();
+        let to_host = self.active_host_label_of(next);
+        trace::diagnostic(format!(
+            "[erika-host-switch] slot={} {}→{}（候选 {}/{}）原因={} | 前向可播 {:.1}s 窗口{} 吞吐 est={:.0}KB/s fill={:.0}KB/s 距上次字节 {}ms 本轮已换 {}/{}",
+            self.diag_slot,
+            from_host,
+            to_host,
+            next + 1,
+            self.candidates.len(),
+            reason,
+            health.forward_secs,
+            if health.window_full { "满" } else { "未满" },
+            self.est_bps / 1024.0,
+            load_fill_bps(self.diag_slot) / 1024.0,
+            t.saturating_sub(last_byte_ms),
+            recent_switches + 1,
+            MULTI_HOST_MAX_SWITCHES,
+        ));
+        self.last_switch_reason = format!(
+            "{} → {}：{}",
+            host_of(&self.candidates[self.active_idx].uri),
+            host_of(&self.candidates[next].uri),
+            reason
+        );
         let new_uri = self.candidates[next].uri.clone();
         *self.uri.lock().expect("uri poisoned") = new_uri.clone();
         http_trace_log(format!(
-            "{{\"event\":\"mhost_switch\",\"from\":{},\"to\":{},\"reason\":\"{}\",\"est_bps\":{:.0},\"next_score\":{:.2}}}",
+            "{{\"event\":\"mhost_switch\",\"from\":{},\"to\":{},\"reason\":\"{}\",\"est_bps\":{:.0},\"forward_secs\":{:.3},\"window_full\":{},\"since_last_byte_ms\":{},\"recent_switches\":{},\"next_score\":{:.2}}}",
             self.active_idx,
             next,
-            if forced {
-                "forced"
-            } else if stalled {
-                "stalled"
-            } else {
-                "slow"
-            },
+            json_escape(&reason),
             self.est_bps,
+            health.forward_secs,
+            health.window_full,
+            t.saturating_sub(last_byte_ms),
+            recent_switches + 1,
             self.candidates[next].score
         ));
+        self.switch_times.push_back(t);
+        while self.switch_times.len() > 16 {
+            self.switch_times.pop_front();
+        }
         self.active_idx = next;
         self.last_byte_ms = t;
         self.host_epoch = self.host_epoch.wrapping_add(1);
-        self.switch_cooldown_until =
-            now + if forced { MULTI_HOST_FORCED_COOLDOWN } else { MULTI_HOST_COOLDOWN };
+        // 顺序长读：把新代数同步给读线程。它在下一个 64KB 块边界发现 epoch 变了
+        // 就断开旧 host 的连接、用新 host 从 `write_pos` 续传——已收到的字节全在
+        // 窗口里，一个字节都不丢，切换的物理代价 = 新 host 上首块到达的时间。
+        // （旧路径那边靠"作废在飞段 + 重发"实现同一件事，见下面的 K1 分支。）
+        self.stream_epoch.store(self.host_epoch, Ordering::Relaxed);
+        // 冷却：强制请求走短冷却（宿主另有 10s 策略冷却）；自发切换**复发退避**
+        // （每次翻倍到 32s），把"切完又判慢"的循环从 4s 一次拉长到 32s 一次。
+        self.switch_cooldown_until = now
+            + if forced {
+                MULTI_HOST_FORCED_COOLDOWN
+            } else {
+                let backoff = self.switch_backoff;
+                self.switch_backoff = (self.switch_backoff * 2).min(MULTI_HOST_COOLDOWN_MAX);
+                backoff
+            };
         // 作废旧 host 上的在飞段，按新 host 从最早未覆盖处重发（K1）。
         // clear 只丢 receiver：后台线程跑完自退，结果无人接收即丢弃。
         if !self.prefetch.is_empty() {
@@ -2066,7 +6088,11 @@ impl HttpRangeSource {
         // 文件名摘要在 `set_candidates` 之后算：那时 `uri` 已经切到最优候选，
         // 桶线程捕获的也是同一份。摘要只取 URI 的稳定部分，换 CDN 不影响复用。
         let uri = self.uri.lock().expect("uri poisoned").clone();
-        let state = FullPreloadState::open(&uri, self.diag_slot, cap, &preload_dir());
+        let dir = self
+            .preload_dir_override
+            .clone()
+            .unwrap_or_else(preload_dir);
+        let state = FullPreloadState::open(&uri, self.diag_slot, cap, &dir);
         // 桶的计数器和源共用同一套「实时已收」语义：桶下载期间（尤其暂停后
         // 桶接管全速补片的阶段）宿主读到非零供给速度，而不是"暂停=0 速度"。
         if let Ok(mut counters) = SOURCE_RX.lock() {
@@ -2080,8 +6106,12 @@ impl HttpRangeSource {
         if audio_first {
             AUDIO_FIRST.enabled.store(true, Ordering::Relaxed);
             AUDIO_FIRST.audio_permille.store(0, Ordering::Relaxed);
-            AUDIO_FIRST.audio_total_known.store(false, Ordering::Relaxed);
-            AUDIO_FIRST.enabled_at_ms.store(audio_first_now_ms(), Ordering::Relaxed);
+            AUDIO_FIRST
+                .audio_total_known
+                .store(false, Ordering::Relaxed);
+            AUDIO_FIRST
+                .enabled_at_ms
+                .store(audio_first_now_ms(), Ordering::Relaxed);
         }
         let (eager, report, video_bucket) = if audio_first {
             // 激进音频桶：不向 demux 让路，优先把整条音轨拉完；进度上报协调器。
@@ -2092,24 +6122,707 @@ impl HttpRangeSource {
         };
         let shared_uri = self.uri.clone(); // Arc<Mutex<String>>：换 host 时桶线程自动跟随
         let headers = self.http_headers.clone();
-        let agent = self.agent.clone();
+        // 流式（默认）：一条 open-ended Range 读到尾，请求数 O(暂停次数)。
+        // 分段（`ERIKA_PRELOAD_STREAM=0`）：旧的"每步一个 256KB 请求"实现。
+        // agent 必须跟着模式走——流式是无限长 body，用带 body 总时长超时的
+        // `http_agent` 会让这条长连接在 60s 处被自己掐断（见 `http_stream_agent`）。
+        let streaming = preload_stream_enabled();
+        let agent = if streaming {
+            http_stream_agent()
+        } else {
+            self.agent.clone()
+        };
+        // **归档模式**（顺序长读生产路径，2026-09-04）：这条桶不再自己下载
+        // （"打开就一路缓冲到整片下完"正是用户要消灭的行为——内存/流量都被它
+        // 拖走），改成**滑动窗口的冷区**：只接收热区淘汰下来的字节、按段落盘，
+        // 供回拖/重播零网络读回。发请求的只剩那条顺序长流。
+        //
+        // 例外（保持既有能力不丢）：音频优先的 eager 桶仍是"下载者"——音频
+        // 整条只有几 MB，抢在 demux 前拉完是刻意的优先策略（见 `audio_first`）。
+        let archive_mode = self.sequential_enabled && !eager;
+        let cold_rx = if archive_mode {
+            let (tx, rx) = mpsc::sync_channel::<ColdMessage>(COLD_CHANNEL_CHUNKS);
+            state.set_cold_sink(ColdSink { tx });
+            trace::diagnostic(format!(
+                "{{\"event\":\"erika_cold_tier_enabled\",\"slot\":{},\"disk\":{},\"cold_budget\":{}}}",
+                self.diag_slot,
+                preload_to_disk_enabled(),
+                state.cold_budget_bytes(),
+            ));
+            Some(rx)
+        } else {
+            None
+        };
         let handle = std::thread::Builder::new()
             .name(format!("erika-full-preload-{}", self.diag_slot))
             .spawn(move || {
-                full_preload_loop(
-                    &agent,
-                    shared_uri,
-                    &headers,
-                    &state,
-                    cap,
-                    eager,
-                    report,
-                    video_bucket,
-                );
+                if let Some(rx) = cold_rx {
+                    // 冷区归档线程：磁盘写 + 拖拽预读都在这里，绝不在 demux 上。
+                    state.run_cold_archive(rx);
+                } else if streaming {
+                    full_preload_stream_loop(
+                        &agent,
+                        shared_uri,
+                        &headers,
+                        &state,
+                        cap,
+                        eager,
+                        report,
+                        video_bucket,
+                    );
+                } else {
+                    full_preload_loop(
+                        &agent,
+                        shared_uri,
+                        &headers,
+                        &state,
+                        cap,
+                        eager,
+                        report,
+                        video_bucket,
+                    );
+                }
             })
             .expect("failed to spawn full-preload thread");
         self.preload_thread = Some(handle);
         self
+    }
+
+    /// 测试专用：把桶/冷区目录指到自己的临时目录（见 `preload_dir_override`
+    /// 注释），随后走**与生产完全相同**的 `enable_full_preload` 链路。
+    #[cfg(test)]
+    fn override_preload_dir(&mut self, dir: PathBuf) {
+        self.preload_dir_override = Some(dir);
+    }
+
+    /// 启用**顺序长读**（见文件上方的大段说明）。生产路径默认调用它：    /// VOD 工厂 `source_from_uri_with_hint_and_headers_slot_and_read_ahead` 的
+    /// HTTP 分支。`ERIKA_HTTP_SEQUENTIAL=0` 可关回旧分段路径（对照/排障用）。
+    ///
+    /// 线程是**懒启动**的（第一次读 / 第一条 seek 提示时才起），所以这里只置
+    /// 标志位，构造 `HttpRangeSource` 不会凭空多出一个后台线程。
+    pub fn enable_sequential_stream(mut self) -> Self {
+        if http_sequential_enabled() {
+            self.sequential_enabled = true;
+        }
+        self
+    }
+
+    /// 懒启动顺序长读线程（起点 = 第一次读的位置）。
+    ///
+    /// 起点取**第一次读的位置**而不是 0：seek 到 30 分钟处再开播时，从 0 起
+    /// 一条连接是白费一个请求（读方马上要重设窗口）。窗口为空时直接以 `base`
+    /// 起窗，读线程自然从该处发出第一条 open-ended Range。
+    fn ensure_stream(&mut self, base: u64) {
+        if self.stream.is_some() || !self.sequential_enabled {
+            return;
+        }
+        // 窗口容量由**预算结算**给出（时间预算 + 内存硬上限，见文件上方整段）：
+        // 冷启动（码率/吞吐未测得）等于配置的 read_ahead/back，行为与改造前一致。
+        let budget = self.window_budget_now();
+        self.window = budget;
+        let front_cap = usize::try_from(budget.forward_bytes)
+            .unwrap_or(usize::MAX)
+            .max(STREAM_MIN_FRONT_CAP);
+        let back_cap = usize::try_from(budget.back_bytes).unwrap_or(0);
+        let mut buffer = StreamBuffer::new(base, front_cap, back_cap);
+        if let Some(state) = self.full_preload.as_ref() {
+            // 冷区（磁盘分层）出口：热区淘汰的字节交给冷区，**不丢**。
+            // 顺序长读路径上它就是"绝不重下"的载体（回拖/重播从盘读回）。
+            buffer.set_cold_sink(state.cold_sink());
+        }
+        let shared = Arc::new(StreamShared {
+            buf: Mutex::new(buffer),
+            data_cv: Condvar::new(),
+        });
+        let arrived = Arc::new(AtomicU64::new(0));
+        // 实时计数器登记进本槽（与旧路径的 `rx` 同一套）：宿主 poll 与
+        // `publish_diag` 都从 `SOURCE_RX` 取「线路上已到达」的字节总量来算
+        // `downloaded_bytes` / `est_bps`。长读路径不登记的话，新路径下
+        // est_bps 恒 0 → 自适应与宿主策略层同时失明。
+        if let Ok(mut counters) = SOURCE_RX.lock() {
+            if let Some(list) = counters.get_mut(self.diag_slot) {
+                list.push(arrived.clone());
+            }
+        }
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let reconnects = Arc::new(StreamReconnects::default());
+        let journal = Arc::new(RangeJournal::default());
+        let last_arrival_ms = Arc::new(AtomicU64::new(now_ms()));
+        let fill_bps = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel();
+        // 跨节点并行回填的计数与在飞配额：读线程与 worker 共享，demux 线程侧的
+        // `stream_seek_hint` 读它的自适应闸门（所以必须在 spawn 之前建好）。
+        let seek_fill = Arc::new(SeekFillDiag::default());
+        let seek_fill_quota = Arc::new(AtomicUsize::new(0));
+        let handle = {
+            let shared = Arc::clone(&shared);
+            let uri = Arc::clone(&self.uri);
+            let headers = self.http_headers.clone();
+            let epoch = Arc::clone(&self.stream_epoch);
+            let arrived_thread = Arc::clone(&arrived);
+            let in_flight_thread = Arc::clone(&in_flight);
+            let reconnects_thread = Arc::clone(&reconnects);
+            let journal_thread = Arc::clone(&journal);
+            let arrival_thread = Arc::clone(&last_arrival_ms);
+            let fill_thread = Arc::clone(&fill_bps);
+            let stop_thread = Arc::clone(&stop);
+            let seek_fill_thread = Arc::clone(&seek_fill);
+            let quota_thread = Arc::clone(&seek_fill_quota);
+            let diag_slot = self.diag_slot;
+            thread::Builder::new()
+                .name(format!("erika-http-stream-{}", self.diag_slot))
+                .spawn(move || {
+                    sequential_reader_loop(
+                        shared,
+                        uri,
+                        headers,
+                        epoch,
+                        arrived_thread,
+                        in_flight_thread,
+                        reconnects_thread,
+                        stop_thread,
+                        diag_slot,
+                        fill_thread,
+                        journal_thread,
+                        arrival_thread,
+                        done_tx,
+                        seek_fill_thread,
+                        quota_thread,
+                    );
+                })
+                .expect("failed to spawn sequential stream thread")
+        };
+        self.stream_epoch.store(self.host_epoch, Ordering::Relaxed);
+        self.stream = Some(SequentialReader {
+            shared,
+            arrived,
+            fill_bps,
+            in_flight,
+            reconnects,
+            journal,
+            last_arrival_ms,
+            stop,
+            done: done_rx,
+            handle: Some(handle),
+            // 跨节点并行回填的计数与在飞配额（见 `SeekFillDiag`）。
+            seek_fill: Arc::new(SeekFillDiag::default()),
+            seek_fill_quota: Arc::new(AtomicUsize::new(0)),
+        });
+    }
+
+    /// 当前预算结算：输入 = 实测码率（`consume_bps`，`ERIKA_HTTP_STREAM_BITRATE_BPS`
+    /// 可覆盖）+ **实测吞吐（唯一入口 [`supply_estimate_bps`]）**；输出 = 前向/后向
+    /// 字节数 + 内存硬上限 + 前向秒数。口径与公式见文件上方"滑动窗口预算"整段。
+    /// 顺序长读的**供给健康度**：换源判据只认"前向缓冲够不够看"，不认吞吐数字
+    /// （背压语义下吞吐必然收敛到消费速率，见 `MULTI_HOST_STARVE_SECS` 注释）。
+    fn stream_health(&self) -> StreamHealth {
+        let Some(stream) = self.stream.as_ref() else {
+            // 旧分段路径：没有长流窗口，"前向可播秒数"无从谈起 → 只让
+            // "长时间没有字节到达"这条死连判据生效（见 `measurable`）。
+            return StreamHealth {
+                forward_secs: 0.0,
+                window_full: false,
+                measurable: false,
+                // 旧分段路径没有长流前沿，判不了"已读到文件终点"：保守为 false
+                // （保持既有行为——那条路径本来就"只能靠长时间没字节判死连"）。
+                source_complete: false,
+            };
+        };
+        let (front_len, window_full, source_complete) = {
+            let g = lock_stream(&stream.shared);
+            (
+                g.front_len(),
+                g.front_reached_budget(),
+                // **「不需要更多字节」**：网络填充前沿到了服务端声明的终点。
+                // 与 `diag_snapshot` 里 `whole_file_cached` 同一个判据，两处必须
+                // 一致（一处给宿主看，一处给换源判据用）。
+                g.total
+                    .is_some_and(|total| total > 0 && g.write_pos() >= total),
+            )
+        };
+        // 码率未知（开播最初 ~2s）时按"配置的 read_ahead ≈ 30 秒"折算：宁可保守，
+        // 也不要漏判真饥饿。
+        let bitrate = window_bitrate_override()
+            .or_else(|| (self.consume_bps > 0.0).then_some(self.consume_bps))
+            .unwrap_or_else(|| self.read_ahead_bytes.max(1) as f64 / WINDOW_FORWARD_SECS_COMFORT);
+        let forward_secs = if bitrate > 0.0 {
+            front_len as f64 / bitrate
+        } else {
+            f64::MAX
+        };
+        StreamHealth {
+            forward_secs,
+            window_full,
+            measurable: true,
+            source_complete,
+        }
+    }
+
+    /// 当前活跃 host（面板/日志用）。
+    fn active_host_label(&self) -> String {
+        self.candidates
+            .get(self.active_idx)
+            .map(|candidate| host_of(&candidate.uri).to_string())
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// 指定候选的 host（换源日志用）。
+    fn active_host_label_of(&self, index: usize) -> String {
+        self.candidates
+            .get(index)
+            .map(|candidate| host_of(&candidate.uri).to_string())
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    fn window_budget_now(&self) -> WindowBudget {
+        let bitrate = window_bitrate_override()
+            .or_else(|| (self.consume_bps > 0.0).then_some(self.consume_bps))
+            .unwrap_or(0.0);
+        window_budget(
+            self.diag_slot,
+            self.read_ahead_bytes,
+            self.back_bytes,
+            bitrate,
+            supply_estimate_bps(self.diag_slot),
+        )
+    }
+
+    /// 按最新吞吐/码率结算预算并同步到读窗口（上限变化会立刻裁剪超出部分，
+    /// 保证"内存不超过硬上限"不是渐进承诺）。由 `publish_diag_throttled`
+    /// 每 500ms 调一次（首次必调）。
+    fn refresh_window_budget(&mut self) {
+        let budget = self.window_budget_now();
+        self.window = budget;
+        // 冷区也要知道文件总长：`covers` 只有在 total 已知时才敢判命中（免得把
+        // 尾部之外的地址判成"有字节"）。归档模式不再自行发请求，因此总长必须
+        // 由这条长流回填给它——否则冷区永远判不出命中，磁盘分层就白做了。
+        if let (Some(state), Some((_, _, Some(total)))) =
+            (self.full_preload.as_ref(), self.stream_window())
+        {
+            state.learn_total(total);
+        }
+        let Some(shared) = self
+            .stream
+            .as_ref()
+            .map(|stream| Arc::clone(&stream.shared))
+        else {
+            return;
+        };
+        let front_cap = usize::try_from(budget.forward_bytes)
+            .unwrap_or(usize::MAX)
+            .max(STREAM_MIN_FRONT_CAP);
+        let back_cap = usize::try_from(budget.back_bytes).unwrap_or(0);
+        lock_stream(&shared).set_caps(front_cap, back_cap);
+    }
+
+    /// 记录 demux 消费推进，维护**实测消费速率**（= 当前档位码率的代理）。
+    ///
+    /// 口径：消费前沿推进量 / 时间，2s 窗口差分 + 0.3/0.7 EMA（与带宽估算同款）。
+    /// 稳态播放时缓冲被背压钳住，demux 只能按播放速度消费，因此这个速率就是
+    /// 当前 ABR 档位的有效码率——正是预算公式要的输入（不需要宿主告诉我们）。
+    ///
+    /// 两个防失真点：① 回拖/重播（消费前沿倒退）只重置窗口、不更新 EMA；
+    /// ② 两次采样间隔超过 `CONSUME_SAMPLE_MAX_GAP`（长暂停 / 长段冷区命中）
+    /// 同样不更新 EMA——否则一次跨分钟的累计消费量会被当成瞬时码率，
+    /// 把预算公式喂成天文数字。
+    fn note_consumed(&mut self, cursor: u64) {
+        let now = Instant::now();
+        if cursor < self.last_consumed_pos {
+            self.last_consumed_pos = cursor;
+            self.consume_window_bytes = 0;
+            self.last_consume_at = now;
+            return;
+        }
+        let delta = cursor - self.last_consumed_pos;
+        self.last_consumed_pos = cursor;
+        let elapsed = now.duration_since(self.last_consume_at);
+        if elapsed < BANDWIDTH_ESTIMATE_WINDOW {
+            self.consume_window_bytes = self.consume_window_bytes.saturating_add(delta);
+            return;
+        }
+        let window = self.consume_window_bytes.saturating_add(delta);
+        if elapsed <= CONSUME_SAMPLE_MAX_GAP && window > 0 {
+            let inst = window as f64 / elapsed.as_secs_f64();
+            let mut bps = if self.consume_bps > 0.0 {
+                self.consume_bps * (1.0 - BANDWIDTH_EMA_NEW) + inst * BANDWIDTH_EMA_NEW
+            } else {
+                inst
+            };
+            if !bps.is_finite() || bps < 1.0 {
+                bps = 0.0; // 与 est_bps 同一套"零供给地板"语义（0 = 未测得）
+            }
+            self.consume_bps = bps;
+        }
+        self.consume_window_bytes = 0;
+        self.last_consume_at = now;
+    }
+
+    /// 冷区（磁盘分层）**零网络**读：先试整段命中，再退化为"能取多少取多少"的
+    /// 前缀命中（跨冷/热边界的读靠它避免一次无谓的网络请求）。
+    ///
+    /// 命中计入 `cold_hits` / `cold_hit_bytes`（既有诊断槽 + 新增字段），
+    /// 宿主 500ms 轮询可见——现场"回拖到底有没有打网络"靠它就够判断。
+    fn read_cold(&self, offset: u64, max: u64) -> Option<Vec<u8>> {
+        let state = self.full_preload.as_ref()?;
+        // 无锁预筛：正常前进播放的读大多在这里就被挡掉（冷区在播放位置之后）。
+        if !state.might_cover(offset) {
+            return None;
+        }
+        if let Some(bytes) = state.read_cached(offset, max) {
+            return Some(bytes);
+        }
+        state.read_available_at(offset, max)
+    }
+
+    /// 长读窗口快照 `(base, write_pos, total)`（诊断用）。
+    fn stream_window(&self) -> Option<(u64, u64, Option<u64>)> {
+        let shared = Arc::clone(&self.stream.as_ref()?.shared);
+        let g = lock_stream(&shared);
+        Some((g.base, g.write_pos(), g.total))
+    }
+
+    /// 诊断发布**节流**：长读路径每读 32KB 都要经过这里，每次都发布会把三个
+    /// 进程级全局锁（`SOURCE_DIAG`/`SOURCE_BW`/`SOURCE_RX`）拉进 demux 热路径
+    /// （~100 次/秒）。500ms 一次足够宿主 500ms 轮询读到新鲜值——但**首次**
+    /// 一定发布（`last_stream_publish_ms` 初值 0），否则宿主在开播后一段
+    /// 时间里读到的是全零快照。
+    fn publish_diag_throttled(&mut self) {
+        let now = now_ms();
+        if now.saturating_sub(self.last_stream_publish_ms) >= STREAM_DIAG_PUBLISH_MS {
+            self.last_stream_publish_ms = now;
+            // 预算跟着诊断一起结算（同一个 500ms 节流）：读窗口容量随实测
+            // 码率/吞吐重新定尺——弱网放宽前向秒数、字节不越内存硬上限。
+            self.refresh_window_budget();
+            self.publish_diag();
+        }
+    }
+
+    /// 组装一次 **seek 出窗的跨节点并行回填**计划（`None` = 不并行，走既有单连接）。
+    ///
+    /// 纯计算 + 从既有候选表取材；**不碰任何状态**（窗口重设由调用点在同一把锁内
+    /// 完成），因此可以单测。
+    ///
+    /// 不并行的情形（每一种都退回改造前的单连接行为，逐字节等价）：
+    ///   - `ERIKA_SEEK_PARALLEL=0`：现场回退开关；
+    ///   - 自适应闸门已因"实测无叠加"关闭（见 `SeekFillDiag::note_gain`）；
+    ///   - 按实测单流通量算出来的条数 < 2（快链路本来就够快，白开连接只涨请求数）；
+    ///   - **候选表里少于 2 个不同 host**：用户要求"宁可慢也不用可疑形态"，而
+    ///     "单节点多连接"正是上游告警点名的形态，所以**直接不做**；
+    ///   - 回填窗口放不下 ≥2 个达标段。
+    fn seek_fill_plan(&self, target: u64, generation: u64, front_cap: u64) -> Option<SeekFillPlan> {
+        if !seek_parallel_enabled() {
+            return None;
+        }
+        let stream = self.stream.as_ref()?;
+        if stream.seek_fill.disabled() {
+            return None;
+        }
+        let per_conn_bps = f64::from_bits(stream.fill_bps.load(Ordering::Relaxed));
+        let bytes = SEEK_PARALLEL_FILL_BYTES.min(front_cap);
+        let wanted = seek_parallel_connections(bytes, per_conn_bps);
+        if wanted < 2 {
+            return None;
+        }
+        let hosts = self.fanout_candidates(wanted);
+        if hosts.len() < 2 {
+            return None;
+        }
+        let segments_count = wanted.min(hosts.len());
+        let per_segment = bytes / segments_count as u64;
+        let mut segments = Vec::with_capacity(segments_count);
+        let mut cursor = target;
+        for (index, (uri, host)) in hosts.into_iter().enumerate() {
+            let length = if index + 1 == segments_count {
+                target.saturating_add(bytes).saturating_sub(cursor)
+            } else {
+                per_segment
+            };
+            if length == 0 {
+                break;
+            }
+            // 首段没有前向重叠可比对（它直接续在窗口前沿上）；其余段各向前多要
+            // [`SEEK_PARALLEL_OVERLAP_BYTES`] 作为与邻段的比对样本——那些字节
+            // **本来就在回填窗口里**（前一段的末尾），所以校验不额外多拉数据。
+            let overlap = if index == 0 {
+                0
+            } else {
+                SEEK_PARALLEL_OVERLAP_BYTES.min(cursor.saturating_sub(target))
+            };
+            segments.push(SeekFillSegment {
+                start: cursor,
+                length,
+                overlap,
+                uri,
+                host,
+            });
+            cursor = cursor.saturating_add(length);
+        }
+        if segments.len() < 2 {
+            return None;
+        }
+        let bytes = cursor.saturating_sub(target);
+        Some(SeekFillPlan {
+            generation,
+            start: target,
+            bytes,
+            segments,
+            per_conn_bps,
+        })
+    }
+
+    /// 取至多 `n` 个**不同 host** 的候选（**活跃 host 优先**），用于跨节点分段。
+    ///
+    /// 为什么活跃 host 必须在里面：段 0 直接续在窗口前沿上，让 demux 先从**已经在
+    /// 用的**那条链路拿到字节；其余节点并行补后面。
+    /// 为什么按 `host_of` 去重：**每个节点只允许一条连接**（见文件上方整段）——
+    /// 同一个 host 出现两次就没有"跨节点"可言了。
+    fn fanout_candidates(&self, n: usize) -> Vec<(String, String)> {
+        let len = self.candidates.len();
+        if len < 2 {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, String)> = Vec::with_capacity(n.min(len));
+        for offset in 0..len {
+            let index = (self.active_idx + offset) % len;
+            let candidate = &self.candidates[index];
+            let host = host_of(&candidate.uri).to_string();
+            if out.iter().any(|(_, seen)| *seen == host) {
+                continue;
+            }
+            out.push((candidate.uri.clone(), host));
+            if out.len() >= n {
+                break;
+            }
+        }
+        out
+    }
+
+    /// 窗口外 seek 的目标提示（由 AVIO seek 钩子 `prefetch_hint` 调用）。
+    ///
+    /// 命中窗口（含后向缓冲）→ 零网络；超过前沿一点点 → 等读线程填上来；
+    /// 真正跳出去 → **重设窗口**：`generation` +1，读线程在下一个 64KB 块边界
+    /// 放弃当前连接、从新起点重发一条 open-ended Range。
+    /// 这就是"一次 seek = 一个请求"的全部实现（旧路径这里是"清空段队列 +
+    /// 重发 2 个预取段"，同样是 1~2 个请求，但那是段模型的产物）。
+    fn stream_seek_hint(&mut self, target: u64) {
+        let Some(shared) = self
+            .stream
+            .as_ref()
+            .map(|stream| Arc::clone(&stream.shared))
+        else {
+            // 长流还没起（尚未开始读）→ 无需提示：首次读会以那时的位置起窗。
+            return;
+        };
+        {
+            let g = lock_stream(&shared);
+            // 窗口内（含后向缓冲）→ 零网络；只领先前沿一点点 → 等读线程填上来。
+            // **回退到窗口之前必须重设**（`target < base` 落不进下面这条），
+            // 那正是 mpv 的行为：回退超出后向缓冲就得重新请求。
+            if target >= g.base
+                && target <= g.write_pos().saturating_add(STREAM_FORWARD_SLACK_BYTES)
+            {
+                return;
+            }
+        }
+        // ② **统一缓存视图的第二个持有者**：冷区（磁盘分层）。目标落在冷区里
+        //    → 同样零网络，**绝不重设窗口、绝不重发请求**（缺陷 ⑤ 的核心断言：
+        //    回拖到已缓冲/已落盘的区域必须 0 个新请求）。同时给冷区线程发一次
+        //    **预读**：用户还在拖、demux 还没读到这里，这段时间足够把目标附近
+        //    读进页缓存，真播到时是页缓存命中而不是裸盘随机读。
+        if let Some(state) = self.full_preload.as_ref()
+            && state.covers_at(target)
+        {
+            state.request_warm(target);
+            http_trace_log(format!(
+                "{{\"event\":\"http_stream_seek_cold_hit\",\"target\":{},\"cold_bytes\":{}}}",
+                target,
+                state.cold_bytes(),
+            ));
+            return;
+        }
+        // 防抖：`av_seek_frame` 内部可能对相近位置多次 seek，同一窗口不重复重设。
+        // **只对前向提示防抖**（`target >= prev`）：回退提示必须生效，否则一次
+        // "跳到 30 分钟再拖回 5 分钟"会被上一条前向提示吞掉，读路径随即在窗口外
+        // 重新重设——白多一个请求，还多绕一圈。
+        if let Some(prev) = self.prefetch_target
+            && target >= prev
+            && target < prev.saturating_add(Self::SEEK_PREFETCH_SEGMENT_BYTES)
+        {
+            return;
+        }
+        self.prefetch_target = Some(target);
+        http_trace_log(format!(
+            "{{\"event\":\"http_stream_seek_hint\",\"target\":{}}}",
+            target,
+        ));
+        // 窗口重设 + **跨节点并行回填计划**（同一把锁内完成，两者不会交错：
+        // 读线程要么看到"新代数 + 新计划"，要么什么都没看到）。
+        // 计划里的每一段来自**不同候选 host**，每 host 一条连接；候选不足时
+        // `seek_fill_plan` 返回 None，行为与改造前逐字节相同。
+        let plan = {
+            let mut g = lock_stream(&shared);
+            let generation = g.generation.wrapping_add(1); // reset 之后的代数
+            let front_cap = g.front_cap as u64;
+            let plan = self.seek_fill_plan(target, generation, front_cap);
+            g.reset(target);
+            g.fill_plan = plan.clone();
+            plan
+        };
+        if let Some(plan) = plan.as_ref() {
+            http_trace_log(format!(
+                "{{\"event\":\"http_stream_seek_parallel_planned\",\"target\":{},\"bytes\":{},\"segments\":{},\"per_conn_bps\":{:.0},\"hosts\":\"{}\"}}",
+                plan.start,
+                plan.bytes,
+                plan.segments.len(),
+                plan.per_conn_bps,
+                plan.segments
+                    .iter()
+                    .map(|segment| segment.host.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
+        }
+    }
+
+    /// **顺序长读的读路径**：窗口命中直接返回（零网络），窗口外重设（+1 请求），
+    /// 其余情况等读线程把字节填上来。
+    ///
+    /// - 完整命中 → 拷贝返回，并 `consume_to` 推进前向缓冲（**这一步必须做**：
+    ///   `front_len` 是读线程唯一的节流依据，忘记推进会永久停读）。
+    /// - 等不到字节 → 返回 [`SourceError::Transient`]，外层
+    ///   [`HttpRangeSource::read_range_with_transient_wait`] 照旧消化（等待窗口
+    ///   语义、`transient_wait` 诊断、换 host 全部不变）。
+    /// - 文件尾（`eof`）→ 返回空 Vec（AVIO 层据此判 EOF），与旧路径一致。
+    /// - `range.length == None`（"读到文件尾"：弹幕/字幕这类 sidecar）→ 累积到 EOF。
+    fn read_range_stream(&mut self, range: ByteRange) -> Result<Vec<u8>> {
+        self.ensure_stream(range.start);
+        let Some(shared) = self
+            .stream
+            .as_ref()
+            .map(|stream| Arc::clone(&stream.shared))
+        else {
+            return Err(SourceError::Unsupported(
+                "sequential stream is not enabled".to_string(),
+            ));
+        };
+        let front_cap = lock_stream(&shared).front_cap as u64;
+        // 0 长度请求：直接返回空。下面 `want` 会把长度钳到 ≥1（"等一个字节"的
+        // 语义需要它），因此必须在钳之前拦掉 0——否则 0 长度读会返回 1 个字节。
+        if range.length == Some(0) {
+            return Ok(Vec::new());
+        }
+        let deadline = Instant::now() + HTTP_FETCH_TOTAL_BUDGET;
+        let mut out: Vec<u8> = Vec::new();
+        let mut cursor = range.start;
+        loop {
+            // 单次请求的读取量不超过前向窗口容量（否则永远填不满 —— 那是
+            // "窗口外"的语义，由下面的重设分支处理）。
+            let want = match range.length {
+                Some(length) => length.clamp(1, front_cap.max(1)),
+                None => front_cap.max(1),
+            };
+            // ① 冷区优先（**磁盘分层**）：热区之前的已下好区间从这里零网络读回，
+            //    包含跨越冷/热边界的读（拿到冷区能给的字节就返回，上层按短读续）。
+            //    必须在这里拦——下面的 `cursor < g.base` 会把"回拖的读"判成
+            //    "seek 出窗"并重设窗口（= 重发请求），那正是缺陷 ⑤ 要消灭的行为。
+            if let Some(bytes) = self.read_cold(cursor, want) {
+                if range.length.is_none() {
+                    cursor = cursor.saturating_add(bytes.len() as u64);
+                    out.extend_from_slice(&bytes);
+                    self.note_consumed(cursor);
+                    self.publish_diag_throttled();
+                    continue;
+                }
+                self.note_consumed(cursor.saturating_add(bytes.len() as u64));
+                trace_read_return("http_stream_read_cold", range, self, &bytes);
+                self.publish_diag_throttled();
+                return Ok(bytes);
+            }
+            {
+                let mut g = lock_stream(&shared);
+                g.consume_to(cursor);
+                let fill = g.write_pos();
+                if cursor < g.base || cursor > fill.saturating_add(STREAM_FORWARD_SLACK_BYTES) {
+                    // 窗口外的随机读 = seek 语义。正常顺序播放**不会**走到这里。
+                    http_trace_log(format!(
+                        "{{\"event\":\"http_stream_seek\",\"start\":{},\"base\":{},\"fill\":{}}}",
+                        cursor, g.base, fill,
+                    ));
+                    g.reset(cursor);
+                }
+                if range.length.is_some() {
+                    if let Some(bytes) = g.read(cursor, want) {
+                        g.consume_to(cursor.saturating_add(bytes.len() as u64));
+                        drop(g);
+                        // 消费速率（= 当前档位码率的实测代理）：预算公式的输入，
+                        // 见文件上方"滑动窗口预算"整段。
+                        self.note_consumed(cursor.saturating_add(bytes.len() as u64));
+                        trace_read_return("http_stream_read", range, self, &bytes);
+                        // 节流发布：宿主 500ms 轮询要能看到新鲜窗口/请求数，
+                        // 但每次 32KB 读都发布会把全局锁拖进热路径。
+                        self.publish_diag_throttled();
+                        return Ok(bytes);
+                    }
+                    if g.eof {
+                        // 文件尾：给出 cursor 处可得的前缀（可能为空 → 上层按 EOF 处理）。
+                        let tail = g
+                            .read_available(cursor, usize::try_from(want).unwrap_or(usize::MAX))
+                            .unwrap_or_default();
+                        drop(g);
+                        trace_read_return("http_stream_read_eof", range, self, &tail);
+                        self.publish_diag_throttled();
+                        return Ok(tail);
+                    }
+                } else {
+                    // 读到文件尾：把当前窗口里 cursor 之后的字节全部取走。
+                    if let Some(bytes) =
+                        g.read_available(cursor, usize::try_from(want).unwrap_or(usize::MAX))
+                    {
+                        cursor = cursor.saturating_add(bytes.len() as u64);
+                        out.extend_from_slice(&bytes);
+                    }
+                    if g.eof && g.write_pos() <= cursor {
+                        drop(g);
+                        return Ok(out);
+                    }
+                }
+                if let Some(error) = g.error.take() {
+                    return Err(SourceError::Http(error));
+                }
+            }
+            if Instant::now() >= deadline {
+                // 20s 拿不到完整请求 → 交回外层等待窗口（语义与旧路径的总预算一致）。
+                return Err(SourceError::Transient(format!(
+                    "sequential stream stalled at {cursor} for {:?}",
+                    HTTP_FETCH_TOTAL_BUDGET
+                )));
+            }
+            {
+                // 分片等待（250ms）：等新字节、期间仍能换 host / 刷新诊断。
+                let guard = lock_stream(&shared);
+                let (guard, _timeout) = shared
+                    .data_cv
+                    .wait_timeout(guard, STREAM_WAIT_SLICE)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // **必须显式 drop**：下一轮循环要重新加锁，非递归 Mutex 重入
+                // 会自死锁（本文件历史上踩过的同类陷阱）。
+                drop(guard);
+            }
+            self.maybe_switch_host();
+            // 仍在等数据 = demux 仍在消费（"在播且饿着"）：刷新活跃时间戳，
+            // 否则一次挂在等待循环里的读调用会随时间"过期"，把真饥饿误判成暂停
+            // （真机现象：`vstall=16s→21s`，判据却一直 Hold 不动）。
+            self.last_read_call_ms = now_ms();
+            if let Some(state) = self.full_preload.as_ref() {
+                // 仍在消费 → 让桶继续让路（把带宽留给这条长流）。
+                state.mark_demux_read();
+                if let Some((_, fill, _)) = self.stream_window() {
+                    state.set_floor(fill);
+                }
+            }
+            self.publish_diag_throttled();
+        }
     }
 
     /// 累计已下载字节进带宽估算窗口；跨 2s 差分做 EMA 更新。
@@ -2200,19 +6913,98 @@ impl HttpRangeSource {
     /// 把当前网络/缓冲状态发布到自己的诊断槽（宿主 UI 轮询读取）。
     /// DASH 双流（video=0/audio=1）各发布各的，互不覆盖。
     fn publish_diag(&mut self) {
+        let snapshot = self.diag_snapshot();
+        if let Ok(mut slots) = SOURCE_DIAG.lock() {
+            if let Some(slot) = slots.get_mut(self.diag_slot) {
+                *slot = snapshot;
+            }
+        }
+    }
+
+    /// 构造本槽的诊断快照（`publish_diag` 负责把它写进全局槽）。
+    ///
+    /// 拆出来的理由：单测要断言字段语义，而全局槽是**进程级共享**的——并行
+    /// 用例互相覆盖会让断言随机失败（本文件多处注释记录过这个坑）。本方法
+    /// 直接返回快照，断言不碰共享状态。
+    fn diag_snapshot(&mut self) -> SourceDiagSnapshot {
         // 多源无缝换 host：诊断刷新时顺带判定死连/慢速并切到下一候选。
         self.maybe_switch_host();
-        // 合并桶数据：缓存窗口前沿 = max(demux 端 cache_end, 桶 covered_until)。
+        // 顺序长读的窗口优先：新模型下 demux 侧的真实窗口就是 `StreamBuffer`
+        // （`base..write_pos`），前向深度由读线程的背压维持在 read_ahead 左右。
+        // 旧字段 `cache_start`/`cache_bytes` 在长读路径下恒为空，不能再用它们
+        // 算窗口，否则宿主读到的是"缓存恒 0"（策略层会立刻判饥饿）。
+        let (demux_start, demux_end, stream_in_flight, whole_file_cached) =
+            match self.stream.as_ref() {
+                Some(stream) => {
+                    let (base, write_pos, total) = {
+                        let g = lock_stream(&stream.shared);
+                        (g.base, g.write_pos(), g.total)
+                    };
+                    (
+                        base,
+                        write_pos,
+                        stream.in_flight.load(Ordering::Relaxed) as usize,
+                        // **「不需要再下载了」的权威判据**：网络填充前沿已经到达
+                        // 服务端声明的文件终点。此后 `write_pos` 不再前进、
+                        // 「距上次收到字节」必然一路涨——那是预期，不是死连。
+                        // 只认长读窗口自己的 `write_pos`：桶的 `covered_until`
+                        // 只增不减且 seek 后仍停旧前沿，判不了这件事。
+                        total.is_some_and(|total| total > 0 && write_pos >= total),
+                    )
+                }
+                None => {
+                    let end = self.cache_end();
+                    (
+                        self.cache_start,
+                        end,
+                        0,
+                        self.content_length
+                            .is_some_and(|total| total > 0 && end >= total),
+                    )
+                }
+            };
+        // 长读路径下 total 由首个 206 的 Content-Range 回填：把它并进
+        // `content_length`，`len()` 就不必再发一个 HEAD（旧路径同样由首个
+        // 206 回填，语义一致）。
+        if self.content_length.is_none() {
+            if let Some((_, _, Some(total))) = self.stream_window() {
+                self.content_length = Some(total);
+            }
+        }
+        // 长读重连计数变化 → trace 一条。这是现场核对"这次播放到底发了几个
+        // 请求、以及**为什么**发的"的直接证据：正常顺序播放期间它应当为 0。
+        let reconnect_counters = self
+            .stream
+            .as_ref()
+            .map(|stream| Arc::clone(&stream.reconnects));
+        let reconnect_count = reconnect_counters.as_ref().map(|counters| counters.total());
+        if let (Some(reconnects), Some(count)) = (reconnect_counters.as_ref(), reconnect_count) {
+            if count != self.stream_reconnects_seen {
+                self.stream_reconnects_seen = count;
+                http_trace_log(format!(
+                    "{{\"event\":\"http_stream_reconnect\",\"slot\":{},\"count\":{},\"early_close\":{},\"empty\":{},\"reset\":{},\"host_switch\":{},\"chunked\":{},\"fill\":{}}}",
+                    self.diag_slot,
+                    count,
+                    reconnects.get(ReconnectCause::EarlyClose),
+                    reconnects.get(ReconnectCause::Empty),
+                    reconnects.get(ReconnectCause::Reset),
+                    reconnects.get(ReconnectCause::HostSwitch),
+                    reconnects.get(ReconnectCause::PlannedChunk),
+                    demux_end,
+                ));
+            }
+        }
+        // 合并桶数据：缓存窗口前沿 = max(demux 端前沿, 桶 covered_until)。
         // 用户定规的核心表征——「缓冲百分比」「下载速度」—都通过这两个字段
         // 反映：桶独立于 demux 推进，pause 后桶仍覆盖到更前方，诊断面板如实
         // 显示「缓冲 80% 仍在涨」。
         let cache_end = match self.full_preload.as_ref() {
-            Some(p) => self.cache_end().max(p.covered_until()),
-            None => self.cache_end(),
+            Some(p) => demux_end.max(p.covered_until()),
+            None => demux_end,
         };
         let prefetch_in_flight = match self.full_preload.as_ref() {
-            Some(p) => self.prefetch.len() + p.in_flight_segments() as usize,
-            None => self.prefetch.len(),
+            Some(p) => self.prefetch.len() + stream_in_flight + p.in_flight_segments() as usize,
+            None => self.prefetch.len() + stream_in_flight,
         };
         // 供给信号一律走**实时**口径：取本槽登记的全部计数器之和（源自身 rx +
         // 整片预载桶），而不是「段完成才累加」的 `self.downloaded_bytes`。
@@ -2222,24 +7014,151 @@ impl HttpRangeSource {
         self.est_bps = refresh_bandwidth(self.diag_slot, downloaded_bytes);
         let uri_guard = self.uri.lock().expect("uri poisoned");
         let active_host = host_of(&uri_guard);
-        if let Ok(mut slots) = SOURCE_DIAG.lock() {
-            if let Some(slot) = slots.get_mut(self.diag_slot) {
-                *slot = SourceDiagSnapshot {
-                    content_length: self.content_length,
-                    cache_start: self.cache_start,
-                    cache_end,
-                    prefetch_in_flight,
-                    downloaded_bytes,
-                    est_bps: self.est_bps,
-                    active_host: active_host.to_string(),
-                    active_idx: self.active_idx,
-                    candidate_count: self.candidates.len(),
-                    // demux 自身窗口终点（不含桶）：宿主策略算真实缓冲秒用
-                    demux_cache_end: self.cache_end(),
-                    host_epoch: self.host_epoch,
-                };
-            }
+        // HTTP 请求画像：进程级单调计数，这里只做快照回填（真正的新鲜值由宿主
+        // 轮询时的 `source_diag_snapshot_slot` 直接读计数器给出，见那里的注释）。
+        let (http_requests, http_request_bytes) = match http_request_profile(self.diag_slot) {
+            Some(profile) => (
+                profile.requests.load(Ordering::Relaxed),
+                profile.bytes.load(Ordering::Relaxed),
+            ),
+            None => (0, 0),
+        };
+        let mut snapshot = SourceDiagSnapshot {
+            content_length: self.content_length,
+            cache_start: demux_start,
+            cache_end,
+            prefetch_in_flight,
+            downloaded_bytes,
+            est_bps: self.est_bps,
+            active_host: active_host.to_string(),
+            active_idx: self.active_idx,
+            candidate_count: self.candidates.len(),
+            // demux 自身窗口终点（不含桶）：宿主策略算真实缓冲秒用
+            demux_cache_end: demux_end,
+            // 「本片已完整缓冲」：宿主用它把"不需要下载"从"链路死了"里分出来。
+            whole_file_cached,
+            host_epoch: self.host_epoch,
+            transient_wait: self.transient_wait,
+            http_requests,
+            http_request_bytes,
+            // ---- 滑动窗口分层缓存（口径见 `SourceDiagSnapshot` 各字段注释）----
+            // 内存层 = 热区窗口实实在在躺着的字节；旧分段路径下是 demux 自己的
+            // 缓存窗口（两条路径都如实反映"内存里现在有多少"）。
+            cache_memory_bytes: match self.stream.as_ref() {
+                Some(stream) => lock_stream(&stream.shared).resident_bytes(),
+                None => self.cache_bytes.len() as u64,
+            },
+            cache_disk_bytes: self
+                .full_preload
+                .as_ref()
+                .map(|state| state.cold_bytes())
+                .unwrap_or(0),
+            cold_hits: self
+                .full_preload
+                .as_ref()
+                .map(|state| state.cold_hit_count())
+                .unwrap_or(0),
+            cold_hit_bytes: self
+                .full_preload
+                .as_ref()
+                .map(|state| state.cold_hit_total_bytes())
+                .unwrap_or(0),
+            memory_budget_bytes: self.window.memory_bytes,
+            forward_budget_bytes: self.window.forward_bytes,
+            // 前向可播秒数 = 已填的前向字节 ÷ 实测码率。码率未知（冷启动）时为 0：
+            // 不猜数字，宿主按 0 处理即可（既有策略对本字段是新增读取）。
+            forward_playable_secs: match (self.stream.as_ref(), self.window.bitrate_bps) {
+                (Some(stream), bitrate) if bitrate > 0.0 => {
+                    let front = {
+                        let g = lock_stream(&stream.shared);
+                        g.front_len() as f64
+                    };
+                    front / bitrate
+                }
+                _ => 0.0,
+            },
+            fill_throughput_bps: match self.stream.as_ref() {
+                Some(stream) => f64::from_bits(stream.fill_bps.load(Ordering::Relaxed)),
+                None => load_fill_bps(self.diag_slot),
+            },
+            // 连接重建按原因分桶：宿主/现场据此判"是不是我们的锅"，见字段注释。
+            stream_reconnects_total: reconnect_count.unwrap_or(0),
+            stream_reconnects_early_close: reconnect_counters
+                .as_ref()
+                .map(|counters| counters.get(ReconnectCause::EarlyClose))
+                .unwrap_or(0),
+            stream_reconnects_empty: reconnect_counters
+                .as_ref()
+                .map(|counters| counters.get(ReconnectCause::Empty))
+                .unwrap_or(0),
+            stream_reconnects_reset: reconnect_counters
+                .as_ref()
+                .map(|counters| counters.get(ReconnectCause::Reset))
+                .unwrap_or(0),
+            stream_reconnects_host_switch: reconnect_counters
+                .as_ref()
+                .map(|counters| counters.get(ReconnectCause::HostSwitch))
+                .unwrap_or(0),
+            stream_chunk_resumes: reconnect_counters
+                .as_ref()
+                .map(|counters| counters.get(ReconnectCause::PlannedChunk))
+                .unwrap_or(0),
+            // 判决实验：请求起点序列的形态分桶（断点续传 vs demux 跳读）。
+            stream_range_contiguous: self
+                .stream
+                .as_ref()
+                .map(|stream| stream.journal.contiguous.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            stream_range_forward_jumps: self
+                .stream
+                .as_ref()
+                .map(|stream| stream.journal.forward_jump.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            stream_range_backward_jumps: self
+                .stream
+                .as_ref()
+                .map(|stream| stream.journal.backward_jump.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            stream_range_last_start: self
+                .stream
+                .as_ref()
+                .map(|stream| stream.journal.last_start.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            stream_last_connection_bytes: reconnect_counters
+                .as_ref()
+                .map(|counters| counters.last_connection_bytes())
+                .unwrap_or(0),
+            stream_max_connection_bytes: reconnect_counters
+                .as_ref()
+                .map(|counters| counters.max_connection_bytes())
+                .unwrap_or(0),
+            // 换源可读原因（面板直接显示，见 `last_switch_reason` 注释）。
+            last_host_switch_reason: self.last_switch_reason.clone(),
+            // ---- seek 出窗的跨节点并行回填 ----
+            // 先落默认（旧分段路径没有长流窗口，也就没有这条统计），有长读路径
+            // 时再让 `SeekFillDiag` 自己把真实计数写进来。
+            seek_fill_batches: 0,
+            seek_fill_connections: 0,
+            seek_fill_bytes: 0,
+            seek_fill_gate_denied: 0,
+            seek_fill_fallbacks: 0,
+            seek_fill_overlap_ok: 0,
+            seek_fill_overlap_mismatch: 0,
+            seek_fill_last_segments: 0,
+            seek_fill_in_flight: 0,
+            seek_fill_last_bytes: 0,
+            seek_fill_last_ms: 0,
+            seek_fill_last_expected_ms: 0,
+            seek_fill_last_fallback: false,
+            seek_fill_last_gate_reason: String::new(),
+            seek_fill_disabled: false,
+        };
+        if let Some(stream) = self.stream.as_ref() {
+            stream.seek_fill.fill_snapshot(&mut snapshot);
+            // "现在有几条分段连接在飞"——用户要的"用了几条连接"当场可读。
+            snapshot.seek_fill_in_flight = stream.seek_fill_quota.load(Ordering::Relaxed) as u64;
         }
+        snapshot
     }
 
     fn cached_slice(&self, range: ByteRange) -> Option<Vec<u8>> {
@@ -2279,6 +7198,7 @@ impl HttpRangeSource {
             // 同步 fetch 同样实时计数：demux 正等这段数据时，宿主 poll 能看出
             // 它到底是在下（慢）还是根本没在下（挂死）。
             Some(self.rx.as_ref()),
+            http_request_profile(self.diag_slot),
         )?;
         if self.content_length.is_none() {
             self.content_length = response.total_length;
@@ -2619,17 +7539,31 @@ impl HttpRangeSource {
                 prefetch_range,
                 self.rx.clone(),
                 self.host_epoch,
+                // 预取线程是独立 `std::thread`，拿不到 `self.diag_slot`——
+                // 必须在 spawn 时把它传进去，否则预取请求的计数会丢（预取
+                // 正是 1080P 播放中的主要请求来源）。
+                self.diag_slot,
             ));
             self.publish_diag();
             cursor = cursor.saturating_add(len);
         }
     }
 
-    /// 窗口外 seek 的目标预取提示（由 AVIO seek 钩子调用）。target 超出
-    /// 已缓存窗口时，清掉旧窗口的顺序预取段，从 target 前一个小段起用 2MB
-    /// 小段并行拉目标窗口——seek 后 demux 第一次 read 命中这些小段并 join，
-    /// 从"同步单请求抓大段（可卡 60s）"降为"join 2MB 小段（约 1s 就绪）"。
+    /// 窗口外 seek 的目标预取提示（由 AVIO seek 钩子调用）。
+    ///
+    /// **顺序长读启用时走 `stream_seek_hint`**（见其注释：命中窗口零网络，否则
+    /// 重设窗口让读线程重发**一条** open-ended Range），本函数以下部分只服务
+    /// 旧的分段路径：target 超出已缓存窗口时，清掉旧窗口的顺序预取段，从
+    /// target 前一个小段起用小段并行拉目标窗口——seek 后 demux 第一次 read
+    /// 命中这些小段并 join，从"同步单请求抓大段（可卡 60s）"降为"join 小段
+    /// （约 1s 就绪）"。
     fn prefetch_hint(&mut self, target: u64) {
+        // 顺序长读：命中窗口零网络；窗口外重设窗口（读线程重发一条连接）。
+        // 见 `stream_seek_hint`——这是"seek 后仍然只 +1 个请求"的实现处。
+        if self.sequential_enabled {
+            self.stream_seek_hint(target);
+            return;
+        }
         let Some(total) = self.content_length else {
             return;
         };
@@ -2678,6 +7612,9 @@ impl PendingHttpFetch {
         range: ByteRange,
         progress: Arc<AtomicU64>,
         host_epoch: u64,
+        // 源诊断槽：预取线程要把本段请求记进对应槽的 HTTP 请求画像
+        //（`fetch_http_range` 的第 7 参）。线程闭包捕获不到源实例，故传入。
+        diag_slot: usize,
     ) -> Self {
         http_trace_log(format!(
             "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{}}}",
@@ -2698,6 +7635,7 @@ impl PendingHttpFetch {
                 range,
                 "http_prefetch_range",
                 Some(progress.as_ref()),
+                http_request_profile(diag_slot),
             );
             let _ = sender.send(result);
         });
@@ -2736,6 +7674,20 @@ impl Drop for HttpRangeSource {
             }
         };
         unregister(&self.rx);
+        // —— 顺序长读线程：置 stop → 唤醒等待 → **有界等待**它退出 ——
+        //
+        // 不能用裸 `join()`：读线程可能正阻塞在 socket `read()` 上（服务端挂死，
+        // 而长读 agent 故意没有 body 总时长超时），join 会把 UI 线程钉在关窗动作
+        // 上——正是用户最忌讳的"关窗卡死"。有界等待（500ms）超时即 detach：
+        // 线程持有的全是 `Arc`（不借用源实例），它会在下一个 stop 检查点自行退出，
+        // 句柄丢弃不构成 use-after-free（detached 线程不引用任何源内存）。
+        if let Some(stream) = self.stream.take() {
+            unregister(&stream.arrived);
+            stream.stop.store(true, Ordering::Relaxed);
+            stream.shared.data_cv.notify_all();
+            let _ = stream.done.recv_timeout(STREAM_STOP_JOIN_TIMEOUT);
+            drop(stream.handle);
+        }
         if let Some(state) = self.full_preload.take() {
             unregister(&state.downloaded);
             state.stop();
@@ -2745,7 +7697,9 @@ impl Drop for HttpRangeSource {
         if self.diag_slot == 1 {
             AUDIO_FIRST.enabled.store(false, Ordering::Relaxed);
             AUDIO_FIRST.audio_permille.store(0, Ordering::Relaxed);
-            AUDIO_FIRST.audio_total_known.store(false, Ordering::Relaxed);
+            AUDIO_FIRST
+                .audio_total_known
+                .store(false, Ordering::Relaxed);
         }
         if let Some(handle) = self.preload_thread.take() {
             drop(handle); // 线程已在 stop 后自退，drop 句柄不阻塞（detached）。
@@ -2765,6 +7719,9 @@ impl Drop for HttpRangeSource {
                 *entry = None;
             }
         }
+        // 填窗期吞吐同理清零：宿主读到 0 = "本槽没有在跑的流"，而不是上一个
+        // 源留下的旧链路值（那会让新源一开播就被判成"链路很好"）。
+        store_fill_bps(self.diag_slot, 0.0);
     }
 }
 
@@ -2840,6 +7797,16 @@ impl HttpLiveStreamSource {
     }
 
     fn publish_diag(&self) {
+        // 直播流走长连接顺序读，**不发 Range 请求**（不经 `fetch_http_range`），
+        // 故这里如实上报槽 0 的进程级请求画像累计值：直播期间它不再增长，
+        // 宿主差分为 0，正是"当前这条流没有 Range 请求"的正确表述。
+        let (http_requests, http_request_bytes) = match http_request_profile(0) {
+            Some(profile) => (
+                profile.requests.load(Ordering::Relaxed),
+                profile.bytes.load(Ordering::Relaxed),
+            ),
+            None => (0, 0),
+        };
         if let Ok(mut slots) = SOURCE_DIAG.lock() {
             if let Some(slot) = slots.get_mut(0) {
                 *slot = SourceDiagSnapshot {
@@ -2854,6 +7821,55 @@ impl HttpLiveStreamSource {
                     candidate_count: 0,
                     demux_cache_end: self.offset,
                     host_epoch: 0,
+                    // 直播流**没有"整片缓冲完"这个状态**（无总长、持续追加）：
+                    // 恒 false 是正确语义，宿主不会把直播的停滞读成"下完了"。
+                    whole_file_cached: false,
+                    // 直播源走 `HttpLiveStreamSource`（无 body 总时长 deadline、
+                    // 读阻塞即等待），不经过点播的「暂时读不到」等待窗口。
+                    transient_wait: false,
+                    http_requests,
+                    http_request_bytes,
+                    // 直播流没有滑动窗口分层（不可 seek、无缓存区间可言）：
+                    // 内存层报当前已读字节在前面的缓冲，冷区恒 0。
+                    cache_memory_bytes: 0,
+                    cache_disk_bytes: 0,
+                    cold_hits: 0,
+                    cold_hit_bytes: 0,
+                    memory_budget_bytes: 0,
+                    forward_budget_bytes: 0,
+                    forward_playable_secs: 0.0,
+                    fill_throughput_bps: 0.0,
+                    stream_reconnects_total: 0,
+                    stream_reconnects_early_close: 0,
+                    stream_reconnects_empty: 0,
+                    stream_reconnects_reset: 0,
+                    stream_reconnects_host_switch: 0,
+                    stream_chunk_resumes: 0,
+                    stream_range_contiguous: 0,
+                    stream_range_forward_jumps: 0,
+                    stream_range_backward_jumps: 0,
+                    stream_range_last_start: 0,
+                    stream_last_connection_bytes: 0,
+                    stream_max_connection_bytes: 0,
+                    last_host_switch_reason: String::new(),
+                    // 直播没有"seek 到未缓冲位置"这个概念（不可 seek、无窗口），
+                    // 跨节点并行回填对它不适用：全 0 是正确语义，宿主不会把直播
+                    // 读成"走过并行分段"。
+                    seek_fill_batches: 0,
+                    seek_fill_connections: 0,
+                    seek_fill_bytes: 0,
+                    seek_fill_gate_denied: 0,
+                    seek_fill_fallbacks: 0,
+                    seek_fill_overlap_ok: 0,
+                    seek_fill_overlap_mismatch: 0,
+                    seek_fill_last_segments: 0,
+                    seek_fill_in_flight: 0,
+                    seek_fill_last_bytes: 0,
+                    seek_fill_last_ms: 0,
+                    seek_fill_last_expected_ms: 0,
+                    seek_fill_last_fallback: false,
+                    seek_fill_last_gate_reason: String::new(),
+                    seek_fill_disabled: false,
                 };
             }
         }
@@ -3006,6 +8022,71 @@ fn http_error_is_retryable(error: &ureq::Error) -> bool {
     }
 }
 
+/// 重试预算用尽后，把一次 HTTP 交换失败归类成「暂时性」还是「终局」。
+///
+/// 分类沿用 [`http_error_is_retryable`]：传输层错误（连接被复位 / 半开连接超时 /
+/// DNS-TLS 抖动）与 5xx 属于链路问题，源很可能马上又能用 → [`SourceError::Transient`]，
+/// 由 [`HttpRangeSource::read_range_with_transient_wait`] 吸收并等待；
+/// 4xx（403 签名过期 / 404 分片不存在）是确定性的，重试无意义 → [`SourceError::Http`]，
+/// 立即上抛让宿主换源。
+fn http_failure_after_retries(error: &ureq::Error) -> SourceError {
+    let message = error.to_string();
+    if http_error_is_retryable(error) {
+        SourceError::Transient(message)
+    } else {
+        SourceError::Http(message)
+    }
+}
+
+/// 「暂时性读取失败」的等待窗口（mpv `paused-for-cache` 等价）：字节完全停止
+/// 到达并持续这么久，才放弃并让宿主换源。
+///
+/// 12s 的取值理由（与宿主策略层分级错开，见 bili-rs `src/playback/policy.rs`）：
+/// 内核 `MULTI_HOST_STALL_MS`(6s) 会先零缓存丢失地自发换一轮 host；宿主双流
+/// 对照判据 9s 再强制换一轮；宿主「位置冻结 20s + 供给≈0」才整流重开。12s
+/// 落在 9s 与 20s 之间——给两级换 host 都留出机会，又在宿主重开之前收手，
+/// 避免"内核已判死 + 宿主又重开"的双重重开。
+const HTTP_TRANSIENT_GRACE: Duration = Duration::from_secs(12);
+/// 等待窗口的**硬上限**：字节虽在来但总量长期不达标（例如 1 字节/秒的涓流、
+/// 或永远只回一个字节段）时，不能把 demux 线程永久钉在等待里——超过即放弃，
+/// 让宿主换源。30s 远大于正常 CDN 抖动，不影响"读慢但推进"的正常等待。
+const HTTP_TRANSIENT_ABS_MAX: Duration = Duration::from_secs(30);
+/// 等待分片：每次重试间隔。300ms 足以让 URLE 连接池里的坏连接被换掉，
+/// 又不会把 demux 线程的 CPU 打满（每次重试都是一次真实 HTTP 往返）。
+const HTTP_TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+/// 一次暂时性失败之后是否继续等待（而不是把整条流判死）。
+///
+/// `stalled`：距上次「有字节到达」的时长（本函数只按字节判定，不看错误次数）；
+/// `elapsed`：本次读的总时长。返回 false 的两个出口：
+/// ① 字节停够 `grace`（真死）；② 总等待超过 `abs_max`（防涓流钉死）。
+fn transient_wait_should_continue(
+    stalled: Duration,
+    elapsed: Duration,
+    grace: Duration,
+    abs_max: Duration,
+) -> bool {
+    elapsed < abs_max && stalled < grace
+}
+
+/// 等待窗口时长（字节完全不动时的容忍度）。默认 [`HTTP_TRANSIENT_GRACE`]，
+/// `ERIKA_HTTP_TRANSIENT_GRACE_MS` 可覆盖（**设 0 = 关闭等待**，回到"一次读
+/// 失败就报错"的旧行为，供排查对照）。上限钳到
+/// [`HTTP_TRANSIENT_ABS_MAX`] 之内，保证硬上限出口始终可达。
+fn transient_grace() -> Duration {
+    static GRACE: OnceLock<Duration> = OnceLock::new();
+    *GRACE.get_or_init(|| {
+        // 只读一次：本函数在 demux 线程的每次失败重试里被调用，反复 getenv
+        // 会取全局环境锁（其他线程 set_var 时更明显）。
+        env::var("ERIKA_HTTP_TRANSIENT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(HTTP_TRANSIENT_GRACE)
+            .min(HTTP_TRANSIENT_ABS_MAX)
+    })
+}
+
 /// Parses the `total` out of a `Content-Range: bytes start-end/total` header.
 /// Returns `None` for missing headers, unsatisfied-range (`*/total` still
 /// yields the total), and unknown totals (`bytes 0-1/*`).
@@ -3037,6 +8118,20 @@ fn response_entity_validator<T>(response: &ureq::http::Response<T>) -> Option<St
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+/// 取响应头原文（`None` = 头不存在 / 空 / 非 UTF-8）。
+///
+/// 只负责**如实回报**，不做任何解释——跨节点一致性怎么判由 `seek_fill_gate`
+/// 集中决定（内核里只允许有一处判据，避免"两套说法互相打架"）。
+fn response_header_value<T>(response: &ureq::http::Response<T>, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// Learns the total length from a one-byte GET, for origins that reject HEAD.
@@ -3118,9 +8213,19 @@ fn http_range_header(range: ByteRange) -> String {
 /// 下每 1.3s 就有一次进度可见，诊断不会"长时间不动"。
 const HTTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
 
+/// **一个 Range 请求换一段字节**（旧分段路径；顺序长读用
+/// [`open_sequential_response`]，它只建连接、把 body 留给调用方持续读）。
+///
 /// `progress`：实时进度计数器（可选）。**不为 None 时**，body 每读到一块就
 /// `fetch_add` 一次，使 `downloaded_bytes` 在段传输期间持续增长——慢网下
 /// 「正在缓慢下载」不再被宿主差分读成 0（换源/降档误判的根因）。
+///
+/// `profile`：**HTTP 请求画像**的两个进程级单调计数器（可选，见
+/// [`SourceDiagSnapshot::http_requests`]）。计数点在本函数内部、**唯一真正
+/// 发请求的那一处**（重试循环里的 `request.call()` 之前）——所以重试与断点
+/// 续传发出的每一个请求都会各记 1；放在调用点计数则会把重试合并掉。
+/// 三个调用点（顺序预取线程 / 同步 fetch / 整片预载桶）各自把 `diag_slot`
+/// 或桶的 `slot` 传进来：预取线程是独立 `std::thread`，捕获不到源实例。
 fn fetch_http_range(
     agent: &ureq::Agent,
     uri: &str,
@@ -3128,6 +8233,7 @@ fn fetch_http_range(
     range: ByteRange,
     event: &str,
     progress: Option<&AtomicU64>,
+    profile: Option<HttpRequestProfile>,
 ) -> Result<HttpRangeResponse> {
     let mut bytes = Vec::new();
     let mut total_length = None;
@@ -3137,6 +8243,12 @@ fn fetch_http_range(
     // start) instead of handing back bytes from a different object to be spliced
     // onto the prefix we already hold.
     let mut validator: Option<String> = None;
+    // `ETag` / `Last-Modified` 原样回报：**seek 跨节点并行的下载前门禁**要用它们
+    // 判断"几个节点给的是不是同一个对象"（见 `seek_fill_gate`）。与 `validator`
+    // 分开记录是因为判据需要知道**到底是哪一种**（ETag 缺失不能拿 Last-Modified
+    // 默认顶替——那只是弱证据）。
+    let mut etag: Option<String> = None;
+    let mut last_modified: Option<String> = None;
     let mut attempt = 0u32;
     let deadline_started = Instant::now();
     loop {
@@ -3150,6 +8262,8 @@ fn fetch_http_range(
             return Ok(HttpRangeResponse {
                 bytes,
                 total_length,
+                etag,
+                last_modified,
             });
         }
         let resume_range = ByteRange {
@@ -3180,6 +8294,15 @@ fn fetch_http_range(
                 .map_or_else(|| "null".to_string(), |length| length.to_string()),
             received,
         ));
+        // —— HTTP 请求画像：粒度 = **一次真正发出的 GET**（含重试与断点续传）——
+        // 计数点必须在 `call()` 这一处（唯一打到网络的地方），而不是调用点：
+        // 调用点计数会把「一次逻辑 fetch 的 3 次尝试」合并成 1 次，重试放大就
+        // 看不出来了；这里每个 attempt 都途经，天然如实。失败（连接错误 / 5xx /
+        // body 中断）同样计入——那确实消耗了一次请求，而且均值正是靠它反映
+        // "重试浪费"（失败请求只进分母、不进分子）。
+        if let Some(profile) = profile.as_ref() {
+            profile.record_request();
+        }
         let mut response = match request.call() {
             Ok(response) => response,
             Err(error) => {
@@ -3210,7 +8333,9 @@ fn fetch_http_range(
                     thread::sleep(backoff);
                     continue;
                 }
-                return Err(SourceError::Http(error.to_string()));
+                // 暂时性 or 终局由错误性质决定（见 `http_failure_after_retries`）；
+                // 暂时性错误后续由外层等待窗口吸收，不再直接判死整条流。
+                return Err(http_failure_after_retries(&error));
             }
         };
         let status = response.status().as_u16();
@@ -3244,6 +8369,13 @@ fn fetch_http_range(
                 if validator.is_none() {
                     validator = response_entity_validator(&response);
                 }
+                // 跨节点门禁的凭据（原样回报，不在内核里做任何推断）。
+                if etag.is_none() {
+                    etag = response_header_value(&response, "etag");
+                }
+                if last_modified.is_none() {
+                    last_modified = response_header_value(&response, "last-modified");
+                }
             }
             200 => {
                 if resume_range.start > 0 {
@@ -3267,6 +8399,13 @@ fn fetch_http_range(
                 }
                 if validator.is_none() {
                     validator = response_entity_validator(&response);
+                }
+                // 跨节点门禁的凭据（200 分支：整片响应，`total` 来自 Content-Length）。
+                if etag.is_none() {
+                    etag = response_header_value(&response, "etag");
+                }
+                if last_modified.is_none() {
+                    last_modified = response_header_value(&response, "last-modified");
                 }
             }
             // ureq maps 4xx/5xx to Error::StatusCode before this point; any
@@ -3294,6 +8433,13 @@ fn fetch_http_range(
                     bytes.extend_from_slice(&chunk[..n]);
                     if let Some(counter) = progress {
                         counter.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    // 请求画像的"分子"：与 `progress` **同一处**累加，口径一致
+                    // ——「所有已发出的 GET 合起来收回了多少字节」。断点续传不会
+                    // 重复计数：续传请求只请求剩余区间，重复的那部分字节从未二次
+                    // 到达（已到达的在上一 attempt 里记过）。
+                    if let Some(profile) = profile.as_ref() {
+                        profile.record_bytes(n as u64);
                     }
                 }
                 Err(error) => {
@@ -3331,7 +8477,10 @@ fn fetch_http_range(
                 thread::sleep(backoff);
                 continue;
             }
-            return Err(SourceError::Http(error.to_string()));
+            // body 分块读错误（连接中断 / 读超时 / 对端提前收线）在重试预算用尽后
+            // 仍是**暂时性**失败：字节只是暂时拿不到，链路恢复后同一个 Range 请求
+            // 还能续上（已到达的字节由上面的 `received` 续传，不会重复下载）。
+            return Err(SourceError::Transient(error.to_string()));
         }
         http_trace_log(format!(
             "{{\"event\":\"{}\",\"attempt\":{},\"start\":{},\"length\":{},\"status\":{},\"bytes\":{},\"elapsed_ms\":{:.3}}}",
@@ -3348,6 +8497,8 @@ fn fetch_http_range(
         return Ok(HttpRangeResponse {
             bytes,
             total_length,
+            etag,
+            last_modified,
         });
     }
 }
@@ -3418,11 +8569,8 @@ impl MediaSource for HttpRangeSource {
                             started.elapsed().as_secs_f64() * 1000.0,
                         ));
                         let uri = self.uri.lock().expect("uri poisoned").clone();
-                        return match probe_http_total_length(
-                            &self.agent,
-                            &uri,
-                            &self.http_headers,
-                        ) {
+                        return match probe_http_total_length(&self.agent, &uri, &self.http_headers)
+                        {
                             Ok(total_length) => {
                                 self.content_length = total_length;
                                 Ok(self.content_length)
@@ -3488,37 +8636,77 @@ impl MediaSource for HttpRangeSource {
     }
 
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
+        self.read_range_with_transient_wait(range)
+    }
+}
+
+impl HttpRangeSource {
+    /// 一次读尝试（**不含**「暂时读不到就等一会儿」的外层循环，见
+    /// [`HttpRangeSource::read_range_with_transient_wait`]）。命中缓存/预取/桶
+    /// 的路径在这里直接返回；需要网络的路径可能返回
+    /// [`SourceError::Transient`]（可重试）或 [`SourceError::Http`]（终局）。
+    ///
+    /// **两条数据通路**（2026-09-03）：
+    ///   1. `sequential_enabled`（生产默认）→ [`HttpRangeSource::read_range_stream`]：
+    ///      一条持续读的长连接覆盖整段顺序播放，只有窗口外的随机读才重发请求；
+    ///   2. 其余（`ERIKA_HTTP_SEQUENTIAL=0` / 直接 `HttpRangeSource::new`）→
+    ///      下面的旧分段路径（每段一个 Range + join），作为对照与兜底。
+    /// 本函数以下的所有代码只服务第 2 条路径。
+    fn read_range_once(&mut self, range: ByteRange) -> Result<Vec<u8>> {
         self.last_read_call_ms = now_ms();
         self.maybe_switch_host();
-        // 与整片预载桶的两个协同信号（都是无锁原子写，每次读刷新，成本可忽略）：
+        // 与整片预载桶/冷区的协同信号（都是无锁原子写，每次读刷新，成本可忽略）：
         // ① mark_demux_read：告诉桶"demux 正在消费"，播放中桶让路，把带宽完整
         //    留给 demux 的多段并行预取（聚合被 CDN 限速的单连接带宽）；
         // ② set_floor：把 demux 已覆盖前沿交给桶，桶跳过该偏移之前的区间，
         //    绝不重复下载 demux 已下过的字节（重复下载会让有效供给砍半）。
         if let Some(state) = self.full_preload.as_ref() {
             state.mark_demux_read();
-            state.set_floor(self.cache_end());
+            // 桶的 `floor` = demux 已覆盖前沿。顺序长读下就是 `StreamBuffer` 的
+            // `write_pos`（这条长流已经把那些字节拿到手上了），旧路径下是
+            // `cache_end`。桶据此**封存旧段、另开新段**（2026-09-04 起不再丢弃
+            // 已有字节），见 `full_preload_step` 的 floor 分支。
+            let covered = match self.stream_window() {
+                Some((_, write_pos, _)) => write_pos,
+                None => self.cache_end(),
+            };
+            state.set_floor(covered);
         }
-        // 整片预载桶优先：桶 [start, covered_until) 是独立线程下载、跨 demux 与
-        // 暂停依然持续推进的"档案式"内存镜像。被桶完整覆盖的请求直接复制
-        // 返回（零网络，绕开 demux prefetch 队列的全部路径），让 demux 哪怕
-        // 暂停也能从桶里取到字节流而不退化。
-        if let Some(state) = self.full_preload.as_ref() {
-            if let Some(length) = range.length {
-                if state.covers(range.start, length) {
-                    if let Some(bytes) = state.copy_range(range.start, length) {
-                        self.maybe_start_prefetch(range);
-                        self.publish_diag();
-                        http_trace_log(format!(
-                            "{{\"event\":\"http_full_preload_hit\",\"start\":{},\"length\":{}}}",
-                            range.start,
-                            length,
-                        ));
-                        trace_read_return("http_read_full_preload", range, self, &bytes);
-                        return Ok(bytes);
-                    }
-                }
-            }
+        // —— 统一缓存视图（磁盘冷区 → 内存热区 → 网络），命中即零网络 ——
+        //
+        // 顺序：① 冷区（磁盘层：热区淘汰下来、已落盘的区间）→ ② 顺序长流的热区
+        // 窗口 → ③ 网络。冷区放在最前面是刻意的：它是**唯一能覆盖 demux 当前
+        // 位置之前**的持有者（热区只保留 back_bytes 的后向窗口），用户回拖 /
+        // 重播命中的正是它——命中就绝不发网络请求（缺陷 ⑤ 的核心）。
+        // 「读到文件尾」（`length == None`，弹幕/字幕这类 sidecar）不走这里：
+        // 它的语义是"从 cursor 起一路累积到 EOF"，由 `read_range_stream` 的
+        // 循环逐段拼接（那里同样先查冷区），避免一次空返回被上层当作 EOF。
+        if let Some(length) = range.length
+            && length > 0
+            && let Some(bytes) = self.read_cold(range.start, length)
+        {
+            self.note_consumed(range.start.saturating_add(bytes.len() as u64));
+            self.maybe_start_prefetch(range);
+            self.publish_diag();
+            http_trace_log(format!(
+                "{{\"event\":\"cold_cache_hit\",\"start\":{},\"length\":{},\"bytes\":{}}}",
+                range.start,
+                length,
+                bytes.len(),
+            ));
+            trace_read_return("http_read_cold", range, self, &bytes);
+            return Ok(bytes);
+        }
+        // —— 顺序长读：正常前进播放全部由一条持续读的连接覆盖 ——
+        //
+        // 放在冷区之后、旧分段路径之前：
+        //   ① 冷区命中是**零网络**（磁盘分层），优先；
+        //   ② 没命中的读全部交给长流——不再走 `maybe_start_prefetch` /
+        //      `spawn_prefetch_window` 那条"每段一个请求"的路径。
+        // 只有窗口外的随机读（seek / demuxer 回退 / 音视频不同步导致的跳读）
+        // 会在长流内部触发一次重设（= 重发一条 open-ended Range）。
+        if self.sequential_enabled {
+            return self.read_range_stream(range);
         }
         if let Some(bytes) = self.cached_slice(range) {
             self.maybe_start_prefetch(range);
@@ -3622,6 +8810,132 @@ impl MediaSource for HttpRangeSource {
             .unwrap_or_default();
         trace_read_return("http_read_fetch", range, self, &out);
         Ok(out)
+    }
+
+    /// 「暂时读不到」的等待窗口（对齐 mpv 的 `paused-for-cache` / `cache-pause-wait`）。
+    ///
+    /// 背景（用户实测"每播约 5 秒自动暂停一次、连出 4~5 次"的根因）：`read_range`
+    /// 失败一次就返回错误 → AVIO 层把它变成 `EIO` → `av_read_frame` 报错 →
+    /// demux worker 把整条流判死（`DemuxMessage::Error`）→ 宿主只能重开换源。
+    /// 而 CDN 抖动的真实形态是「几秒拿不到字节，随后同一个连接或换一个 host 又能
+    /// 用」；mpv 在这种情形下退回缓冲等待（`paused-for-cache`），**不把流判失败**。
+    ///
+    /// 本函数吸收 [`SourceError::Transient`]，三个出口：
+    /// - **有字节到达**（`live_rx_bytes` 增长：涓流、换 host 后恢复、或整片预载桶
+    ///   在别的连接上继续下载）→ 只要字节还在来就继续等，**不判死**；
+    /// - **字节完全停了**并持续 `transient_grace()` → 放弃（返回错误，宿主自愈换源）；
+    /// - **总时长超过 [`HTTP_TRANSIENT_ABS_MAX`]** → 放弃。兜底防 1 字节/秒级涓流
+    ///   把 demux 线程永久钉住（用户看到的是长时间无进度，换源反而能救）。
+    ///
+    /// [`SourceError::Http`]（4xx / Range 被忽略 / Content-Range 违约 / 帧内错位）
+    /// 以及 `Io`/`Unsupported` 等**不等待**：那些重试多少次都不会好，必须立刻让
+    /// 宿主换源——"等待"只吸收真的可能自愈的失败。
+    ///
+    /// 等待期间每 [`HTTP_TRANSIENT_RETRY_DELAY`] 重试一次，并且每次都刷新
+    /// `last_read_call_ms`（保持"demux 仍在消费"的活跃标记）、调 `maybe_switch_host`
+    /// （消费宿主的强制换 host 请求、让 6s 死连与慢速自发换 host 生效）、调
+    /// `publish_diag`（刷新 `est_bps` 与 `transient_wait`：宿主策略据此降档/换
+    /// host，内核 worker 据此对外发缓冲态）。
+    fn read_range_with_transient_wait(&mut self, range: ByteRange) -> Result<Vec<u8>> {
+        // 标记"demux 此刻正卡在读上"（换源判据区分"在播且饿着"与"暂停"靠它，
+        // 见 `read_in_flight` 注释）——读调用挂 20 秒也不会被误判成暂停。
+        self.read_in_flight = true;
+        let result = self.read_range_wait_loop(range);
+        self.read_in_flight = false;
+        result
+    }
+
+    /// 等待窗口主体（见 [`HttpRangeSource::read_range_with_transient_wait`] 的说明）。
+    fn read_range_wait_loop(&mut self, range: ByteRange) -> Result<Vec<u8>> {
+        let started = Instant::now();
+        let rx_at_entry = live_rx_bytes(self.diag_slot);
+        // 「距上次字节到达」的计时**只在本函数内累计**，不复用历史 `last_byte_ms`：
+        // 暂停很久后 seek 回来恰好赶上一次失败时，历史值会让 stalled 直接爆表，
+        // 把一次普通的瞬时失败误判成死连。
+        let mut last_progress_at = started;
+        let mut rx_seen = rx_at_entry;
+        let mut attempts = 0u32;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match self.read_range_once(range) {
+                Ok(bytes) => {
+                    if attempts > 1 {
+                        trace::diagnostic(
+                            serde_json::json!({
+                                "event": "http_transient_wait",
+                                "stage": "recovered",
+                                "attempts": attempts,
+                                "waitedSeconds": started.elapsed().as_secs_f64(),
+                                "start": range.start,
+                                "bytes": bytes.len(),
+                            })
+                            .to_string(),
+                        );
+                    }
+                    self.set_transient_wait(false);
+                    return Ok(bytes);
+                }
+                Err(SourceError::Transient(message)) => {
+                    let rx_now = live_rx_bytes(self.diag_slot);
+                    if rx_now != rx_seen {
+                        rx_seen = rx_now;
+                        last_progress_at = Instant::now();
+                    }
+                    let stalled = last_progress_at.elapsed();
+                    if !transient_wait_should_continue(
+                        stalled,
+                        started.elapsed(),
+                        transient_grace(),
+                        HTTP_TRANSIENT_ABS_MAX,
+                    ) {
+                        // 真死：字节停了足够久（或总等待超上限）→ 交回上层，由
+                        // AVIO → av_read_frame → demux worker → 宿主换源自愈。
+                        self.set_transient_wait(false);
+                        trace::diagnostic(
+                            serde_json::json!({
+                                "event": "http_transient_wait",
+                                "stage": "give_up",
+                                "attempts": attempts,
+                                "stalledSeconds": stalled.as_secs_f64(),
+                                "waitedSeconds": started.elapsed().as_secs_f64(),
+                                "start": range.start,
+                                "error": message.as_str(),
+                            })
+                            .to_string(),
+                        );
+                        return Err(SourceError::Transient(message));
+                    }
+                    self.set_transient_wait(true);
+                    self.last_read_call_ms = now_ms();
+                    self.maybe_switch_host();
+                    self.publish_diag();
+                    http_trace_log(format!(
+                        "{{\"event\":\"http_transient_wait_retry\",\"attempt\":{},\"stalled_ms\":{:.3},\"waited_ms\":{:.3},\"est_bps\":{:.0},\"host_epoch\":{},\"error\":\"{}\"}}",
+                        attempts,
+                        stalled.as_secs_f64() * 1000.0,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        self.est_bps,
+                        self.host_epoch,
+                        json_escape(&message),
+                    ));
+                    thread::sleep(HTTP_TRANSIENT_RETRY_DELAY);
+                }
+                Err(other) => {
+                    self.set_transient_wait(false);
+                    return Err(other);
+                }
+            }
+        }
+    }
+
+    /// 发布/清除「正在等字节」标志。只在跳变时刷诊断（低频）；
+    /// 内核 worker 与宿主读的都是诊断槽里的 `transient_wait`。
+    fn set_transient_wait(&mut self, waiting: bool) {
+        if self.transient_wait == waiting {
+            return;
+        }
+        self.transient_wait = waiting;
+        self.publish_diag();
     }
 }
 
@@ -3739,7 +9053,11 @@ pub(crate) fn source_from_uri_with_hint_and_headers_slot_and_read_ahead(
                     http_read_ahead_bytes,
                 );
                 s.set_candidates(candidates);
-                Ok(Box::new(s.enable_full_preload()))
+                // 生产 VOD 路径：**顺序长读**（一条连接覆盖整段播放）+ 整片预载
+                // 桶（暂停后在同一条流式连接上补片）。两者的分工见
+                // `full_preload_stream_loop` 的注释：demux 活跃时桶不连，
+                // 任一时刻只有一个下载者。
+                Ok(Box::new(s.enable_sequential_stream().enable_full_preload()))
             } else {
                 Err(SourceError::Unsupported(uri.to_string()))
             }
@@ -3781,7 +9099,7 @@ fn source_from_auto_uri_with_slot(
             http_read_ahead_bytes,
         );
         s.set_candidates(candidates);
-        return Ok(Box::new(s.enable_full_preload()));
+        return Ok(Box::new(s.enable_sequential_stream().enable_full_preload()));
     }
     let path = Path::new(uri);
     if path.exists() {
@@ -3862,6 +9180,17 @@ fn http_prefetch_parallel() -> usize {
         .unwrap_or(2)
 }
 
+/// 是否启用**顺序长读**（默认开）。`ERIKA_HTTP_SEQUENTIAL=0/false` 关回旧分段
+/// 路径——保留这条开关是刻意的：新路径一旦在现场发现问题，一行环境变量即可
+/// 回退到"每段一个请求"的旧行为，不必回滚二进制。
+///
+/// 只在源构造时读一次（`enable_sequential_stream`），不在读热路径上。
+fn http_sequential_enabled() -> bool {
+    std::env::var("ERIKA_HTTP_SEQUENTIAL")
+        .map(|value| value != "0" && value != "false")
+        .unwrap_or(true)
+}
+
 fn http_read_ahead_bytes(diag_slot: usize) -> u64 {
     if diag_slot > 0 {
         return env::var("ERIKA_HTTP_READAHEAD_BYTES_AUDIO")
@@ -3895,8 +9224,7 @@ fn http_back_bytes(diag_slot: usize) -> u64 {
 /// → 视频流 ~100 次/秒）——此前每次都做 env::var 查询：Windows 上拿进程
 /// 环境锁 + 线性查找，在 demux 热路径上是实打实的锁竞争开销。LazyLock
 /// 首次求值后零开销（宿主在 main 早期 set_var，先于任何源创建，时序安全）。
-static HTTP_TRACE_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| trace::env_flag("ERIKA_HTTP_TRACE"));
+static HTTP_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| trace::env_flag("ERIKA_HTTP_TRACE"));
 
 fn http_trace_log(line: impl AsRef<str>) {
     if !*HTTP_TRACE_ENABLED {
@@ -3942,6 +9270,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transient_wait_keeps_waiting_while_bytes_are_still_arriving() {
+        // 「读慢但在推进」必须继续等：stalled 小（每次重试前都有新字节），
+        // 即使总等待已经接近/超过 grace 也不判死——这正是 mpv paused-for-cache
+        // 的语义，也是"带宽刚好够 + CDN 抖动"场景下不该判死的判据。
+        let grace = Duration::from_secs(12);
+        let abs_max = Duration::from_secs(30);
+        assert!(transient_wait_should_continue(
+            Duration::from_millis(0),
+            Duration::from_secs(11),
+            grace,
+            abs_max,
+        ));
+        assert!(transient_wait_should_continue(
+            Duration::from_millis(299),
+            Duration::from_secs(25),
+            grace,
+            abs_max,
+        ));
+        // 但硬上限仍然生效：涓流不能把 demux 线程永久钉住。
+        assert!(!transient_wait_should_continue(
+            Duration::ZERO,
+            abs_max,
+            grace,
+            abs_max,
+        ));
+    }
+
+    #[test]
+    fn transient_wait_gives_up_only_after_the_grace_without_bytes() {
+        let grace = Duration::from_secs(12);
+        let abs_max = Duration::from_secs(30);
+        // 尚未到 grace → 继续等（一次失败不判死整条流）。
+        assert!(transient_wait_should_continue(
+            Duration::from_millis(11_900),
+            Duration::from_millis(11_900),
+            grace,
+            abs_max,
+        ));
+        // 字节停够 grace → 判死，交回上层让宿主换源。
+        assert!(!transient_wait_should_continue(
+            grace,
+            Duration::from_secs(12),
+            grace,
+            abs_max,
+        ));
+        assert!(!transient_wait_should_continue(
+            Duration::from_secs(20),
+            Duration::from_secs(20),
+            grace,
+            abs_max,
+        ));
+    }
+
+    #[test]
+    fn http_fetch_failures_are_classified_by_retryability() {
+        // 4xx（403 签名过期 / 404）重试无意义 → 终局错误，立即让宿主换源。
+        assert!(matches!(
+            http_failure_after_retries(&ureq::Error::StatusCode(403)),
+            SourceError::Http(_)
+        ));
+        assert!(matches!(
+            http_failure_after_retries(&ureq::Error::StatusCode(404)),
+            SourceError::Http(_)
+        ));
+        // 5xx 是链路问题 → 暂时性，进等待窗口重试（而不是判死整条流）。
+        assert!(matches!(
+            http_failure_after_retries(&ureq::Error::StatusCode(503)),
+            SourceError::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn transient_wait_flag_tracks_the_read_path_state() {
+        // 新源不在等待窗口里，且置位/清除是幂等的（`set_transient_wait` 只在
+        // 跳变时刷诊断槽——诊断槽是进程级共享的，这里只断言源自身状态，
+        // 不读全局槽，避免与并行用例互相干扰）。
+        let mut source = HttpRangeSource::with_http_headers_and_diag_slot(
+            "http://127.0.0.1:1/never-connected",
+            Vec::new(),
+            1,
+        );
+        assert!(!source.transient_wait);
+        source.set_transient_wait(true);
+        assert!(source.transient_wait);
+        source.set_transient_wait(true);
+        assert!(source.transient_wait);
+        source.set_transient_wait(false);
+        assert!(!source.transient_wait);
+    }
+
+    #[test]
     fn http_retry_budget_stops_retrying_once_the_stall_ceiling_is_reached() {
         let fresh = Instant::now();
         assert!(http_retry_fits_budget(fresh, Duration::from_millis(200)));
@@ -3978,7 +9397,13 @@ mod tests {
         state.set_floor(512 * 1024);
 
         // 第一步：只前移（丢弃 demux 已持有的旧字节），不发任何网络请求
-        assert!(!full_preload_step(&state, &http_agent(), &uri, &[], 1024 * 1024));
+        assert!(!full_preload_step(
+            &state,
+            &http_agent(),
+            &uri,
+            &[],
+            1024 * 1024
+        ));
         assert_eq!(state.covered_until(), 512 * 1024);
         assert!(
             requests.recv_timeout(Duration::from_millis(100)).is_err(),
@@ -3986,7 +9411,13 @@ mod tests {
         );
 
         // 第二步：从 demux 前沿（512KB）起下载，绝不回头重下 [0, 512KB)
-        assert!(!full_preload_step(&state, &http_agent(), &uri, &[], 1024 * 1024));
+        assert!(!full_preload_step(
+            &state,
+            &http_agent(),
+            &uri,
+            &[],
+            1024 * 1024
+        ));
         let head = recv_request_head(&requests);
         assert!(
             head.contains("range: bytes=524288-"),
@@ -4210,6 +9641,7 @@ mod tests {
         assert_eq!(audio.back_bytes, http_back_bytes(1));
         // 音频槽位不继承视频槽位的 env 覆盖（宿主只调大 ERIKA_HTTP_
         // READAHEAD_BYTES 时，音频保持 2MB 小窗而非跟着变大）
+        let previous = std::env::var("ERIKA_HTTP_READAHEAD_BYTES").ok();
         unsafe {
             std::env::set_var("ERIKA_HTTP_READAHEAD_BYTES", "8388608");
         }
@@ -4223,6 +9655,13 @@ mod tests {
             Vec::new(),
             0,
         );
+        // 用完**必须还原**：进程 env 是所有并行用例共享的全局状态。此前这里只
+        // set 不还原，8388608 会一直留在进程里，之后任何 `HttpRangeSource::new`
+        // （槽 0）都会拿到 8MB 而不是 4MB —— 这正是"并行用例互相干扰"的形态。
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ERIKA_HTTP_READAHEAD_BYTES", value) },
+            None => unsafe { std::env::remove_var("ERIKA_HTTP_READAHEAD_BYTES") },
+        }
         assert_eq!(audio_after.read_ahead_bytes, AUDIO_DEFAULT_READ_AHEAD_BYTES);
         assert_eq!(video_after.read_ahead_bytes, 8 * 1024 * 1024);
         // 常规测试环境（两个 env 均未设置）：视频窗口（4MB，对齐 PiliPlus
@@ -4283,6 +9722,8 @@ mod tests {
             let _ = sender.send(Ok(HttpRangeResponse {
                 bytes,
                 total_length: None,
+                etag: None,
+                last_modified: None,
             }));
         });
         PendingHttpFetch {
@@ -4318,8 +9759,12 @@ mod tests {
             length: Some(256 * 1024),
         };
         // seg2 先完成、seg1 延迟 200ms —— 并行下载的乱序完成场景
-        source.prefetch.push(pending_from_bytes(seg2, patterned(seg2), 0));
-        source.prefetch.push(pending_from_bytes(seg1, patterned(seg1), 200));
+        source
+            .prefetch
+            .push(pending_from_bytes(seg2, patterned(seg2), 0));
+        source
+            .prefetch
+            .push(pending_from_bytes(seg1, patterned(seg1), 200));
 
         // 读 seg1 起点：join seg1（等它完成），必须返回 seg1 的字节
         let out = source
@@ -4328,7 +9773,13 @@ mod tests {
                 length: Some(64 * 1024),
             })
             .unwrap();
-        assert_eq!(out, patterned(ByteRange { start: 256 * 1024, length: Some(64 * 1024) }));
+        assert_eq!(
+            out,
+            patterned(ByteRange {
+                start: 256 * 1024,
+                length: Some(64 * 1024)
+            })
+        );
         // 窗口连续延伸到 seg1 末尾；队列 = seg2（等待）+ join 后自动回填的
         // seg3（流水线常满：消费一段即补一段）
         assert_eq!(source.cache_end(), 512 * 1024);
@@ -4341,7 +9792,13 @@ mod tests {
                 length: Some(64 * 1024),
             })
             .unwrap();
-        assert_eq!(out, patterned(ByteRange { start: 512 * 1024, length: Some(64 * 1024) }));
+        assert_eq!(
+            out,
+            patterned(ByteRange {
+                start: 512 * 1024,
+                length: Some(64 * 1024)
+            })
+        );
         assert_eq!(source.cache_end(), 768 * 1024);
         // join seg2 后 refill 又回填 [768K,1MB)（该段打 example.invalid 不可达
         // 而 Err，窗口推进到它时走同步兜底——队列非空属正常）
@@ -4639,13 +10096,109 @@ mod tests {
         assert!(recv_request_head(&requests).contains("range: bytes=32-63"));
     }
 
+    // —— HTTP 请求画像（把"是不是被 CDN 限速"变成可实测数字）——
+
+    #[test]
+    fn http_request_profile_counts_one_request_per_successful_fetch() {
+        // 口径 1：一次成功的 Range 请求 → 请求数 +1、字节 +body.len()。
+        // 计数点在 `fetch_http_range` 内部（唯一真正发请求的那一处），
+        // 不是调用点。
+        //
+        // 计数目标用**用例自己的静态原子量**（而非进程级槽位数组）：
+        // 同进程并行跑的其它用例也在发 HTTP，共享槽位会让断言不可靠。
+        static REQUESTS: AtomicU64 = AtomicU64::new(0);
+        static BYTES: AtomicU64 = AtomicU64::new(0);
+        let body: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let (uri, _heads) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(0, 4096, &body),
+        )]);
+
+        let response = fetch_http_range(
+            &http_agent(),
+            &uri,
+            &[],
+            ByteRange {
+                start: 0,
+                length: Some(4096),
+            },
+            "test_profile_ok",
+            None,
+            Some(HttpRequestProfile {
+                requests: &REQUESTS,
+                bytes: &BYTES,
+            }),
+        )
+        .expect("mock 206 应成功");
+
+        assert_eq!(response.bytes.len(), 4096);
+        assert_eq!(REQUESTS.load(Ordering::Relaxed), 1, "成功一次 = 1 次请求");
+        assert_eq!(BYTES.load(Ordering::Relaxed), 4096, "字节按实际到达量累计");
+    }
+
+    #[test]
+    fn http_request_profile_counts_retries_and_resumed_bytes_once() {
+        // 口径 2：一次失败（body 截断）后重试续传成功 → **请求数 = 2**。
+        // 若把计数点错放在调用点 / 只按"逻辑 fetch"记一次，这里会得到 1，
+        // "请求放大"（重试把每请求平均字节拖低）就被掩盖了——而这正是本
+        // 计数存在的理由。
+        // 字节侧必须只记实际到达量：续传请求只请求缺失区间，重复的 32 字节
+        // 不会二次到达，所以总数恰为 64。
+        static REQUESTS: AtomicU64 = AtomicU64::new(0);
+        static BYTES: AtomicU64 = AtomicU64::new(0);
+        let body: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+        let (uri, heads) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_truncated_response(0, 64, 64, &body[..32])),
+            MockResponse::immediate(http_206_response(32, 64, &body[32..])),
+        ]);
+
+        let response = fetch_http_range(
+            &http_agent(),
+            &uri,
+            &[],
+            ByteRange {
+                start: 0,
+                length: Some(64),
+            },
+            "test_profile_retry",
+            None,
+            Some(HttpRequestProfile {
+                requests: &REQUESTS,
+                bytes: &BYTES,
+            }),
+        )
+        .expect("截断后应续传成功");
+
+        assert_eq!(response.bytes, body);
+        assert_eq!(
+            REQUESTS.load(Ordering::Relaxed),
+            2,
+            "失败一次后重试成功 = 2 次请求（每个 attempt 各记 1）"
+        );
+        assert_eq!(
+            BYTES.load(Ordering::Relaxed),
+            64,
+            "断点续传的字节不重复计数"
+        );
+        // 两次请求确实是一次逻辑 fetch 的两段（第二次从断点 32 起）。
+        assert!(recv_request_head(&heads).contains("range: bytes=0-63"));
+        assert!(recv_request_head(&heads).contains("range: bytes=32-63"));
+    }
+
     #[test]
     fn prefetch_spawns_parallel_segments() {
         let body: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
         let (uri, requests) = spawn_mock_http_server(vec![
             MockResponse::immediate(http_206_response(1024 * 1024, 128 * 1024 * 1024, &body)),
-            MockResponse::immediate(http_206_response(1024 * 1024 + 256 * 1024, 128 * 1024 * 1024, &body)),
-            MockResponse::immediate(http_206_response(1024 * 1024 + 512 * 1024, 128 * 1024 * 1024, &body)),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 256 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
+            MockResponse::immediate(http_206_response(
+                1024 * 1024 + 512 * 1024,
+                128 * 1024 * 1024,
+                &body,
+            )),
         ]);
         let mut source = HttpRangeSource::new(uri);
         source.content_length = Some(128 * 1024 * 1024);
@@ -4809,6 +10362,7 @@ mod tests {
             range,
             Arc::new(AtomicU64::new(0)),
             0,
+            0, // diag_slot：测试源走槽 0（请求画像只影响诊断计数）
         )];
         assert_eq!(source.read_range(range).unwrap(), body);
         let _ = recv_request_head(&requests);
@@ -4836,6 +10390,7 @@ mod tests {
             range,
             Arc::new(AtomicU64::new(0)),
             0,
+            0, // diag_slot：测试源走槽 0（请求画像只影响诊断计数）
         )];
         // A short prefetch must trigger the synchronous fallback, not an
         // empty (fake-EOF) read.
@@ -5043,16 +10598,8 @@ mod tests {
             http_206_response(0, 1024 * 1024, &vec![0u8; 256 * 1024]),
         )]);
         let (uri_b, requests_b) = spawn_mock_http_server(vec![
-            MockResponse::immediate(http_206_response(
-                0,
-                1024 * 1024,
-                &vec![0u8; 256 * 1024],
-            )),
-            MockResponse::immediate(http_206_response(
-                0,
-                1024 * 1024,
-                &vec![0u8; 256 * 1024],
-            )),
+            MockResponse::immediate(http_206_response(0, 1024 * 1024, &vec![0u8; 256 * 1024])),
+            MockResponse::immediate(http_206_response(0, 1024 * 1024, &vec![0u8; 256 * 1024])),
         ]);
         let mut source =
             HttpRangeSource::with_http_headers_and_diag_slot(uri_a.clone(), Vec::new(), 0);
@@ -5107,6 +10654,7 @@ mod tests {
             range,
             Arc::new(AtomicU64::new(0)),
             0, // spawn 于旧 epoch
+            0, // diag_slot：测试源走槽 0
         ));
         let started = Instant::now();
         let result = source.take_prefetch(range);
@@ -5148,10 +10696,7 @@ mod tests {
     /// 落盘桶测试用的独立目录（按名字分，跑完清掉）。不引 `tempfile`：仓库
     /// 没有这个依赖，为几条测试拉一个新 crate 不值当。
     fn preload_test_dir(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!(
-            "erika-preload-test-{}-{name}",
-            std::process::id()
-        ));
+        let dir = env::temp_dir().join(format!("erika-preload-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -5210,7 +10755,11 @@ mod tests {
         let path = dir.join(format!("{:016x}.part", 0x1234));
         write_preload_fixture(&path, 0, &[9u8; 4096]);
         let mut store = DiskStore::open(&dir, 0x1234, 64 * 1024 * 1024).unwrap();
-        assert_eq!(store.len(), 4096, "残留文件的窗口必须被恢复（弱网重开省流量）");
+        assert_eq!(
+            store.len(),
+            4096,
+            "残留文件的窗口必须被恢复（弱网重开省流量）"
+        );
         assert_eq!(store.data_start, 0);
         assert_eq!(store.read(0, 4).unwrap(), vec![9u8; 4]);
 
@@ -5306,6 +10855,7 @@ mod tests {
             total: None,
             start: 0,
             store: PreloadStore::Disk(disk),
+            sealed: Vec::new(),
         };
         let error = inner.append_chunk(b"first-chunk").unwrap_err();
         assert!(!error.is_empty());
@@ -5353,7 +10903,8 @@ mod tests {
         assert_eq!(preload_key(first, 1), preload_key(second, 1));
         // 不同流绝不能撞名——撞名就是两个会话共写一个文件，字节必然错位。
         assert_ne!(preload_key(first, 1), preload_key(second, 0));
-        let other = "https://cn-gotcha.bilivideo.com/upgcxcode/1/2/3/4000000000001-1-30077.m4s?deadline=1";
+        let other =
+            "https://cn-gotcha.bilivideo.com/upgcxcode/1/2/3/4000000000001-1-30077.m4s?deadline=1";
         assert_ne!(preload_key(first, 1), preload_key(other, 1));
     }
 
@@ -5374,6 +10925,7 @@ mod tests {
             // 与 `set_floor` 一致：模拟 demux 已跑赢、桶刚刚前移过
             start: 512 * 1024,
             store: PreloadStore::Disk(disk),
+            sealed: Vec::new(),
         };
         state.end.store(512 * 1024, Ordering::Relaxed);
 
@@ -5399,5 +10951,1991 @@ mod tests {
         assert!(!state.covers(0, 1024));
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =====================================================================
+    // 顺序长读（sequential stream）
+    //
+    // 核心命题：**一次连续播放的 HTTP 请求数与播放时长无关**——只在
+    // seek 出窗 / 换 host / 连接被断 / 瞬时错误重试时 +1。改造前是
+    // "每 256KB 一个 Range 请求"，1080P 一小时 4700~6000 个。
+    // =====================================================================
+
+    /// 流式 mock server：与 `spawn_mock_http_server`（预置响应、只服务有限
+    /// 次数）不同，它服务**任意**连接数，按请求里的 `Range: bytes=<start>-`
+    /// 现场生成响应体（字节值 = `offset % 256`），因此可以模拟"8 分钟 1080P
+    /// ≈ 166MB"而不用真的分配 166MB 内存。返回 (uri, 累计请求数, 请求头通道)。
+    ///
+    /// `cut_after_first`：**仅第一条连接**在写了这么多 body 字节后直接断开
+    /// （模拟 CDN 主动掐断长连接）。
+    fn spawn_streaming_mock_http_server(
+        total: u64,
+        cut_after_first: Option<u64>,
+    ) -> (String, Arc<AtomicU64>, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.m4s", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicU64::new(0));
+        let (sender, receiver) = mpsc::channel();
+        let counter = Arc::clone(&requests);
+        thread::spawn(move || {
+            let mut connection_index = 0u64;
+            loop {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let sender = sender.clone();
+                let counter = Arc::clone(&counter);
+                let cut = if connection_index == 0 {
+                    cut_after_first
+                } else {
+                    None
+                };
+                connection_index += 1;
+                thread::spawn(move || {
+                    serve_streaming_connection(stream, total, cut, counter, sender);
+                });
+            }
+        });
+        (uri, requests, receiver)
+    }
+
+    /// 解析请求头里的 `Range: bytes=<start>[-<end>]`，同时把请求头记进通道、
+    /// 连接计数 +1（新写的"收线/分片"mock 共用，形态与
+    /// `serve_streaming_connection` 完全一致）。
+    fn read_range_request(
+        stream: &mut std::net::TcpStream,
+        requests: &AtomicU64,
+        heads: &mpsc::Sender<String>,
+    ) -> Option<(u64, Option<u64>)> {
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+        }
+        requests.fetch_add(1, Ordering::Relaxed);
+        let _ = heads.send(head.clone());
+        head.lines().find_map(|line| {
+            let lower = line.trim().to_ascii_lowercase();
+            let rest = lower.strip_prefix("range: bytes=")?.to_string();
+            let (start, end) = rest.split_once('-')?;
+            let start = start.trim().parse::<u64>().ok()?;
+            let end = end.trim();
+            let end = if end.is_empty() {
+                None
+            } else {
+                Some(end.parse::<u64>().ok()?)
+            };
+            Some((start, end))
+        })
+    }
+
+    /// **「CDN 每 N 字节收线」mock**（用户真机形态的复现）：响应**声明**完整的
+    /// `Content-Range`（`bytes <start>-<end>/<total>` + 完整 Content-Length），
+    /// 却只写 `cut` 字节就把连接关掉。ureq 的 body reader 因此报错（而不是干净
+    /// 的 EOF），内核走"服务端提前收线 → 从 write_pos 静默续传"这条路径——
+    /// 用户实测的"每 ~1MB 重建一次、~0.5 次/秒"就是它。
+    fn spawn_cutting_mock_http_server(
+        total: u64,
+        cut: u64,
+    ) -> (String, Arc<AtomicU64>, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicU64::new(0));
+        let (sender, receiver) = mpsc::channel();
+        let counter = Arc::clone(&requests);
+        thread::spawn(move || {
+            loop {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let counter = Arc::clone(&counter);
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    serve_cutting_connection(stream, total, cut, counter, sender)
+                });
+            }
+        });
+        (uri, requests, receiver)
+    }
+
+    fn serve_cutting_connection(
+        mut stream: std::net::TcpStream,
+        total: u64,
+        cut: u64,
+        requests: Arc<AtomicU64>,
+        heads: mpsc::Sender<String>,
+    ) {
+        let Some((start, requested_end)) = read_range_request(&mut stream, &requests, &heads)
+        else {
+            return;
+        };
+        if start >= total {
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            return;
+        }
+        let end = requested_end.unwrap_or(total - 1).min(total - 1);
+        let declared = end - start + 1;
+        let header = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            return;
+        }
+        let limit = declared.min(cut);
+        if write_stream_body(&mut stream, start, limit).is_err() {
+            return;
+        }
+        let _ = stream.flush();
+        // 直接收线（不发完声明的 Content-Length）——这正是 CDN 的行为。
+    }
+
+    /// **分片式 CDN mock**：每次响应只声明并发送 `chunk` 字节，`Content-Range`
+    /// 的 `end + 1 < total`（合法分片响应）。内核必须**续传**而不是把流判成
+    /// EOF——真机实测的音频"停在 2.7MB/8MB"就是旧实现把分片尾当成了文件尾。
+    fn spawn_chunked_mock_http_server(
+        total: u64,
+        chunk: u64,
+    ) -> (String, Arc<AtomicU64>, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicU64::new(0));
+        let (sender, receiver) = mpsc::channel();
+        let counter = Arc::clone(&requests);
+        thread::spawn(move || {
+            loop {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let counter = Arc::clone(&counter);
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    serve_chunked_connection(stream, total, chunk, counter, sender)
+                });
+            }
+        });
+        (uri, requests, receiver)
+    }
+
+    fn serve_chunked_connection(
+        mut stream: std::net::TcpStream,
+        total: u64,
+        chunk: u64,
+        requests: Arc<AtomicU64>,
+        heads: mpsc::Sender<String>,
+    ) {
+        let Some((start, _)) = read_range_request(&mut stream, &requests, &heads) else {
+            return;
+        };
+        if start >= total {
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            return;
+        }
+        let end = start.saturating_add(chunk.max(1) - 1).min(total - 1);
+        let length = end - start + 1;
+        let header = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            return;
+        }
+        if write_stream_body(&mut stream, start, length).is_err() {
+            return;
+        }
+        let _ = stream.flush();
+    }
+
+    /// 单条流式连接：解析 `Range: bytes=<start>-` → 206 头 + 现场生成的 body。
+    fn serve_streaming_connection(
+        mut stream: std::net::TcpStream,
+        total: u64,
+        cut_after: Option<u64>,
+        requests: Arc<AtomicU64>,
+        heads: mpsc::Sender<String>,
+    ) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+        }
+        requests.fetch_add(1, Ordering::Relaxed);
+        let _ = heads.send(head.clone());
+        // `Range: bytes=<start>-`（开放结尾）→ 一直服务到文件尾；
+        // `bytes=<start>-<end>`（旧分段路径的闭区间）→ 只服务请求的那一段。
+        let (start, requested_end) = head
+            .lines()
+            .find_map(|line| {
+                let lower = line.trim().to_ascii_lowercase();
+                let rest = lower.strip_prefix("range: bytes=")?.to_string();
+                let (start, end) = rest.split_once('-')?;
+                let start = start.trim().parse::<u64>().ok()?;
+                let end = end.trim();
+                let end = if end.is_empty() {
+                    None
+                } else {
+                    Some(end.parse::<u64>().ok()?)
+                };
+                Some((start, end))
+            })
+            .unwrap_or((0, None));
+        if start >= total {
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            return;
+        }
+        let end = requested_end.unwrap_or(total - 1).min(total - 1);
+        let declared = end - start + 1;
+        // 请求是开放结尾（bytes=N-）时，服务端如实把 [N, total) 全部声明出来
+        // ——这正是 CDN 对 mpv/浏览器的回答形态。
+        let header = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            return;
+        }
+        let limit = match cut_after {
+            Some(cut) => declared.min(cut),
+            None => declared,
+        };
+        if write_stream_body(&mut stream, start, limit).is_err() {
+            return;
+        }
+        let _ = stream.flush();
+    }
+
+    /// 按 `offset % 256` 生成 body：256 字节周期整块复制，166MB 也是毫秒级，
+    /// 且任何偏移错位都会在断言里立刻暴露。
+    fn write_stream_body(
+        stream: &mut std::net::TcpStream,
+        mut offset: u64,
+        mut remaining: u64,
+    ) -> std::io::Result<()> {
+        let template: Vec<u8> = (0..256u32).map(|value| value as u8).collect();
+        let mut block = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let n = remaining.min(block.len() as u64) as usize;
+            let mut position = 0usize;
+            let mut shift = (offset % 256) as usize;
+            while position < n {
+                let take = (n - position).min(256 - shift);
+                block[position..position + take].copy_from_slice(&template[shift..shift + take]);
+                position += take;
+                shift = 0;
+            }
+            stream.write_all(&block[..n])?;
+            offset += n as u64;
+            remaining -= n as u64;
+        }
+        Ok(())
+    }
+
+    /// 从请求头里取出 `Range` 的值（已小写、去空白），供形态断言。
+    fn range_header_of(head: &str) -> String {
+        head.lines()
+            .find(|line| line.trim_start().to_ascii_lowercase().starts_with("range:"))
+            .map(|line| line.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    }
+
+    /// 顺序读 `length` 字节（模拟 demux 的连续读），断言内容按偏移生成。
+    fn read_forward(source: &mut HttpRangeSource, from: u64, length: u64) -> Vec<u8> {
+        let mut collected = Vec::new();
+        let mut cursor = from;
+        while (cursor - from) < length {
+            let want = (from + length - cursor).min(32 * 1024);
+            let bytes = source
+                .read_range(ByteRange {
+                    start: cursor,
+                    length: Some(want),
+                })
+                .unwrap_or_else(|error| panic!("offset {cursor} 读取失败: {error}"));
+            assert_eq!(bytes.len() as u64, want, "offset {cursor} 短读");
+            assert_eq!(bytes[0], (cursor % 256) as u8, "offset {cursor} 字节错位");
+            assert_eq!(
+                bytes[bytes.len() - 1],
+                ((cursor + want - 1) % 256) as u8,
+                "offset {cursor} 字节错位"
+            );
+            collected.extend_from_slice(&bytes);
+            cursor += want;
+        }
+        collected
+    }
+
+    #[test]
+    fn legacy_segmented_path_request_count_baseline_for_the_same_playback() {
+        // 对照基线（**刻意保留旧路径的实测数字**）：同一段播放走
+        // `ERIKA_HTTP_SEQUENTIAL=0` 的旧分段路径时到底发多少个请求。
+        // 读 8MB（≈2.3 分钟 1080P），按 256KB 段算 ≈32 个；顺序长读路径在同
+        // 一场景里是 1 个。这个数字就是"一小时几千次"的来源，留着当回归标尺。
+        const BYTES: u64 = 8 * 1024 * 1024;
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(BYTES, None);
+        // 不经 `enable_sequential_stream` → 旧分段路径（与生产回退开关等价）。
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(BYTES);
+        read_forward(&mut source, 0, BYTES);
+        let legacy = requests.load(Ordering::Relaxed);
+        // 跑 `--nocapture` 时打印实测数字（回归时一眼看出量级）。
+        println!(
+            "legacy segmented path: {legacy} HTTP requests for {BYTES} bytes \
+             (sequential path = 1 for the same traffic)"
+        );
+        assert!(
+            legacy >= 16,
+            "旧分段路径是「每段一个请求」（256KB 段 → 8MB ≈32 个），实际 {legacy}"
+        );
+    }
+
+    #[test]
+    fn sequential_stream_covers_a_whole_playback_in_one_request() {
+        // **本次改造的核心验收**：8 分钟 1080P（347KB/s × 480s ≈ 166MB）连续
+        // 播放 → **1 个** HTTP 请求。改造前同样一段播放按 256KB 段切分是 ≈660
+        // 个请求（一小时 4700~6000），官方客户端全程约 79 个。
+        const PLAYBACK_BYTES: u64 = 166 * 1024 * 1024;
+        let (uri, requests, heads) = spawn_streaming_mock_http_server(PLAYBACK_BYTES, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        assert!(source.sequential_enabled);
+        // 按 demux 的真实读粒度（AVIO 32KB 块）从头读到尾。
+        read_forward(&mut source, 0, PLAYBACK_BYTES);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "8 分钟连续播放必须只有 1 个 HTTP 请求（改造前 ≈660 个）"
+        );
+        // 且必须是**开放结尾**的 Range（`bytes=<start>-`，无结束偏移）——
+        // 这是 mpv / 浏览器 / 官方客户端看视频的请求形态。
+        let head = recv_request_head(&heads);
+        assert_eq!(
+            range_header_of(&head),
+            "range: bytes=0-",
+            "必须是开放结尾的 Range，实际请求头: {head}"
+        );
+        // 窗口应当已经填到文件尾（读完 166MB 后读线程收工，不再重连）。
+        let (_, fill, total) = source.stream_window().unwrap();
+        assert_eq!(total, Some(PLAYBACK_BYTES));
+        assert!(
+            fill >= PLAYBACK_BYTES - 256 * 1024,
+            "读到尾后填充位置: {fill}"
+        );
+    }
+
+    #[test]
+    fn sequential_stream_seek_costs_exactly_one_more_request() {
+        const TOTAL: u64 = 64 * 1024 * 1024;
+        let (uri, requests, heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        // 顺序读 1MB：1 个请求。
+        read_forward(&mut source, 0, 1024 * 1024);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        let first = recv_request_head(&heads);
+        assert_eq!(range_header_of(&first), "range: bytes=0-");
+
+        // AVIO seek 钩子（`prefetch_hint`）→ 窗口外目标：读线程放弃旧连接、
+        // 从目标重发**一条** open-ended Range。
+        let target = 32 * 1024 * 1024;
+        source.prefetch_hint(target);
+        let bytes = source
+            .read_range(ByteRange {
+                start: target,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        assert_eq!(bytes[0], (target % 256) as u8);
+        assert_eq!(requests.load(Ordering::Relaxed), 2, "seek 只应多一个请求");
+        let second = recv_request_head(&heads);
+        assert_eq!(
+            range_header_of(&second),
+            format!("range: bytes={target}-"),
+            "seek 后的请求必须从目标起、且开放结尾"
+        );
+
+        // 窗口内回退（后向缓冲命中）：**零请求**。
+        source.prefetch_hint(target + 32 * 1024);
+        let back = source
+            .read_range(ByteRange {
+                start: target + 32 * 1024,
+                length: Some(16 * 1024),
+            })
+            .unwrap();
+        assert_eq!(back[0], ((target + 32 * 1024) % 256) as u8);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            2,
+            "窗口内 seek 不得产生请求"
+        );
+
+        // 回退到**后向缓冲之外**（回到文件开头）：后向缓冲只覆盖已消费的
+        // back_bytes，超出就得重发一条——这才是诚实的边界。
+        source.prefetch_hint(0);
+        let rewind = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        assert_eq!(rewind[0], 0);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            3,
+            "超出后向缓冲的回退必须重发（恰好 +1）"
+        );
+        let third = recv_request_head(&heads);
+        assert_eq!(range_header_of(&third), "range: bytes=0-");
+    }
+
+    #[test]
+    fn sequential_stream_stops_reading_when_the_window_is_full() {
+        // **背压**：前向窗口填满后必须停止从 socket 读（不关连接、不发新请求）。
+        // 若背压失效，读线程会在几百毫秒内把 8MB 全下完——断言直接抓住。
+        //
+        // 边界口径（2026-09-15 修正；这条测试此前 flaky）：窗口满后**不是零增长**
+        // —— `stream_drip_enabled()` 默认开启，满窗后每 200ms 仍会再滴灌 16KiB，
+        // 上限是 `front_cap + STREAM_DRIP_HEADROOM_BYTES`（1MiB）。旧断言写的是
+        // `fill <= 256KB + 128KB`：本机实测（临时探针）**400ms 就已经是 352KB**，
+        // 余量只有 32KB；机器一忙（599 个用例并行时 sleep 被拉长）就越界失败。
+        // 也就是说随机失败的不是背压，是断言没把滴灌余量算进去。
+        //
+        // 现在的口径与兄弟用例 `window_stops_at_the_budget_without_discarding_buffered_bytes`
+        // 一致：① 绝对上界 = 前向预算 + 滴灌余量 + 小块余量；② 满窗后的**增长速率**
+        // 必须仍是滴灌量级（按实测时间间隔归一，避免"忙 → sleep 拉长"再次误判）。
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        const FRONT_CAP: u64 = 256 * 1024; // = STREAM_MIN_FRONT_CAP
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        source.read_ahead_bytes = 256 * 1024; // = STREAM_MIN_FRONT_CAP
+        let first = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        assert_eq!(first.len(), 64 * 1024);
+        // 有界等待"窗口真的填满"，而不是"睡够 400ms 就该填满"（后者在并行压力下
+        // 会变成"还没填满就断言"）。
+        let fill_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut fill = 0u64;
+        while std::time::Instant::now() < fill_deadline {
+            let (_, current, _) = source.stream_window().unwrap();
+            fill = current;
+            if fill >= FRONT_CAP {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(fill >= FRONT_CAP, "窗口必须在超时前填满：fill={fill}");
+        assert!(
+            fill <= FRONT_CAP + STREAM_DRIP_HEADROOM_BYTES + 128 * 1024,
+            "窗口写满后不得继续读：fill={fill}（8MB 全下完即背压失效）"
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "背压不得靠重发请求实现"
+        );
+        // 满窗后的增长速率：标称滴灌 = 16KiB/200ms ≈ 80KB/s；本机实测最坏
+        // ≈245KB/s（352KB@400ms）。上界取 1MiB/s —— 仍比"本地环回全速下载"
+        // （百 MB/s 量级）低两个数量级，所以"背压失效"依然会被抓住。
+        let before_growth = fill;
+        let growth_started = std::time::Instant::now();
+        thread::sleep(Duration::from_millis(400));
+        let growth_seconds = growth_started.elapsed().as_secs_f64().max(0.001);
+        let (_, after_growth, _) = source.stream_window().unwrap();
+        let grown = after_growth.saturating_sub(before_growth);
+        let grown_per_sec = grown as f64 / growth_seconds;
+        assert!(
+            grown_per_sec <= 1024.0 * 1024.0,
+            "满窗后必须只剩滴灌量级的读取：{grown} 字节 / {growth_seconds:.3}s = {grown_per_sec:.0} B/s"
+        );
+        // 消费之后必须能继续推进，且**仍然只有那一个请求**（连接没被关掉）。
+        let next = source
+            .read_range(ByteRange {
+                start: 64 * 1024,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        assert_eq!(next.len(), 64 * 1024);
+        let progress_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut fill_after = fill;
+        while std::time::Instant::now() < progress_deadline {
+            let (_, current, _) = source.stream_window().unwrap();
+            fill_after = current;
+            if fill_after > fill {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            fill_after > fill,
+            "消费后应继续填充：{fill} -> {fill_after}"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sequential_stream_resumes_silently_after_the_server_closes_early() {
+        // CDN 主动掐断长连接的真实形态：声明了 Content-Length 却没发完就收线
+        // （ureq 的 body reader 会报错而不是 EOF）。读线程必须从 `write_pos`
+        // **静默续传**：demux 侧看不到任何错误，请求数恰好 +1。
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let (uri, requests, heads) = spawn_streaming_mock_http_server(TOTAL, Some(16 * 1024));
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        let bytes = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 64 * 1024, "demux 侧必须无感（不得短读/报错）");
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[64 * 1024 - 1], ((64 * 1024 - 1) % 256) as u8);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            2,
+            "掐断后从断点续传：恰好 +1 个请求"
+        );
+        let first = recv_request_head(&heads);
+        let second = recv_request_head(&heads);
+        assert_eq!(range_header_of(&first), "range: bytes=0-");
+        // 续传起点取决于客户端在被掐断前**实际收到**多少字节（TCP 分段不确定），
+        // 断言它落在 (0, 掐断点] 内即可——语义"从已收字节之后续上"完全一致。
+        let resumed: u64 = range_header_of(&second)
+            .trim_start_matches("range: bytes=")
+            .trim_end_matches('-')
+            .parse()
+            .unwrap_or_else(|_| panic!("续传请求头无法解析: {second}"));
+        assert!(
+            resumed > 0 && resumed <= 16 * 1024,
+            "续传必须从已收字节之后起（0 < {resumed} <= 16384）"
+        );
+    }
+
+    #[test]
+    fn full_preload_bucket_downloads_the_whole_file_in_one_request() {
+        // 整片预载桶也必须是**流式**：旧实现（`full_preload_step`）是"每步一个
+        // 256KB Range 请求"，4MB 桶 = 16 个请求、一整部 300MB 片子上千个——
+        // 与 demux 侧的分段预取叠加正是用户实测的"一小时几千次"。
+        // 这里断言整个桶只花 **1** 个请求，且桶的语义（按绝对偏移读回）不变。
+        const TOTAL: u64 = 4 * 1024 * 1024;
+        let (uri, requests, heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let state = FullPreloadState::new();
+        state.learn_total(TOTAL);
+        full_preload_stream_loop(
+            &http_stream_agent(),
+            Arc::new(Mutex::new(uri)),
+            &[],
+            &state,
+            TOTAL, // cap
+            false, // eager
+            false, // report_audio_first
+            false, // video_bucket
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "整片预载必须是 1 个请求（旧实现 4MB 桶 = 16 个请求）"
+        );
+        assert_eq!(
+            range_header_of(&recv_request_head(&heads)),
+            "range: bytes=0-"
+        );
+        assert_eq!(state.covered_until(), TOTAL);
+        let head = state.copy_range(0, 4096).unwrap();
+        assert_eq!(head[0], 0);
+        assert_eq!(head[4095], (4095 % 256) as u8);
+        let tail = state.copy_range(TOTAL - 4096, 4096).unwrap();
+        assert_eq!(tail[0], ((TOTAL - 4096) % 256) as u8);
+    }
+
+    #[test]
+    fn sequential_stream_reports_the_live_window_in_diagnostics() {
+        // 宿主（bili-rs）直接吃这些字段，语义一个都不能变：
+        //   - `cache_start` / `demux_cache_end` 必须是**长流窗口**（旧字段
+        //     `cache_bytes` 在长读路径下恒空，再用它算窗口就是"缓存恒 0"，
+        //     策略层立刻判饥饿 → 无故换源/降档）；
+        //   - `content_length` 由首个 206 的 Content-Range 回填（**不发 HEAD**）；
+        //   - `prefetch_in_flight` 是 O(1)（旧模型 5~6 条连接）；
+        //   - 请求画像如实计数（含重试与续传的口径不变）。
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        read_forward(&mut source, 0, 512 * 1024);
+        let snapshot = source.diag_snapshot();
+        assert_eq!(snapshot.cache_start, 0);
+        assert!(
+            snapshot.demux_cache_end >= 512 * 1024,
+            "demux 窗口前沿必须反映长流已填位置，实际 {}",
+            snapshot.demux_cache_end
+        );
+        assert_eq!(
+            snapshot.content_length,
+            Some(TOTAL),
+            "总长应由首个 206 的 Content-Range 回填（不发 HEAD）"
+        );
+        assert!(
+            snapshot.prefetch_in_flight <= 3,
+            "长读路径的并发连接数是 O(1)，实际 {}",
+            snapshot.prefetch_in_flight
+        );
+        // 进程级单调计数：本源的请求确实被记进去了（其它并行用例只会累加）。
+        assert!(
+            snapshot.http_requests >= requests.load(Ordering::Relaxed),
+            "请求画像必须反映真实请求数"
+        );
+        assert!(snapshot.active_host.contains("127.0.0.1"));
+        assert_eq!(snapshot.host_epoch, 0);
+    }
+
+    #[test]
+    fn sequential_stream_host_switch_resumes_on_the_new_host_without_losing_bytes() {
+        // 换源自愈：切 host 时**已收字节全在窗口里**，读线程只是换一条连接、
+        // 从 `write_pos` 续——demux 侧一个字节都不丢、一个错误都看不到。
+        // 旧模型要"作废在飞段 + 重发"，这里没有"在飞段"这个概念。
+        const TOTAL: u64 = 32 * 1024 * 1024;
+        let (uri_a, requests_a, _heads_a) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (uri_b, requests_b, heads_b) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source =
+            HttpRangeSource::with_http_headers_and_diag_slot(uri_a.clone(), Vec::new(), 0)
+                .enable_sequential_stream();
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.5)]);
+        read_forward(&mut source, 0, 1024 * 1024);
+        assert_eq!(requests_a.load(Ordering::Relaxed), 1);
+        let fill_before = source.stream_window().unwrap().1;
+        // 模拟死连：久无字节但 demux 仍在读。
+        //
+        // **注意（2026-09-04 订正）**：顺序长读的"最后收到字节"由读线程自己维护
+        // （`SequentialReader::last_arrival_ms`，修复了"该时间戳在顺序长读下从不
+        // 刷新 → 每 6 秒换一次 host"的真机 bug）。所以死连必须把**那个**时间戳
+        // 做旧；只改 `source.last_byte_ms` 已经不再影响判据（它取两者较新者）。
+        source
+            .stream
+            .as_ref()
+            .expect("顺序长读已起")
+            .last_arrival_ms
+            .store(now_ms().saturating_sub(10_000), Ordering::Relaxed);
+        source.last_byte_ms = now_ms().saturating_sub(10_000);
+        source.last_read_call_ms = now_ms();
+        source.maybe_switch_host();
+        assert_eq!(source.active_idx, 1);
+        assert_eq!(source.host_epoch, 1);
+        // 继续读：数据必须**继续**（偏移连续、内容正确）——跨 host 无缝。
+        read_forward(&mut source, 1024 * 1024, 2 * 1024 * 1024);
+        assert_eq!(
+            requests_a.load(Ordering::Relaxed),
+            1,
+            "换源后不得再打旧 host"
+        );
+        assert_eq!(
+            requests_b.load(Ordering::Relaxed),
+            1,
+            "新 host 上从 write_pos 续传：恰好一个请求"
+        );
+        let head = recv_request_head(&heads_b);
+        let resumed: u64 = range_header_of(&head)
+            .trim_start_matches("range: bytes=")
+            .trim_end_matches('-')
+            .parse()
+            .unwrap_or_else(|_| panic!("续传请求头无法解析: {head}"));
+        // 续传起点 = 换 host 那一刻的已收到前沿（采样后再涨一点是正常的：切换
+        // 前旧 host 还在推字节，那些字节照样保留）。
+        assert!(
+            resumed >= fill_before && resumed < fill_before + 8 * 1024 * 1024,
+            "续传起点必须是已收到的前沿（{resumed} vs 采样 {fill_before}）"
+        );
+    }
+
+    #[test]
+    fn sequential_stream_drop_returns_without_waiting_for_the_connection() {
+        // 关窗/换源时的**有界退出**：读线程可能正阻塞在 socket read 上，
+        // 裸 join 会把 UI 线程钉住（用户最忌讳的"关窗卡死"）。Drop 走有界等待
+        // （500ms）+ detach，这里断言它真的很快返回。
+        const TOTAL: u64 = 256 * 1024 * 1024;
+        let (uri, _requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        read_forward(&mut source, 0, 256 * 1024);
+        // 窗口远没填满（4MB vs 256MB），读线程此刻正在猛读。
+        let started = Instant::now();
+        drop(source);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "Drop 必须有界返回（实际 {:?}）",
+            started.elapsed()
+        );
+    }
+
+    // =====================================================================
+    // 滑动窗口 + 分层缓存（2026-09-04 架构改造）
+    //
+    // 覆盖用户实测的四条缺陷与两条追加需求：
+    //   ④ 整段缓冲完之后重播仍在"重复大量下载"；
+    //   ⑤ 回拖/重播到已缓冲区域必须**零网络**命中（内存层或磁盘层）；
+    //   ① 缓冲不再"一路冲到整片下完"：达到预算就停（背压），消费推进再补；
+    //   ③ 缓存有明确字节预算，且**能在诊断里看到**；
+    //   （追加）弱网按**秒数**更激进地缓冲，同时内存不越字节硬上限；
+    //   （追加）冷区落盘 + 磁盘预算 + 淘汰真的删文件。
+    // =====================================================================
+
+    /// 按生产路径装配顺序长读 + 整片桶（含归档冷区），但把桶目录指向测试
+    /// 自己的临时目录（绝不碰 `ERIKA_PRELOAD_DIR`，避免与并行用例互污）。
+    fn streaming_source_with_cold_tier(
+        uri: String,
+        dir: &Path,
+    ) -> (HttpRangeSource, Arc<FullPreloadState>) {
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        // 目录必须在 `enable_full_preload` 之前指好（桶/冷区在那一刻开）。
+        source.override_preload_dir(dir.to_path_buf());
+        let source = source.enable_full_preload();
+        let state = source.full_preload.clone().expect("冷区状态必须已装配");
+        assert!(state.archive_mode(), "顺序长读路径必须进归档模式");
+        (source, state)
+    }
+
+    #[test]
+    fn replay_of_a_fully_buffered_file_costs_zero_requests() {
+        // **缺陷 ④**：整个窗口都缓冲结束之后，重播（把播放位置挪回开头再放）
+        // 不得再产生任何网络请求——"事实上都已经缓冲结束了，就不需要再对它
+        // 进行缓冲了"。数据仍在预算内（这里 2MB < 4MB 前向预算），所以窗口
+        // 从头到尾都在内存里，既不淘汰也不重下。
+        const TOTAL: u64 = 2 * 1024 * 1024;
+        let dir = preload_test_dir("replay");
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (mut source, state) = streaming_source_with_cold_tier(uri, &dir);
+
+        // 第一次播完（整片 2MB）。
+        read_forward(&mut source, 0, TOTAL);
+        let first_play = requests.load(Ordering::Relaxed);
+        println!("replay: 第一次播完 {TOTAL} 字节 → {first_play} 个请求");
+        assert_eq!(first_play, 1, "整片顺序播放只应有 1 个请求");
+
+        // 重播：AVIO seek 钩子 + 从头读。
+        source.prefetch_hint(0);
+        read_forward(&mut source, 0, TOTAL);
+        let after_replay = requests.load(Ordering::Relaxed);
+        println!("replay: 重播整片后 → {after_replay} 个请求（必须仍为 1）");
+        assert_eq!(
+            after_replay, 1,
+            "整段仍在预算内时重播必须零新请求（缺陷 ④），实际 {after_replay}"
+        );
+        // 诚实边界：这条路径没用到磁盘层（窗口全在内存），冷区字节应为 0。
+        assert_eq!(state.cold_bytes(), 0, "2MB 全在前向预算内，不该有淘汰");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seek_back_into_the_disk_tier_costs_zero_requests_and_keeps_the_bytes() {
+        // **缺陷 ⑤ + 冷区落盘的核心验收**：往前播过一段（比回看窗口大得多）
+        // 之后，回拖到很久以前的已缓冲区间：
+        //   ① 必须 **0 个新网络请求**（字节来自磁盘冷区，而不是网络）；
+        //   ② 读回的字节必须与原始字节**完全一致**（错位 = 静默数据损坏）。
+        const TOTAL: u64 = 24 * 1024 * 1024;
+        let dir = preload_test_dir("cold-seek-back");
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (mut source, state) = streaming_source_with_cold_tier(uri, &dir);
+
+        // 往前播 16MB：远超后向窗口（默认 4MB）→ 早期区间被淘汰进冷区。
+        read_forward(&mut source, 0, 16 * 1024 * 1024);
+        // 冷区写入是异步的（归档线程），等它把交接块落完。
+        let cold_ready = Instant::now();
+        while state.cold_bytes() == 0 && cold_ready.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let cold_bytes = state.cold_bytes();
+        let forward_requests = requests.load(Ordering::Relaxed);
+        println!("cold-tier: 前向 16MB 后 → 请求 {forward_requests} 个，冷区 {cold_bytes} 字节");
+        assert!(cold_bytes > 0, "16MB 前向播放必须把早期区间淘汰进冷区");
+        assert!(
+            state.covers(0, 64 * 1024),
+            "最早期的那一块必须真的在冷区里（覆盖下界 = 0）"
+        );
+
+        // 回拖到原点：AVIO seek 钩子 + 读第一块。
+        source.prefetch_hint(0);
+        let back = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(64 * 1024),
+            })
+            .unwrap_or_else(|error| panic!("回拖到已落盘区间读取失败: {error}"));
+        let after_seek_back = requests.load(Ordering::Relaxed);
+        println!(
+            "cold-tier: 回拖到 0 再读 64KB → 请求 {after_seek_back} 个（必须仍为 {forward_requests}），冷区命中 {} 次",
+            state.cold_hit_count()
+        );
+        assert_eq!(
+            after_seek_back, forward_requests,
+            "回拖到已落盘区间必须零新请求（缺陷 ⑤），实际 {after_seek_back}"
+        );
+        assert_eq!(back.len(), 64 * 1024);
+        // 字节一致性：服务器按 `offset % 256` 生成内容，逐字节核对。
+        for (index, byte) in back.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                (index % 256) as u8,
+                "冷区读回的第 {index} 字节错位（静默数据损坏）"
+            );
+        }
+        assert!(state.cold_hit_count() > 0, "命中必须被计入诊断");
+        // 诊断字段：内存层/磁盘层字节数都必须如实可见。
+        let snapshot = source.diag_snapshot();
+        println!(
+            "cold-tier: 诊断 cache_memory_bytes={} cache_disk_bytes={} cold_hits={} cold_hit_bytes={}",
+            snapshot.cache_memory_bytes,
+            snapshot.cache_disk_bytes,
+            snapshot.cold_hits,
+            snapshot.cold_hit_bytes
+        );
+        assert!(
+            snapshot.cache_disk_bytes >= 64 * 1024,
+            "磁盘层至少要能看到回拖命中的那一块，实际 {}",
+            snapshot.cache_disk_bytes
+        );
+        assert!(snapshot.cold_hit_bytes >= back.len() as u64);
+        // 内存层不得越过硬上限。
+        assert!(
+            snapshot.cache_memory_bytes <= snapshot.memory_budget_bytes,
+            "内存层 {} 越过硬上限 {}",
+            snapshot.cache_memory_bytes,
+            snapshot.memory_budget_bytes
+        );
+        drop(source);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window_stops_at_the_budget_without_discarding_buffered_bytes() {
+        // **缺陷 ① + 需求 ②③**：缓冲不再"一路冲到整片下完"。前向窗口填到预算
+        // 就停下（背压，不关连接、不发新请求），并且**不丢**任何已缓冲字节
+        // （旧实现在 demux 跑赢时会把桶整体前移丢弃旧字节）。
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        // 明确的小预算（不改 env，避免影响并行用例）：前向 512KB / 后向 256KB。
+        source.read_ahead_bytes = 512 * 1024;
+        source.back_bytes = 256 * 1024;
+
+        read_forward(&mut source, 0, 64 * 1024);
+        thread::sleep(Duration::from_millis(400));
+        let (base, fill, _) = source.stream_window().unwrap();
+        println!("budget: 填窗后 base={base} fill={fill}（前向预算 524288 + 滴灌余量）");
+        // 窗口停在"前向预算 + 滴灌余量"附近：滴灌的存在只允许再多读 1MiB 上限
+        // （见 `STREAM_DRIP_HEADROOM_BYTES`），**不再是"一路下到整片"**。
+        let drip_room = STREAM_DRIP_HEADROOM_BYTES;
+        assert!(
+            fill <= 512 * 1024 + drip_room + 128 * 1024,
+            "前向窗口必须停在预算+滴灌余量附近，实际 fill={fill}（8MB 全下完 = 预算失效）"
+        );
+        thread::sleep(Duration::from_millis(700));
+        let (_, fill_later, _) = source.stream_window().unwrap();
+        let grown = fill_later.saturating_sub(fill);
+        // 滴灌语义（2026-09-04）：窗口满之后**仍会以 ~80KB/s 的小口继续读**
+        // （避免 CDN 判定写空闲而重置连接），但增长必须是"滴灌速率"量级，
+        // 而不是全速下载——700ms 最多几十 KB。
+        println!(
+            "budget: 700ms 后 fill={fill_later}（增长 {grown} 字节，滴灌上限 ≈{}）",
+            80 * 1024
+        );
+        assert!(
+            grown <= 256 * 1024,
+            "满窗后的增长必须是滴灌量级（≤256KB/700ms），实际 {grown}"
+        );
+        assert!(
+            fill_later <= 512 * 1024 + drip_room + 128 * 1024,
+            "滴灌不得越出预算+余量：{fill_later}"
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "停在预算是靠背压/滴灌实现的，不得靠重发请求"
+        );
+
+        // 不丢弃：窗口内（后向 256KB）回读必须零请求且字节正确。
+        let back = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(32 * 1024),
+            })
+            .unwrap();
+        assert_eq!(back[0], 0, "回读第一字节必须仍是文件第 0 字节");
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "回读已缓冲区间不得产生新请求"
+        );
+        // 内存硬上限：常驻字节不得超过预算。
+        let snapshot = source.diag_snapshot();
+        println!(
+            "budget: 诊断 cache_memory_bytes={} memory_budget={} forward_budget={}",
+            snapshot.cache_memory_bytes,
+            snapshot.memory_budget_bytes,
+            snapshot.forward_budget_bytes
+        );
+        assert!(
+            snapshot.cache_memory_bytes <= snapshot.memory_budget_bytes,
+            "常驻内存 {} 越过硬上限 {}",
+            snapshot.cache_memory_bytes,
+            snapshot.memory_budget_bytes
+        );
+        assert!(
+            snapshot.forward_budget_bytes >= 512 * 1024,
+            "前向预算不得低于配置的 read-ahead"
+        );
+    }
+
+    #[test]
+    fn advancing_past_the_window_edge_refills_incrementally_on_one_connection() {
+        // 需求 ②的后半句：播放推进到窗口边缘后**按预算继续往前补**，而且补的
+        // 代价是"同一个连接继续读"，不是"每补一次重发一个请求"。
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        source.read_ahead_bytes = 512 * 1024;
+        source.back_bytes = 256 * 1024;
+
+        read_forward(&mut source, 0, 128 * 1024);
+        thread::sleep(Duration::from_millis(300));
+        let (_, fill_first, _) = source.stream_window().unwrap();
+        let requests_first = requests.load(Ordering::Relaxed);
+
+        // 推进到窗口边缘附近再往前消费（模拟播放继续）。
+        read_forward(&mut source, 128 * 1024, 256 * 1024);
+        thread::sleep(Duration::from_millis(300));
+        let (_, fill_second, _) = source.stream_window().unwrap();
+        let requests_second = requests.load(Ordering::Relaxed);
+        println!(
+            "refill: 推进 256KB → fill {fill_first} -> {fill_second}，请求 {requests_first} -> {requests_second}"
+        );
+        assert!(
+            fill_second > fill_first,
+            "消费推进后必须继续往前补：{fill_first} -> {fill_second}"
+        );
+        assert_eq!(
+            requests_second, requests_first,
+            "补窗必须复用同一条连接（增量请求上界 = 0），实际 {requests_second}"
+        );
+        // 仍然不越内存硬上限。
+        let snapshot = source.diag_snapshot();
+        assert!(
+            snapshot.cache_memory_bytes <= snapshot.memory_budget_bytes,
+            "补窗后常驻内存 {} 越过硬上限 {}",
+            snapshot.cache_memory_bytes,
+            snapshot.memory_budget_bytes
+        );
+    }
+
+    #[test]
+    fn cold_budget_eviction_drops_the_oldest_segment_and_deletes_its_file() {
+        // **追加需求**：磁盘也要有预算；超预算时按策略淘汰（丢**最久远**的段，
+        // 保留最近回看窗口），并且**淘汰必须真的删文件**（不留残渣）。
+        let dir = preload_test_dir("cold-evict");
+        let body = vec![9u8; 1024 * 1024];
+        let state = FullPreloadState::open("https://example.invalid/x.m4s", 0, 1024 * 1024, &dir);
+        state.learn_total(64 * 1024 * 1024);
+        // 预算 16MiB：塞 3 段（每段 8MiB）必然触发一次淘汰。
+        state.cold_budget.store(16 * 1024 * 1024, Ordering::Relaxed);
+
+        // 预算是"温"的：先塞两段（16MiB，不超），记录它们各自的文件路径。
+        let mut first_segment_path = None;
+        for index in 0..2u64 {
+            for step in 0..8u64 {
+                let offset = index * 8 * 1024 * 1024 + step * 1024 * 1024;
+                state.ingest_evicted(offset, &body);
+            }
+            if index == 0 {
+                let guard = state.inner.lock().unwrap();
+                first_segment_path =
+                    guard
+                        .sealed
+                        .first()
+                        .and_then(|segment| match &segment.store {
+                            PreloadStore::Disk(disk) => Some(disk.file.path.clone()),
+                            PreloadStore::Memory(_) => None,
+                        });
+            }
+        }
+        let sealed_after_two = state.inner.lock().unwrap().sealed.len();
+        let cold_after_two = state.cold_bytes();
+        println!(
+            "cold-evict: 两段后 sealed={sealed_after_two} cold_bytes={cold_after_two} first_file={:?}",
+            first_segment_path
+        );
+        assert_eq!(cold_after_two, 16 * 1024 * 1024, "两段应恰好 16MiB");
+        let first_path = first_segment_path;
+        if let Some(path) = first_path.as_ref() {
+            assert!(path.exists(), "未超预算时不许删任何段文件");
+        }
+
+        // 第三段 → 超预算 → 丢最久远的一段（起点最小的封存段）。
+        for step in 0..8u64 {
+            let offset = 16 * 1024 * 1024 + step * 1024 * 1024;
+            state.ingest_evicted(offset, &body);
+        }
+        let cold_after_evict = state.cold_bytes();
+        println!(
+            "cold-evict: 三段后 cold_bytes={cold_after_evict}（预算 16MiB），最旧段文件还在吗={:?}",
+            first_path.as_ref().map(|path| path.exists())
+        );
+        assert!(
+            cold_after_evict <= 16 * 1024 * 1024,
+            "冷区字节 {} 越过磁盘预算",
+            cold_after_evict
+        );
+        assert!(
+            !state.covers(0, 4096),
+            "最久远的一段必须已被淘汰（[0, 8MiB) 不再命中）"
+        );
+        assert!(
+            state.covers(16 * 1024 * 1024, 4096),
+            "最近回看窗口必须保留（[16MiB, ...) 仍命中）"
+        );
+        if let Some(path) = first_path.as_ref() {
+            assert!(
+                !path.exists(),
+                "淘汰必须**真的删除段文件**，不能留残渣：{}",
+                path.display()
+            );
+        }
+        // 关窗收尾：整个冷区文件也一并删除。
+        let live = state
+            .inner
+            .lock()
+            .unwrap()
+            .sealed
+            .iter()
+            .find_map(|segment| match &segment.store {
+                PreloadStore::Disk(disk) => Some(disk.file.path.clone()),
+                PreloadStore::Memory(_) => None,
+            });
+        drop(state);
+        if let Some(live) = live {
+            assert!(!live.exists(), "冷区释放后不得留下文件：{}", live.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_only_cold_tier_serves_hits_without_touching_the_disk() {
+        // **回退开关**（`ERIKA_PRELOAD_DISK=0` / 旧名 `ERIKA_PRELOAD_TO_DISK=0`）：
+        // 关掉落盘后冷区走**纯内存**，分层与"命中即零网络"的语义完全不变；
+        // 预算同时被钳到 `WINDOW_COLD_MEMORY_ONLY_MAX`（32MiB），
+        // **不会**因为关掉落盘就把 256MiB 搬进内存。
+        assert!(
+            window_cold_budget(false) <= WINDOW_COLD_MEMORY_ONLY_MAX,
+            "纯内存冷区预算必须被钳住"
+        );
+        assert!(
+            window_cold_budget(true) >= window_cold_budget(false),
+            "落盘开关只应放宽（不是收紧）冷区预算"
+        );
+        // 无 `dir` 的状态 = 段一律内存（等价于关掉落盘）。
+        let state = FullPreloadState::new();
+        state.learn_total(64 * 1024 * 1024);
+        state.cold_budget.store(16 * 1024 * 1024, Ordering::Relaxed);
+        let chunk = vec![3u8; 1024 * 1024];
+        for step in 0..24u64 {
+            state.ingest_evicted(step * 1024 * 1024, &chunk);
+        }
+        let disk_segments = state
+            .inner
+            .lock()
+            .unwrap()
+            .sealed
+            .iter()
+            .filter(|segment| matches!(segment.store, PreloadStore::Disk(_)))
+            .count();
+        println!(
+            "memory-only: cold_bytes={} 预算={} 落盘段数={disk_segments}",
+            state.cold_bytes(),
+            state.cold_budget_bytes()
+        );
+        assert_eq!(disk_segments, 0, "纯内存冷区不得开任何段文件");
+        assert!(
+            state.cold_bytes() <= 16 * 1024 * 1024,
+            "纯内存冷区同样受预算约束"
+        );
+        assert!(state.covers(23 * 1024 * 1024, 4096), "最近的区间必须可命中");
+        assert_eq!(
+            state.read_cached(23 * 1024 * 1024, 4096).unwrap(),
+            vec![3u8; 4096]
+        );
+        assert!(state.cold_hit_count() >= 1, "命中必须被计数");
+        assert!(!state.covers(0, 4096), "最久远的段必须已被淘汰");
+    }
+
+    #[test]
+    fn weak_network_widens_the_forward_window_without_breaking_the_memory_cap() {
+        // **追加需求（弱网更激进）**：预算不能只按字节卡——那样网速越差、
+        // 折算出的可播秒数越短，恰好是反的。这里断言：
+        //   ① 吞吐越低 → 前向**可播秒数**越长（弱网堆更多时间垫）；
+        //   ② 任何情况下 前向 + 后向 ≤ 内存硬上限（字节守内存）。
+        // 参照行为：官方网页端在弱网下"会直接缓冲后面好大一段"（同类客户端
+        // issue cotaku/Bibi-Release#344 的对照结论），本公式的目标是达到并
+        // 超过它的量级。
+        const READ_AHEAD: u64 = 4 * 1024 * 1024;
+        const BACK: u64 = 4 * 1024 * 1024;
+        const BITRATE: f64 = 100_000.0; // 360P 级：100KB/s
+
+        let fast = window_budget(0, READ_AHEAD, BACK, BITRATE, Some(1_000_000.0)); // 链路 10x
+        let normal = window_budget(0, READ_AHEAD, BACK, BITRATE, Some(100_000.0)); // 刚好够播
+        let weak = window_budget(0, READ_AHEAD, BACK, BITRATE, Some(25_000.0)); // 四分之一速
+        let terrible = window_budget(0, READ_AHEAD, BACK, BITRATE, Some(5_000.0)); // 1/20 速
+
+        for (name, budget) in [
+            ("fast", fast),
+            ("normal", normal),
+            ("weak", weak),
+            ("terrible", terrible),
+        ] {
+            let secs = budget.forward_bytes as f64 / BITRATE;
+            println!(
+                "{name}: 前向预算 {} 字节（≈{secs:.0}s 可播），后向 {} 字节，内存上限 {} 字节",
+                budget.forward_bytes, budget.back_bytes, budget.memory_bytes
+            );
+            assert!(
+                budget.forward_bytes + budget.back_bytes <= budget.memory_bytes,
+                "{name}: 前向+后向越内存硬上限"
+            );
+        }
+
+        // ① 弱网更激进：可播秒数单调上升。
+        assert!(
+            normal.forward_secs >= 30.0,
+            "充裕/正常链路的前向时间预算不应低于 30s（网页端量级）"
+        );
+        assert!(
+            weak.forward_secs > normal.forward_secs,
+            "弱网（1/4 速）的前向时间预算必须更长：{} vs {}",
+            weak.forward_secs,
+            normal.forward_secs
+        );
+        assert!(
+            terrible.forward_secs > weak.forward_secs,
+            "更弱网（1/20 速）必须继续放宽：{} vs {}",
+            terrible.forward_secs,
+            weak.forward_secs
+        );
+        assert!(
+            terrible.forward_secs <= WINDOW_FORWARD_SECS_MAX,
+            "弱网放开必须有上限（内存/磁盘成本兜底）"
+        );
+        // ② 字节守内存：极弱网也不会把内存撑爆。
+        assert!(
+            terrible.forward_bytes + terrible.back_bytes <= terrible.memory_bytes,
+            "极弱网下仍在内存硬上限内"
+        );
+
+        // ③ **吞吐未知 ≠ 充裕**：拿不到吞吐时回退到保守固定秒数（20s），
+        // 既不是"不知道就多缓"（`weak` 的 80s），也不是"少缓"（`fast` 的 30s 之下）。
+        let unknown = window_budget(0, READ_AHEAD, BACK, BITRATE, None);
+        println!(
+            "unknown: 吞吐未知 → 前向 {:.0}s / {} 字节（保守回退 {:.0}s）",
+            unknown.forward_secs, unknown.forward_bytes, WINDOW_FORWARD_SECS_CONSERVATIVE
+        );
+        assert_eq!(
+            unknown.forward_secs, WINDOW_FORWARD_SECS_CONSERVATIVE,
+            "吞吐未知必须回退到保守固定秒数"
+        );
+        assert!(
+            unknown.forward_secs < weak.forward_secs,
+            "未知不得被当成弱网（那会凭空多缓）"
+        );
+        assert_eq!(unknown.throughput_bps, None, "未知语义必须如实保留");
+        assert!(unknown.forward_bytes + unknown.back_bytes <= unknown.memory_bytes);
+        // 码率也未知（开播最初 ~2s）→ 退回配置值，与改造前行为一致。
+        let cold_start = window_budget(0, READ_AHEAD, BACK, 0.0, None);
+        assert_eq!(cold_start.forward_bytes, READ_AHEAD, "冷启动前向 = 配置值");
+        assert_eq!(cold_start.back_bytes, BACK, "冷启动后向 = 配置值");
+        assert_eq!(cold_start.forward_secs, 0.0, "算不出秒数就如实报 0");
+
+        // 运行时那一半：窗口容量被预算调小时，已缓冲字节**立即**被裁到上限内
+        // （不是"下次消费才生效"）。
+        let shared = Arc::new(StreamShared {
+            buf: Mutex::new(StreamBuffer::new(0, 4 * 1024 * 1024, 4 * 1024 * 1024)),
+            data_cv: Condvar::new(),
+        });
+        {
+            let mut guard = lock_stream(&shared);
+            guard.push(&vec![7u8; 6 * 1024 * 1024]);
+            guard.consume_to(5 * 1024 * 1024);
+            // consume_to 已经按后向预算（4MB）裁掉 1MB：常驻 = 5MB。
+            assert_eq!(guard.resident_bytes(), 5 * 1024 * 1024, "裁剪前应有 5MB");
+            guard.set_caps(1024 * 1024, 1024 * 1024);
+            let resident = guard.resident_bytes();
+            println!("weak: 预算收紧后常驻 {resident} 字节（上限 2MB）");
+            assert!(
+                resident <= 2 * 1024 * 1024,
+                "预算收紧后常驻 {} 字节越过上限 2MB",
+                resident
+            );
+            // 前向内容必须完好（裁剪只动后向历史，不许伤到待播字节）。
+            assert_eq!(guard.front_len(), 1_048_576, "前向深度应保持 1MB");
+        }
+    }
+
+    #[test]
+    fn whole_playback_with_layered_cache_stays_at_one_request_and_bounded_memory() {
+        // 「整片播放总请求数」的回归标尺（用户实测同一条：328MB 一次播放）。
+        // 旧模型 ≈1310 个请求，官方 ≈79，上一轮改造（长连接 + 整片桶流式）84。
+        // 本次（滑动窗口 + 分层缓存）的答案：**1 个请求**，与文件大小无关；
+        // 内存被预算钉住、磁盘被冷区预算钉住，回拖仍零网络。
+        const TOTAL: u64 = 328 * 1024 * 1024;
+        let dir = preload_test_dir("whole-playback");
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (mut source, state) = streaming_source_with_cold_tier(uri, &dir);
+        // 冷区预算压到 32MiB：既让淘汰路径真的跑起来，也不让测试写掉几百 MB 盘。
+        state.cold_budget.store(32 * 1024 * 1024, Ordering::Relaxed);
+
+        read_forward(&mut source, 0, TOTAL);
+        let total_requests = requests.load(Ordering::Relaxed);
+        let snapshot = source.diag_snapshot();
+        println!(
+            "whole-playback: {TOTAL} 字节 → {total_requests} 个请求；内存 {} 字节（上限 {}），磁盘 {} 字节（预算 {}）",
+            snapshot.cache_memory_bytes,
+            snapshot.memory_budget_bytes,
+            snapshot.cache_disk_bytes,
+            state.cold_budget_bytes()
+        );
+        assert_eq!(total_requests, 1, "整片播放必须只有 1 个请求");
+        assert!(
+            snapshot.cache_memory_bytes <= snapshot.memory_budget_bytes,
+            "内存 {} 越过硬上限 {}",
+            snapshot.cache_memory_bytes,
+            snapshot.memory_budget_bytes
+        );
+        assert!(
+            snapshot.cache_disk_bytes <= state.cold_budget_bytes(),
+            "磁盘 {} 越过冷区预算 {}",
+            snapshot.cache_disk_bytes,
+            state.cold_budget_bytes()
+        );
+        assert!(
+            state.cold_bytes() > 8 * 1024 * 1024,
+            "整片播放应当把大量历史区间沉到冷区，实际 {}",
+            state.cold_bytes()
+        );
+
+        // 回拖到**冷区确实覆盖**的位置（不猜：问状态自己哪个偏移真的在盘上）。
+        let mut target = None;
+        let mut probe = TOTAL - 8 * 1024 * 1024;
+        while probe > 0 {
+            if state.covers(probe, 32 * 1024) {
+                target = Some(probe);
+                break;
+            }
+            probe -= 1024 * 1024;
+        }
+        let target = target.expect("整片播放后冷区应当仍覆盖相当一段历史区间");
+        source.prefetch_hint(target);
+        let back = source
+            .read_range(ByteRange {
+                start: target,
+                length: Some(32 * 1024),
+            })
+            .unwrap();
+        let after_rewind = requests.load(Ordering::Relaxed);
+        println!(
+            "whole-playback: 回拖到 {target}（距尾部 {} 字节）→ 请求 {after_rewind} 个（必须仍为 {total_requests}），冷区命中 {} 次",
+            TOTAL - target,
+            state.cold_hit_count()
+        );
+        assert_eq!(after_rewind, total_requests, "回拖到已落盘区间必须零新请求");
+        for (index, byte) in back.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                ((target as usize + index) % 256) as u8,
+                "冷区读回字节错位"
+            );
+        }
+        drop(source);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sequential_stream_never_rebuilds_the_connection_across_a_whole_playback() {
+        // **本次追加的头号验收指标**：顺序播放期间**不该重建连接**。
+        //
+        // 真机反例（用户 631 秒 / 176MB 视频的实测，`[perf][CLIENT][1s]` 行）：
+        //   `HTTP v=387次(均2002KB,≈1.0/s)` → `v=398次(均1972KB,≈1.0/s)`
+        //   边际：21 秒 +11 个请求、每请求只传 ≈917KB（≈0.52 次/秒）——
+        //   而窗口基本是满的（29.4MB/32MB），**不是**背压导致的。
+        // 本测试断言"内核自己绝不重建"：只要服务端不主动收线，8 分钟连续播放
+        // 必须只有 1 个请求、重建计数全 0（尤其是 `reset` 必须为 0）。
+        // 真机那种"每 ~0.9MB 重建一次"由下面两条服务端行为测试分别复现与归因。
+        const PLAYBACK_BYTES: u64 = 200 * 1024 * 1024; // ≈8 分钟 1080P
+        let (uri, requests, _heads) = spawn_streaming_mock_http_server(PLAYBACK_BYTES, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        read_forward(&mut source, 0, PLAYBACK_BYTES);
+        let snapshot = source.diag_snapshot();
+        println!(
+            "no-rebuild: {PLAYBACK_BYTES} 字节 → 请求 {} 个，重建 total={} (early_close={} empty={} reset={} host_switch={} chunked={})",
+            requests.load(Ordering::Relaxed),
+            snapshot.stream_reconnects_total,
+            snapshot.stream_reconnects_early_close,
+            snapshot.stream_reconnects_empty,
+            snapshot.stream_reconnects_reset,
+            snapshot.stream_reconnects_host_switch,
+            snapshot.stream_chunk_resumes
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "顺序播放必须一条连接读到底"
+        );
+        assert_eq!(snapshot.stream_reconnects_total, 0, "内核自己不得重建连接");
+        assert_eq!(
+            snapshot.stream_reconnects_reset, 0,
+            "顺序播放期间不得有 reset"
+        );
+    }
+
+    #[test]
+    fn cdn_cutting_every_megabyte_is_resumed_transparently_and_attributed_to_the_cdn() {
+        // 复现真机形态：服务端**声明**完整范围，却每 1MB 收线一次。
+        // 断言 ① 字节一个不丢、顺序正确；② 重建全部归因于 `early_close`（CDN），
+        // `reset` 必须为 0（不是我们的锅）；③ 请求数 = 分片数（这是请求数下界）。
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        const CUT: u64 = 1024 * 1024;
+        let (uri, requests, heads) = spawn_cutting_mock_http_server(TOTAL, CUT);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        read_forward(&mut source, 0, TOTAL);
+        let snapshot = source.diag_snapshot();
+        let expected = TOTAL.div_ceil(CUT);
+        println!(
+            "cdn-cut: {TOTAL} 字节 / 每 {CUT} 字节收线 → 请求 {} 个（预期 {expected}），early_close={} reset={} total={}",
+            requests.load(Ordering::Relaxed),
+            snapshot.stream_reconnects_early_close,
+            snapshot.stream_reconnects_reset,
+            snapshot.stream_reconnects_total
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            expected,
+            "服务端每收线一次就必然多一个请求：请求数 = 分片数（这是下界，不是我们的 bug）"
+        );
+        // 恒等式（宿主可直接用它核算请求来源）：**请求数 = 1 + 重建次数**。
+        // 首条连接不算"重建"，所以这里重建数 = 分片数 - 1。
+        assert_eq!(
+            snapshot.stream_reconnects_early_close,
+            expected - 1,
+            "重建必须全部归因于服务端提前收线"
+        );
+        assert_eq!(
+            snapshot.stream_reconnects_total,
+            expected - 1,
+            "请求数 = 1 + 重建次数"
+        );
+        assert_eq!(
+            snapshot.stream_reconnects_reset, 0,
+            "不得有任何本地 reset（否则是我们的 bug）"
+        );
+        // 续传必须从断点精确接上：请求头的 Range 起点逐片递增。
+        let mut starts = Vec::new();
+        for _ in 0..expected {
+            let head = recv_request_head(&heads);
+            let value = range_header_of(&head);
+            let start: u64 = value
+                .trim_start_matches("range: bytes=")
+                .trim_end_matches('-')
+                .parse()
+                .unwrap_or_else(|_| panic!("请求头无法解析: {head}"));
+            starts.push(start);
+        }
+        for (index, start) in starts.iter().enumerate() {
+            assert_eq!(
+                *start,
+                index as u64 * CUT,
+                "第 {index} 片必须从断点续传（字节不丢、不重下）"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_content_range_chunks_are_resumed_and_not_mistaken_for_eof() {
+        // 分片式 CDN（`Content-Range` 的 end+1 < total）**不是**文件尾：
+        // 旧实现在分片末尾直接 `eof = true` → 流永远停在半途（真机音频
+        // 2.7MB/8MB 停滞的形态）。现在必须续传，且整片字节一个不丢。
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        const CHUNK: u64 = 1024 * 1024;
+        let (uri, requests, _heads) = spawn_chunked_mock_http_server(TOTAL, CHUNK);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        read_forward(&mut source, 0, TOTAL);
+        let snapshot = source.diag_snapshot();
+        let expected = TOTAL.div_ceil(CHUNK);
+        println!(
+            "chunked: {TOTAL} 字节 / 每片 {CHUNK} → 请求 {} 个（预期 {expected}），chunk_resumes={} reset={} eof 前沿={}",
+            requests.load(Ordering::Relaxed),
+            snapshot.stream_chunk_resumes,
+            snapshot.stream_reconnects_reset,
+            source.stream_window().map(|(_, fill, _)| fill).unwrap_or(0)
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), expected, "每片一个请求");
+        assert!(
+            snapshot.stream_chunk_resumes >= expected - 1,
+            "分片续传必须被计入 chunk_resumes，实际 {}",
+            snapshot.stream_chunk_resumes
+        );
+        assert_eq!(snapshot.stream_reconnects_reset, 0);
+        // 读到整片末尾：前沿必须到 TOTAL（没有被分片尾误判成 EOF）。
+        let (_, fill, total) = source.stream_window().unwrap();
+        assert_eq!(total, Some(TOTAL));
+        assert_eq!(fill, TOTAL, "分片尾不得被当成文件尾（旧实现会停在 1MB）");
+    }
+
+    #[test]
+    fn range_journal_classifies_resume_versus_seek() {
+        // **判决实验（假说 D）的仪器自检**：请求起点序列必须能把
+        // "断点续传"（服务端/传输侧断了我们）与"demux 跳读"（与 CDN 无关）
+        // 分开。判据：Contiguous = 断点续；Backward/ForwardJump = 在 seek。
+        const TOTAL: u64 = 16 * 1024 * 1024;
+        let (uri, requests, _heads) = spawn_cutting_mock_http_server(TOTAL, 1024 * 1024);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        read_forward(&mut source, 0, 9 * 1024 * 1024);
+        let snapshot = source.diag_snapshot();
+        println!(
+            "journal: contiguous={} forward={} backward={} last_start={} last_conn={}KB max_conn={}KB requests={}",
+            snapshot.stream_range_contiguous,
+            snapshot.stream_range_forward_jumps,
+            snapshot.stream_range_backward_jumps,
+            snapshot.stream_range_last_start,
+            snapshot.stream_last_connection_bytes / 1024,
+            snapshot.stream_max_connection_bytes / 1024,
+            requests.load(Ordering::Relaxed),
+        );
+        assert!(
+            snapshot.stream_range_contiguous >= 1,
+            "每 1MB 被收线后从断点续 → 必须计为 contiguous，实际 {}",
+            snapshot.stream_range_contiguous
+        );
+        assert_eq!(
+            snapshot.stream_range_backward_jumps, 0,
+            "顺序前进播放期间不该出现回拖（backward_jump）"
+        );
+        // 真回拖（seek 到窗口之外）→ 必须被识别为 backward_jump：
+        // 这才是"请求放大可能来自 demux 而非 CDN"的那一类。
+        source.prefetch_hint(0);
+        let _ = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(32 * 1024),
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let after = source.diag_snapshot();
+        println!(
+            "journal: 回拖后 backward={} forward={} contiguous={}",
+            after.stream_range_backward_jumps,
+            after.stream_range_forward_jumps,
+            after.stream_range_contiguous
+        );
+        assert!(
+            after.stream_range_backward_jumps >= 1,
+            "回拖到窗口外必须被计为 backward_jump（判决实验的分界）"
+        );
+    }
+
+    #[test]
+    fn a_dead_connection_recovers_long_before_a_deep_buffer_drains() {
+        // **本轮核心断言（真机 vstall=16→21s 却 Hold 的修复）**：缓冲很深时，
+        // 连接真死必须**早于**缓冲耗尽就触发恢复。
+        //
+        // 真机反例：`buf=57.7s vstall=16s→21s` → 判据一直 Hold，要等第 56 秒
+        // 才动作，用户先看到卡住。现在两条恢复通路都与缓冲深度解耦：
+        //   ① 连接真死：6s 无字节（`MULTI_HOST_STALL_MS`）就走；
+        //   ② 供给跟不上：前向可播 < 20s 恢复余量并持续 3s 就走。
+        // 本测试构造"缓冲还剩几十秒 + 连接真死"，断言在**剩余可播时间仍远超
+        // 恢复余量**时就换了源（即触发时刻早于耗尽，且留足恢复时间）。
+        const TOTAL: u64 = 256 * 1024 * 1024;
+        let (uri_a, _requests_a, _heads_a) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (uri_b, _requests_b, _heads_b) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri_a.clone()).enable_sequential_stream();
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.5)]);
+        // 深缓冲：8MB 前向 + 低码率（0.1MB/s）→ 满窗 ≈ 80 秒可播。
+        source.read_ahead_bytes = 8 * 1024 * 1024;
+        source.back_bytes = 4 * 1024 * 1024;
+        source.consume_bps = 100_000.0;
+        read_forward(&mut source, 0, 256 * 1024);
+        thread::sleep(Duration::from_millis(400));
+        let before = source.stream_health();
+        println!(
+            "recover-early: 触发前 前向可播 {:.1}s 窗口满={}",
+            before.forward_secs, before.window_full
+        );
+        assert!(
+            before.forward_secs > MULTI_HOST_RECOVERY_MARGIN_SECS * 1.5,
+            "前置条件：缓冲必须远深于恢复余量（实际 {:.1}s）",
+            before.forward_secs
+        );
+        // 连接真死：读线程再没收到字节（顺序长读的到达时间戳做旧），但 demux
+        // 仍在读（`read_in_flight`/活跃时间戳都新鲜）。
+        source
+            .stream
+            .as_ref()
+            .expect("长读已起")
+            .last_arrival_ms
+            .store(
+                now_ms().saturating_sub(MULTI_HOST_STALL_MS + 500),
+                Ordering::Relaxed,
+            );
+        source.last_byte_ms = now_ms().saturating_sub(MULTI_HOST_STALL_MS + 500);
+        source.last_read_call_ms = now_ms();
+        source.read_in_flight = true; // demux 正挂在读上（真机形态）
+        // ① **窗口满 + 连接真死 → 不换源**：窗口满是"供给充足"的正面证据，而
+        //    连接死掉由读线程自己从 `write_pos` 重连兜底（+1 请求，字节不丢），
+        //    换源判据在这里必须按住不动（防抖，上一轮的核心修复）。
+        let full_health = source.stream_health();
+        assert!(full_health.window_full, "前置条件：窗口必须已满");
+        source.maybe_switch_host();
+        println!(
+            "recover-early: 满窗+真死 → host_epoch={}（必须 0，由读线程重连兜底）",
+            source.host_epoch
+        );
+        assert_eq!(
+            source.host_epoch, 0,
+            "窗口满时不得换源（真死由读线程重连兜底）"
+        );
+        // ② **链路还活着但供给跟不上**（真机 `ratio=0.68/0.33` 的形态：字节仍在
+        //    到达，只是比消费慢）→ 前向掉到恢复余量附近并持续 3s 必须换源，
+        //    且触发时前向仍剩约一个恢复余量（**早于缓冲耗尽**）。
+        //    （这里刻意保持 `last_arrival_ms` 新鲜，隔离出"余量线"这条判据；
+        //      路径①的"6 秒无字节"是另一条更快的通路，不受 3s 迟滞约束。）
+        {
+            let stream = source.stream.as_ref().expect("长读已起");
+            let shared = Arc::clone(&stream.shared);
+            let mut guard = lock_stream(&shared);
+            let write_pos = guard.write_pos();
+            // 前向压到 ~15s（码率 0.1MB/s → 1.5MB），即低于 20s 恢复余量。
+            let keep = (1.5 * 1024.0 * 1024.0) as u64;
+            guard.consume_to(write_pos.saturating_sub(keep));
+        }
+        source.last_read_call_ms = now_ms();
+        source.read_in_flight = true;
+        source
+            .stream
+            .as_ref()
+            .expect("长读已起")
+            .last_arrival_ms
+            .store(now_ms(), Ordering::Relaxed);
+        source.maybe_switch_host(); // 只开始计时（迟滞）
+        assert_eq!(source.host_epoch, 0, "刚判饥饿不该立刻换（需要持续 3s）");
+        source.starve_since_ms = now_ms().saturating_sub(MULTI_HOST_STARVE_PERSIST_MS + 200);
+        source.last_read_call_ms = now_ms();
+        source.read_in_flight = true;
+        source
+            .stream
+            .as_ref()
+            .expect("长读已起")
+            .last_arrival_ms
+            .store(now_ms(), Ordering::Relaxed);
+        source.maybe_switch_host();
+        let after = source.stream_health();
+        println!(
+            "recover-early: 前向掉到余量线 → host_epoch={} 原因={} 触发时前向仍剩 {:.1}s（缓冲总深 {:.1}s）",
+            source.host_epoch, source.last_switch_reason, after.forward_secs, before.forward_secs
+        );
+        assert_eq!(
+            source.host_epoch, 1,
+            "供给跟不上必须触发恢复（不得 Hold 到耗尽）"
+        );
+        assert!(
+            source.last_switch_reason.contains("starving"),
+            "原因必须可读且指向饥饿：{}",
+            source.last_switch_reason
+        );
+        assert!(
+            after.forward_secs < MULTI_HOST_RECOVERY_MARGIN_SECS + 1.0,
+            "触发点应当在恢复余量附近（实际 {:.1}s）",
+            after.forward_secs
+        );
+        assert!(
+            after.forward_secs > 0.0,
+            "必须**早于**缓冲耗尽触发：触发时前向仍剩 {:.1}s",
+            after.forward_secs
+        );
+    }
+
+    #[test]
+    fn a_paused_source_never_accumulates_starvation() {
+        // **暂停态必须显式排除**：暂停时 demux 不读、字节自然不来——若把它算成
+        // 饥饿，用户一暂停就会被换源（真机日志最后一行就是 `state=Paused`）。
+        const TOTAL: u64 = 64 * 1024 * 1024;
+        let (uri_a, _requests_a, _heads_a) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (uri_b, _requests_b, _heads_b) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri_a.clone()).enable_sequential_stream();
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.5)]);
+        source.read_ahead_bytes = 512 * 1024;
+        source.back_bytes = 256 * 1024;
+        source.consume_bps = 4_000_000.0; // 大码率：前向秒数会很小（更容易误判饥饿）
+        read_forward(&mut source, 0, 64 * 1024);
+        thread::sleep(Duration::from_millis(300));
+        // 进入"暂停"：没有读调用在飞、活跃时间戳过期、字节很长时间没来。
+        source.read_in_flight = false;
+        source.last_read_call_ms = now_ms().saturating_sub(MULTI_HOST_ACTIVE_MS + 5_000);
+        source.last_byte_ms = now_ms().saturating_sub(60_000);
+        source
+            .stream
+            .as_ref()
+            .expect("长读已起")
+            .last_arrival_ms
+            .store(now_ms().saturating_sub(60_000), Ordering::Relaxed);
+        // 把消费前沿推到下载前沿：前向可播 = 0（若判据不看"在播"，这里必触发）。
+        {
+            let stream = source.stream.as_ref().expect("长读已起");
+            let shared = Arc::clone(&stream.shared);
+            let mut guard = lock_stream(&shared);
+            let write_pos = guard.write_pos();
+            guard.consume_to(write_pos);
+        }
+        for _ in 0..10 {
+            source.maybe_switch_host();
+            thread::sleep(Duration::from_millis(20));
+        }
+        println!(
+            "paused: host_epoch={} starve_since={} 原因='{}'",
+            source.host_epoch, source.starve_since_ms, source.last_switch_reason
+        );
+        assert_eq!(source.host_epoch, 0, "暂停态绝不能换源");
+        assert_eq!(source.starve_since_ms, 0, "暂停态不得累计饥饿计时");
+    }
+
+    #[test]
+    fn a_full_window_with_low_throughput_never_triggers_a_host_switch() {
+        // **真机"87 秒换源 14 次"的核心修复断言**：窗口满 = 供给充足的正面证据。
+        //
+        // 旧判据用 `est_bps < 25KB/s` 判"慢"。但顺序长读的**背压语义**是"窗口满就
+        // 几乎不读 socket"，此时到达速率必然收敛到**消费速率** → 健康的满窗口被
+        // 判成慢链路 → 切 host → 新连接重新加速（rate shapers throttle by connection
+        // age）→ 窗口又满 → 再判慢 → 无限抖动。
+        // 本测试构造"窗口满 + 吞吐极低 + demux 一直在读"，断言**一次都不换**。
+        const TOTAL: u64 = 64 * 1024 * 1024;
+        let (uri_a, _requests_a, _heads_a) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (uri_b, _requests_b, _heads_b) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri_a.clone()).enable_sequential_stream();
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.5)]);
+        // 小预算：读一点就把窗口填满（本地 mock 很快）。
+        source.read_ahead_bytes = 512 * 1024;
+        source.back_bytes = 256 * 1024;
+        read_forward(&mut source, 0, 64 * 1024);
+        thread::sleep(Duration::from_millis(500));
+
+        // 制造旧判据必然误判的现场：吞吐很低（5KB/s < 25KB/s 阈值）。
+        source.est_bps = 5_000.0;
+        // 连做 40 轮"播放中"的换源判定（旧实现在第 6 秒就会开始换、每 4 秒一次）。
+        let mut switches = 0;
+        for _ in 0..40 {
+            source.last_read_call_ms = now_ms();
+            let before = source.host_epoch;
+            source.maybe_switch_host();
+            if source.host_epoch != before {
+                switches += 1;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let health = source.stream_health();
+        println!(
+            "full-window: 前向可播 {:.1}s 窗口满={} est={:.0}KB/s → 换源 {switches} 次（必须 0）",
+            health.forward_secs,
+            health.window_full,
+            source.est_bps / 1024.0
+        );
+        assert!(
+            health.window_full,
+            "前置条件：窗口必须已满（否则本测试无意义）"
+        );
+        assert_eq!(switches, 0, "窗口满时绝不能换源（否则就是抖动循环）");
+        assert_eq!(source.host_epoch, 0);
+    }
+
+    /// **整片已缓冲完 → "没有字节到达"不是死连证据**（真机事故 2026-09-15）。
+    ///
+    /// 现场：19MB 的片子已经缓冲到 18.9/19MB，`vstall` 却涨到 596 秒——整片下完
+    /// 之后网络前沿不再前进，"距上次字节"自然一路涨。只要 demux 还有一次读活动
+    /// （`consuming` 为真），旧判据就会拿"下完了"当死连证据去换源，并给健康
+    /// host 记失败分污染下次排序。
+    ///
+    /// **关键前提**：这里必须用"整片比 `read_ahead` 还小"的片子——真机就是这样
+    /// （宿主配 32MiB，片子 19MB）。此时 `window_full` 恒为 false，那道守卫等于
+    /// 不存在，只有 `source_complete` 能拦住它。
+    #[test]
+    fn a_fully_cached_source_does_not_look_like_a_dead_host() {
+        const TOTAL: u64 = 2 * 1024 * 1024;
+        let (uri_a, _ra, _ha) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (uri_b, _rb, _hb) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri_a.clone()).enable_sequential_stream();
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.5)]);
+        // read_ahead > 整片：窗口永远填不满（真机形态；窗满的下界是 32MiB）。
+        source.read_ahead_bytes = 8 * 1024 * 1024;
+        source.back_bytes = 256 * 1024;
+        // 完整读一遍：网络前沿应当走到服务端声明的 total。
+        read_forward(&mut source, 0, TOTAL);
+        let mut complete = false;
+        for _ in 0..100 {
+            if source.stream_health().source_complete {
+                complete = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(complete, "前置条件：整片必须已缓冲完（source_complete）");
+        assert!(
+            !source.stream_health().window_full,
+            "前置条件：整片比 read_ahead 小 → window_full 必须为 false（真机形态）"
+        );
+        // 真机现场：距上次字节远超 6s 死连阈值；两条"最后字节"来源都推旧
+        //（判据取两者的较新者，所以要一起推）。
+        let stale = now_ms().saturating_sub(MULTI_HOST_STALL_MS * 50);
+        source.last_byte_ms = stale;
+        if let Some(stream) = source.stream.as_ref() {
+            stream.last_arrival_ms.store(stale, Ordering::Relaxed);
+        }
+        source.est_bps = 0.0;
+        // 码率取大 → 前向可播秒数贴近 0，把"饥饿"判据也压成成立（对照组）。
+        source.consume_bps = 4_000_000.0;
+        let mut switches = 0;
+        for _ in 0..40 {
+            // demux 仍在读（真机上 demux 从窗口里取数据同样走这条路径）。
+            source.last_read_call_ms = now_ms();
+            // 饥饿迟滞已过（否则第一次判定只是开始计时，测不出东西）。
+            source.starve_since_ms = now_ms().saturating_sub(MULTI_HOST_STARVE_PERSIST_MS + 200);
+            let before = source.host_epoch;
+            source.maybe_switch_host();
+            if source.host_epoch != before {
+                switches += 1;
+            }
+        }
+        let health = source.stream_health();
+        println!(
+            "full-cache: 前向 {:.1}s 窗口满={} 已完整={} → 换源 {switches} 次（必须 0）",
+            health.forward_secs, health.window_full, health.source_complete
+        );
+        assert_eq!(
+            switches, 0,
+            "整片已缓冲完时绝不能换源：那是「不需要」，不是「来不了」"
+        );
+        assert_eq!(source.host_epoch, 0);
+    }
+
+    #[test]
+    fn only_real_starvation_triggers_a_host_switch() {
+        // 换源的**唯一**正当理由：这条链路正在饿死我们——前向缓冲见底
+        // （< 2s 可播）并持续 ≥3s，或长时间没有字节到达。
+        const TOTAL: u64 = 64 * 1024 * 1024;
+        let (uri_a, _requests_a, _heads_a) = spawn_streaming_mock_http_server(TOTAL, None);
+        let (uri_b, _requests_b, _heads_b) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri_a.clone()).enable_sequential_stream();
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.5)]);
+        source.read_ahead_bytes = 8 * 1024 * 1024;
+        source.back_bytes = 512 * 1024;
+        read_forward(&mut source, 0, 64 * 1024);
+        thread::sleep(Duration::from_millis(200));
+        // 构造真饥饿：把消费前沿推到下载前沿（前向 = 0 秒），并让码率估计很大
+        // 使"可播秒数"确实见底；同时保持"demux 在读"。
+        {
+            let stream = source.stream.as_ref().expect("长读已起");
+            let shared = Arc::clone(&stream.shared);
+            let mut guard = lock_stream(&shared);
+            let write_pos = guard.write_pos();
+            guard.consume_to(write_pos);
+        }
+        source.consume_bps = 4_000_000.0; // 4MB/s：0 前向 → 0 秒可播
+        source.last_read_call_ms = now_ms();
+        // 第一次判定只**开始计时**（迟滞），不该立刻换。
+        source.maybe_switch_host();
+        assert_eq!(source.host_epoch, 0, "刚判饥饿不该立刻换（需要持续 3s）");
+        // 让"饥饿起点"过去 3.2 秒（比真机等待便宜：直接做旧计时起点）。
+        source.starve_since_ms = now_ms().saturating_sub(MULTI_HOST_STARVE_PERSIST_MS + 200);
+        source.last_read_call_ms = now_ms();
+        source.maybe_switch_host();
+        println!(
+            "starving: host_epoch={} 原因={}",
+            source.host_epoch, source.last_switch_reason
+        );
+        assert_eq!(source.host_epoch, 1, "持续饥饿必须换源");
+        assert!(
+            source.last_switch_reason.contains("starving"),
+            "换源原因必须可读且说明是饥饿：{}",
+            source.last_switch_reason
+        );
+    }
+
+    #[test]
+    fn switch_cooldown_and_rate_limit_cap_the_rotation() {
+        // ③ 抖动抑制：即便判据一直成立，也必须 ① 冷却期内不换；
+        // ② 5 分钟窗口内最多 `MULTI_HOST_MAX_SWITCHES` 次，之后停在当前 host。
+        const TOTAL: u64 = 64 * 1024 * 1024;
+        let mut candidates = Vec::new();
+        for index in 0..3 {
+            let (uri, _r, _h) = spawn_streaming_mock_http_server(TOTAL, None);
+            candidates.push((uri, 1.0 - index as f64 * 0.1));
+        }
+        let mut source = HttpRangeSource::new(candidates[0].0.clone()).enable_sequential_stream();
+        source.set_candidates(candidates.clone());
+        source.read_ahead_bytes = 8 * 1024 * 1024;
+        // 先把长流起起来（`maybe_switch_host` 的饥饿判据读窗口状态）。
+        read_forward(&mut source, 0, 64 * 1024);
+        thread::sleep(Duration::from_millis(150));
+        source.consume_bps = 4_000_000.0;
+        {
+            let stream = source.stream.as_ref().expect("长读已起");
+            let shared = Arc::clone(&stream.shared);
+            let mut guard = lock_stream(&shared);
+            let write_pos = guard.write_pos();
+            guard.consume_to(write_pos);
+        }
+        // 模拟"持续劣化"：每轮都把饥饿计时做旧、把冷却清掉，只留限流闸生效。
+        for _ in 0..12 {
+            source.starve_since_ms = now_ms().saturating_sub(MULTI_HOST_STARVE_PERSIST_MS + 100);
+            source.last_read_call_ms = now_ms();
+            source.switch_cooldown_until = Instant::now();
+            source.maybe_switch_host();
+        }
+        let switches = source.host_epoch;
+        println!(
+            "rotation-cap: 连续劣化 12 轮 → 实际换源 {switches} 次（上限 {MULTI_HOST_MAX_SWITCHES}）"
+        );
+        assert!(
+            switches as usize <= MULTI_HOST_MAX_SWITCHES,
+            "轮换必须被限流闸钳住，实际 {switches}"
+        );
+        // 冷却：立刻再判一次（不清冷却）→ 不得再切。
+        let before = source.host_epoch;
+        source.starve_since_ms = now_ms().saturating_sub(MULTI_HOST_STARVE_PERSIST_MS + 100);
+        source.last_read_call_ms = now_ms();
+        source.maybe_switch_host();
+        assert_eq!(
+            source.host_epoch, before,
+            "冷却期内不得再换（复发退避 4s 起翻倍到 32s）"
+        );
+    }
+
+    #[test]
+    fn bilibili_sources_send_the_referer_anti_leech_header() {
+        // 对外调研（一手）：B 站防盗链——带 UA 不带 Referer → 403。成熟客户端
+        // 全部无条件带 `Referer: https://www.bilibili.com`。我们没带 → 现在补上。
+        const TOTAL: u64 = 4 * 1024 * 1024;
+        let (uri, _requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let bilibili_uri = uri.replace("127.0.0.1", "upos-sz-mirrorcos.bilivideo.com");
+        // 真实连不了该域名，所以只验证**请求头装配**：用本地 uri 但手工构造
+        // 与生产同样的 header 集合。
+        let source = HttpRangeSource::with_http_headers_and_diag_slot(uri.clone(), Vec::new(), 0);
+        source.enable_sequential_stream();
+        // 直接检查 is_bilibili_media_host + 构造器补头逻辑。
+        assert!(is_bilibili_media_host(&bilibili_uri));
+        assert!(!is_bilibili_media_host(&uri));
+        let with_referer =
+            HttpRangeSource::with_http_headers_and_diag_slot(bilibili_uri.clone(), Vec::new(), 0);
+        assert!(
+            with_referer
+                .http_headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("referer")
+                    && value == "https://www.bilibili.com"),
+            "B 站媒体源必须自动带上防盗链 Referer：{:?}",
+            with_referer.http_headers
+        );
+        // 宿主自己给了 Referer 时不重复添加。
+        let custom = HttpRangeSource::with_http_headers_and_diag_slot(
+            bilibili_uri,
+            vec![("Referer".to_string(), "https://example.test/".to_string())],
+            0,
+        );
+        assert_eq!(
+            custom
+                .http_headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                .count(),
+            1,
+            "宿主已给 Referer 时不得重复添加"
+        );
+        // 本地源不该被塞 Referer。
+        let local = HttpRangeSource::with_http_headers_and_diag_slot(uri, Vec::new(), 0);
+        assert!(
+            !local
+                .http_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("referer")),
+            "非 B 站源不得被塞 Referer"
+        );
+        // 顺带：我们发的是**自己实现的 HTTP 层**（ureq），不是 FFmpeg 的 HTTP——
+        // 调研里"FFmpeg 默认发 Connection: close"那条**不适用**于我们。这里真读
+        // 一次、抓真实请求头，断言里面**没有** `connection: close`。
+        let (local_uri, _requests, heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut reader = HttpRangeSource::new(local_uri.clone()).enable_sequential_stream();
+        read_forward(&mut reader, 0, 64 * 1024);
+        let head = recv_request_head(&heads);
+        println!("referer-head: {head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("connection: close"),
+            "我们不该主动发 Connection: close（那是 FFmpeg HTTP 层的固有行为）：{head}"
+        );
+        assert!(
+            head.to_ascii_lowercase().contains("range: bytes=0-"),
+            "请求形态仍是开放结尾长连接（本轮明确不改有界分片）：{head}"
+        );
+    }
+
+    #[test]
+    fn fill_throughput_is_measured_only_while_the_window_is_not_full() {
+        // 任务三：宿主判"能不能升画质"要链路真实吞吐；窗口满时客户端故意不读、
+        // 吞吐会被钳成消费速率。`fill_throughput_bps` 的口径就是"只在窗口未满
+        // 期间采样"，并且宿主 500ms 轮询能读到新鲜值。
+        const TOTAL: u64 = 64 * 1024 * 1024;
+        let (uri, _requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        // 16MB 前向窗口：本地回环下填满也要上百毫秒，足以留下一个真实样本。
+        source.read_ahead_bytes = 16 * 1024 * 1024;
+
+        // 先消费一点，然后让窗口自己填满（本地 mock 很快）。
+        read_forward(&mut source, 0, 256 * 1024);
+        thread::sleep(Duration::from_millis(900));
+        let filled = source.diag_snapshot();
+        println!(
+            "fill-bps: 填窗期 fill_throughput_bps={:.0} B/s，窗口内 {:.0}s",
+            filled.fill_throughput_bps, filled.forward_playable_secs
+        );
+        assert!(
+            filled.fill_throughput_bps > 0.0,
+            "窗口未满期间必须测到非零链路吞吐"
+        );
+        // 本地 mock 是"快链路"：填窗期测得的值应显著高于 1080P 码率量级，
+        // 说明它反映的是链路能力、而不是消费速率。
+        assert!(
+            filled.fill_throughput_bps > 400_000.0,
+            "本地回环链路吞吐应远高于 1080P 码率，实际 {:.0} B/s",
+            filled.fill_throughput_bps
+        );
+        // 背压期间（窗口满、读线程不读）该值必须**冻结**而不是衰减到 0——
+        // 否则宿主会把"我们故意不读"误判成"链路垮了"。
+        thread::sleep(Duration::from_millis(700));
+        let after_backpressure = source.diag_snapshot();
+        println!(
+            "fill-bps: 背压 700ms 后 fill_throughput_bps={:.0} B/s",
+            after_backpressure.fill_throughput_bps
+        );
+        assert!(
+            after_backpressure.fill_throughput_bps >= filled.fill_throughput_bps * 0.5,
+            "背压期间吞吐读数不得塌陷：{:.0} -> {:.0}",
+            filled.fill_throughput_bps,
+            after_backpressure.fill_throughput_bps
+        );
     }
 }

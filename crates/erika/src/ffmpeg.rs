@@ -328,6 +328,111 @@ impl DemuxInput {
     }
 }
 
+/// 一次 `open` 内某个阶段的耗时与字节读数（诊断用）。
+///
+/// 存在的理由：「点播放 → 真正开始播放」这段里，宿主只能看到内核停在
+/// `Opening` 且 `duration` 仍为 0，偏偏网络在正常下载——是「网络慢」还是
+/// 「内核在解析」在宿主侧无法区分。`avformat_open_input` 与
+/// `avformat_find_stream_info` 都会按 `probesize` / `analyzeduration`
+/// 读入可观的流数据才能判定流信息，本结构把这部分切分出来，让"这几秒花在
+/// 哪"成为可读数字，而不是靠推断。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenStageTiming {
+    /// 阶段名（稳定标识，日志直接展示）。
+    pub stage: &'static str,
+    /// 该阶段耗时（毫秒）。
+    pub elapsed_ms: f64,
+    /// 阶段结束时 video 输入累计从源消费的字节（HTTP 路径下即真实下载量）。
+    pub video_bytes: u64,
+    /// 阶段结束时 audio 输入累计从源消费的字节。
+    pub audio_bytes: u64,
+    /// 该阶段观测到的流数（仅 `find_stream_info_*` 阶段有值）。
+    pub streams: Option<usize>,
+}
+
+/// 把一条 open 阶段读数发到两个通道：无条件 stderr（宿主重定向到
+/// `%TEMP%\bili-rs-stderr.log`，用户默认可见），以及内核 trace 文件
+/// （`BILI_RS_KERNEL_TRACE=1` 时）。open 是低频事件，每行几个字节的 I/O
+/// 对起播没有可测影响。
+fn emit_open_stage(stage: &OpenStageTiming) {
+    let line = serde_json::json!({
+        "event": "erika_open_stage",
+        "stage": stage.stage,
+        "elapsedMs": (stage.elapsed_ms * 10.0).round() / 10.0,
+        "videoReadBytes": stage.video_bytes,
+        "audioReadBytes": stage.audio_bytes,
+    })
+    .to_string();
+    crate::trace::diagnostic(line.clone());
+    crate::trace::log(format!("[erika-open-trace] {line}"));
+}
+
+/// 把一条 seek 阶段读数发到与 [`emit_open_stage`] 相同的两个通道。
+///
+/// 存在的理由：真机「续播 seek 的预滚」实测 `elapsedMs=5103`，宿主侧过去只能
+/// 看到那一行（耗时 + 丢帧数），分不清这几秒是 `av_seek_frame` 在 HTTP 源上
+/// 建索引、是等目标窗口的字节到达、还是解码本身。`Demuxer::seek` 跑在 demux
+/// 线程里，而 `AsyncDemuxer::seek` 只投递命令就返回（真正执行推迟到下一次
+/// `Start`，见 `handle_demux_command`），所以这一段是整条预滚链上唯一没有读数
+/// 的环节。读字节数用 AVIO 的累计计数差分，口径与 `OpenStageTiming` 一致
+/// （HTTP 路径下即真实下载量）。
+fn emit_seek_stage(
+    stage: &'static str,
+    target: Duration,
+    elapsed: Duration,
+    input: Option<usize>,
+    bytes_before: &[Option<u64>],
+    bytes_after: &[Option<u64>],
+) {
+    let delta_at = |index: usize| -> u64 {
+        bytes_after
+            .get(index)
+            .copied()
+            .flatten()
+            .zip(bytes_before.get(index).copied().flatten())
+            .map(|(after, before)| after.saturating_sub(before))
+            .unwrap_or(0)
+    };
+    let (video_bytes, audio_bytes) = match input {
+        Some(0) => (delta_at(0), 0),
+        Some(1) => (0, delta_at(1)),
+        Some(_) => (0, 0),
+        None => (delta_at(0), delta_at(1)),
+    };
+    let mut fields = serde_json::Map::new();
+    fields.insert("event".to_string(), serde_json::json!("erika_seek_stage"));
+    fields.insert("stage".to_string(), serde_json::json!(stage));
+    if let Some(index) = input {
+        fields.insert("inputIndex".to_string(), serde_json::json!(index));
+    }
+    // 墙钟毫秒：本行由 demux 线程打印，`video_seek_preroll` 由播放线程打印，
+    // stderr 是多线程共享的。带上墙钟才能把「demux 线程的 seek 用了多久」与
+    // 「播放线程的预滚用了多久」在时间轴上对齐，也才能与宿主 diag 日志的
+    // `[<epochMs>]` 前缀对上。
+    fields.insert(
+        "wallMs".to_string(),
+        serde_json::json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0)
+        ),
+    );
+    fields.insert(
+        "targetSeconds".to_string(),
+        serde_json::json!((target.as_secs_f64() * 1000.0).round() / 1000.0),
+    );
+    fields.insert(
+        "elapsedMs".to_string(),
+        serde_json::json!((elapsed.as_secs_f64() * 1000.0 * 10.0).round() / 10.0),
+    );
+    fields.insert("videoReadBytes".to_string(), serde_json::json!(video_bytes));
+    fields.insert("audioReadBytes".to_string(), serde_json::json!(audio_bytes));
+    let line = serde_json::Value::Object(fields).to_string();
+    crate::trace::diagnostic(line.clone());
+    crate::trace::log(format!("[erika-seek-trace] {line}"));
+}
+
 pub struct Demuxer {
     inputs: Vec<DemuxInput>,
     /// 每个输入缓存的下一包（PTS 交错读取）
@@ -337,6 +442,8 @@ pub struct Demuxer {
     probe: MediaProbe,
     stream_time_bases: Vec<Option<TimeBase>>,
     selection: StreamSelection,
+    /// 本次 open 的分阶段读数（见 [`OpenStageTiming`]）；单输入路径为空。
+    open_stages: Vec<OpenStageTiming>,
 }
 
 unsafe impl Send for Demuxer {}
@@ -376,6 +483,7 @@ impl Demuxer {
             probe,
             stream_time_bases,
             selection: StreamSelection::all(),
+            open_stages: Vec::new(),
         })
     }
 
@@ -391,35 +499,108 @@ impl Demuxer {
     ) -> Result<Self> {
         let video_uri = video_source.uri().to_string();
         let audio_uri = audio_source.uri().to_string();
+        let dash_open_started = std::time::Instant::now();
+        let mut stages: Vec<OpenStageTiming> = Vec::new();
         crate::trace::log(format!(
             "[erika-open-trace] stage=dash_open_start uri={video_uri} | {audio_uri}"
         ));
+        // —— 两条输入**并行** open ——
+        //
+        // video / audio 各持独立的 `FormatContext`、独立 AVIO 与独立 HTTP 连接，
+        // 彼此没有共享状态，因此可以并行。串行的代价在真机上是实打实的：单条流
+        // 在 B 站 CDN 上实测约 320KB/s（宿主日志 `[net] V: speed=316~360KB/s`），
+        // 而两条流同时下载时合计可达 ~1.1MB/s——瓶颈在**单连接速率**而不是链路
+        // 带宽，于是串行等于把靠后那条流的整段读取时间白等。
+        //
+        // 限速对照实验（`tests/open_stages_diag.rs`，同为 320KB/s）：
+        //   串行 open 两个输入 = 5.47s，并行 = 2.73s。
+        //
+        // 失败语义与串行版一致：任一输入失败即整体失败。失败路径才 join 音频
+        // 线程（让它把连接干净收掉，不在返回后继续下载）；成功路径两线程各自
+        // 跑满，谁也不等谁。
+        let audio_worker = std::thread::spawn(move || -> Result<OpenedInput> {
+            let open_started = std::time::Instant::now();
+            let mut context = open_source_format_context(audio_source)?;
+            let open_ms = open_started.elapsed().as_secs_f64() * 1000.0;
+            let bytes_after_open = context.avio_diag().map(|d| d.0).unwrap_or(0);
+            let probe_started = std::time::Instant::now();
+            find_stream_info(&mut context)?;
+            let probe_ms = probe_started.elapsed().as_secs_f64() * 1000.0;
+            let stream_count = unsafe { (*context.as_ptr()).nb_streams as usize };
+            Ok(OpenedInput {
+                context,
+                open_ms,
+                bytes_after_open,
+                probe_ms,
+                stream_count,
+            })
+        });
+
         let video_input_started = std::time::Instant::now();
-        let mut video_context = open_source_format_context(video_source)?;
-        crate::trace::log(format!(
-            "[erika-open-trace] stage=avformat_open_done kind=video elapsed_ms={:.1}",
-            video_input_started.elapsed().as_secs_f64() * 1000.0
-        ));
+        let mut video_context = match open_source_format_context(video_source) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = audio_worker.join();
+                return Err(error);
+            }
+        };
+        let video_open_ms = video_input_started.elapsed().as_secs_f64() * 1000.0;
+        let video_bytes_after_open = video_context.avio_diag().map(|d| d.0).unwrap_or(0);
         let video_probe_started = std::time::Instant::now();
-        find_stream_info(&mut video_context)?;
-        crate::trace::log(format!(
-            "[erika-open-trace] stage=find_stream_info_done kind=video elapsed_ms={:.1} streams={}",
-            video_probe_started.elapsed().as_secs_f64() * 1000.0,
-            unsafe { (*video_context.as_ptr()).nb_streams },
-        ));
-        let audio_input_started = std::time::Instant::now();
-        let mut audio_context = open_source_format_context(audio_source)?;
-        crate::trace::log(format!(
-            "[erika-open-trace] stage=avformat_open_done kind=audio elapsed_ms={:.1}",
-            audio_input_started.elapsed().as_secs_f64() * 1000.0
-        ));
-        let audio_probe_started = std::time::Instant::now();
-        find_stream_info(&mut audio_context)?;
-        crate::trace::log(format!(
-            "[erika-open-trace] stage=find_stream_info_done kind=audio elapsed_ms={:.1} streams={}",
-            audio_probe_started.elapsed().as_secs_f64() * 1000.0,
-            unsafe { (*audio_context.as_ptr()).nb_streams },
-        ));
+        if let Err(error) = find_stream_info(&mut video_context) {
+            let _ = audio_worker.join();
+            return Err(error);
+        }
+        let video_probe_ms = video_probe_started.elapsed().as_secs_f64() * 1000.0;
+        let video_streams = unsafe { (*video_context.as_ptr()).nb_streams as usize };
+        let video_bytes_now = video_context.avio_diag().map(|d| d.0).unwrap_or(0);
+
+        let audio = match audio_worker.join() {
+            Ok(Ok(audio)) => audio,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(FfmpegError::Source(
+                    "audio open worker panicked during DASH open".to_string(),
+                ));
+            }
+        };
+        let audio_context = audio.context;
+        let audio_bytes_now = audio_context.avio_diag().map(|d| d.0).unwrap_or(0);
+
+        // 阶段读数按 video → audio 的固定顺序发布（与串行版一致，便于日志对比）。
+        // 注意 `elapsed_ms` 在并行下是**各自阶段自身**的耗时，两条流的数值会
+        // 重叠——`dash_open_total` 才是整体墙钟（见下方）。
+        stages.push(OpenStageTiming {
+            stage: "avformat_open_video",
+            elapsed_ms: video_open_ms,
+            video_bytes: video_bytes_after_open,
+            audio_bytes: 0,
+            streams: None,
+        });
+        stages.push(OpenStageTiming {
+            stage: "find_stream_info_video",
+            elapsed_ms: video_probe_ms,
+            video_bytes: video_bytes_now,
+            audio_bytes: 0,
+            streams: Some(video_streams),
+        });
+        stages.push(OpenStageTiming {
+            stage: "avformat_open_audio",
+            elapsed_ms: audio.open_ms,
+            video_bytes: video_bytes_now,
+            audio_bytes: audio.bytes_after_open,
+            streams: None,
+        });
+        stages.push(OpenStageTiming {
+            stage: "find_stream_info_audio",
+            elapsed_ms: audio.probe_ms,
+            video_bytes: video_bytes_now,
+            audio_bytes: audio_bytes_now,
+            streams: Some(audio.stream_count),
+        });
+        for stage in &stages {
+            emit_open_stage(stage);
+        }
 
         let video_origin = format_timeline_origin_micros(video_context.as_ptr());
         trace_timeline_origin(video_origin);
@@ -430,6 +611,13 @@ impl Demuxer {
             inspect_format_context(&video_uri, video_context.as_ptr());
         let (audio_probe, audio_time_bases) =
             inspect_format_context(&audio_uri, audio_context.as_ptr());
+
+        // 两个输入即将被移入 `inputs`，其 AVIO 读数（累计消费字节）在此收口
+        // ——这是「本次 DASH open 到底从源读了多少字节」的最终值。
+        let final_reads = (
+            video_context.avio_diag().map(|d| d.0).unwrap_or(0),
+            audio_context.avio_diag().map(|d| d.0).unwrap_or(0),
+        );
 
         let video_stream_count = video_time_bases.len();
         let audio_offset = video_stream_count as i32;
@@ -479,6 +667,19 @@ impl Demuxer {
         let mut stream_time_bases = video_time_bases;
         stream_time_bases.extend(audio_time_bases);
 
+        // 收口：本次 DASH demux 的分阶段读数（含总耗时与两条流的累计消费字节）。
+        // `video_bytes` / `audio_bytes` 是**累计值**，看相邻两行的增量即该阶段
+        // 新增读取量——这正是「网络在下载但 dur 还是 0」那段的可归因来源。
+        let total_stage = OpenStageTiming {
+            stage: "dash_open_total",
+            elapsed_ms: dash_open_started.elapsed().as_secs_f64() * 1000.0,
+            video_bytes: final_reads.0,
+            audio_bytes: final_reads.1,
+            streams: None,
+        };
+        emit_open_stage(&total_stage);
+        stages.push(total_stage);
+
         Ok(Self {
             inputs,
             pending: vec![None, None],
@@ -486,7 +687,25 @@ impl Demuxer {
             probe,
             stream_time_bases,
             selection: StreamSelection::all(),
+            open_stages: stages,
         })
+    }
+
+    /// 本次 open 的分阶段读数（见 [`OpenStageTiming`]）；单输入路径为空。
+    pub fn open_stages(&self) -> &[OpenStageTiming] {
+        &self.open_stages
+    }
+
+    /// 每个输入自创建起从源消费的字节总量（顺序同 `Demuxer` 的输入顺序：
+    /// DASH 双流下 0=video、1=audio）。本地路径没有自定义 AVIO → 该输入为
+    /// `None`；HTTP 路径下这是**真实下载量**（含 seek 后重读的区段与 AVIO 的
+    /// 64KiB 预读窗口）。播放层用相邻两次读数的差分回答"这次 seek 之后到底从
+    /// 网络读了多少字节"——它是把预滚耗时归因到"等字节"而不是"解码"的依据。
+    pub fn input_bytes_read(&self) -> Vec<Option<u64>> {
+        self.inputs
+            .iter()
+            .map(|input| input.context.avio_diag().map(|(bytes, _)| bytes))
+            .collect()
     }
 
     pub fn probe(&self) -> &MediaProbe {
@@ -628,11 +847,35 @@ impl Demuxer {
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
         let relative_target = position.as_micros().min(i64::MAX as u128) as i64;
+        // 分输入打点：HTTP 源上 `av_seek_frame` 不是纯内存操作——fMP4 要靠 moof
+        // 定关键帧，且 AVIO 的 seek 钩子会在这里触发 `prefetch_hint` 重设下载
+        // 窗口，所以它既耗时又读字节。video / audio 两个输入是**串行** seek 的，
+        // 把每个输入的耗时 + 读取量单独报出来，才能看出"预滚那几秒"里有多少
+        // 花在 seek 本身、有多少是 seek 之后等目标窗口的字节。
+        let seek_started = std::time::Instant::now();
+        let bytes_before = self.input_bytes_read();
         for index in 0..self.inputs.len() {
+            let input_started = std::time::Instant::now();
             self.seek_input(index, relative_target)?;
+            emit_seek_stage(
+                "av_seek_input",
+                position,
+                input_started.elapsed(),
+                Some(index),
+                &bytes_before,
+                &self.input_bytes_read(),
+            );
             self.pending[index] = None;
             self.eof[index] = false;
         }
+        emit_seek_stage(
+            "demux_seek_total",
+            position,
+            seek_started.elapsed(),
+            None,
+            &bytes_before,
+            &self.input_bytes_read(),
+        );
         Ok(())
     }
 
@@ -1053,10 +1296,21 @@ pub struct DecoderConfig {
     ///
     /// 只有在**同时**下调了视频帧 handoff 队列容量
     /// （`PlayerConfig::video_frame_queue_capacity`）时才应该跟着下调：
-    /// 下界里的 9 片消费端预留有 8 片是留给那个队列的。宿主把它调回 Erika
-    /// 默认值 3 时，这里给 `Some(21)` 是安全的；队列仍是 8 时改小这里就是
-    /// 复现 `get_buffer failed`。
+    /// 下界里的消费端预留就是那个队列的容量加渲染器常驻的 1 片。队列还是 8 时
+    /// 把它改成 21 就是复现 `get_buffer failed`。
+    ///
+    /// 一般情况下**不要设它**：正常路径由
+    /// `d3d11va_consumer_queue_frames` 把队列容量喂进来，下界自动跟着队列走，
+    /// 不会漂移。
     pub d3d11va_pool_min_frames: Option<i32>,
+    /// 视频帧 handoff 队列容量（片），用来推导池下界里的消费端预留。
+    ///
+    /// 由 `Player` 在创建解码器时填成它实际使用的
+    /// `PlayerConfig::video_frame_queue_capacity`；默认值
+    /// `DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY` 只用于没有 Player 层队列的直接
+    /// 调用（`PlaybackSession` / `VideoPlaybackEngine::open`）。
+    /// Windows 之外的平台忽略。
+    pub d3d11va_consumer_queue_frames: i32,
 }
 
 impl DecoderConfig {
@@ -1116,6 +1370,7 @@ impl Default for DecoderConfig {
             mediacodec_surface: false,
             d3d11va_pool_budget_bytes: None,
             d3d11va_pool_min_frames: None,
+            d3d11va_consumer_queue_frames: crate::core::DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY as i32,
         }
     }
 }
@@ -1124,10 +1379,11 @@ struct HardwareDecoderState {
     device_ref: *mut sys::AVBufferRef,
     frames_ref: *mut sys::AVBufferRef,
     pixel_format: sys::AVPixelFormat,
-    /// D3D11VA 池预算与下界覆盖值，随 `DecoderConfig` 一起下发到
+    /// D3D11VA 池预算、下界覆盖值与消费端队列容量，随 `DecoderConfig` 一起下发到
     /// `select_hw_format` → `ensure_d3d11va_frames_for_context` 的建池路径。
     pool_budget_bytes: usize,
     pool_min_frames: Option<i32>,
+    pool_consumer_queue_frames: i32,
 }
 
 #[cfg(target_os = "android")]
@@ -1309,7 +1565,8 @@ impl Decoder {
             DecoderBackend::D3d11va => decoder.configure_d3d11va(codec, &config)?,
             DecoderBackend::AvCodec => {}
         }
-        let mut codec_options = ptr::null_mut();        #[cfg(target_os = "android")]
+        let mut codec_options = ptr::null_mut();
+        #[cfg(target_os = "android")]
         if config.backend == DecoderBackend::MediaCodec {
             let option_result = check(
                 unsafe {
@@ -1744,6 +2001,7 @@ impl Decoder {
                 .d3d11va_pool_budget_bytes
                 .unwrap_or(D3D11VA_POOL_BUDGET_BYTES);
             state.pool_min_frames = config.d3d11va_pool_min_frames;
+            state.pool_consumer_queue_frames = config.d3d11va_consumer_queue_frames;
         }
         // 硬解固定单线程解码。
         //
@@ -1857,6 +2115,7 @@ impl Decoder {
                 pixel_format,
                 pool_budget_bytes: D3D11VA_POOL_BUDGET_BYTES,
                 pool_min_frames: None,
+                pool_consumer_queue_frames: crate::core::DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY as i32,
             });
             unsafe {
                 (*self.context).hw_device_ctx = context_device_ref;
@@ -1923,6 +2182,7 @@ impl Decoder {
             pixel_format,
             pool_budget_bytes: D3D11VA_POOL_BUDGET_BYTES,
             pool_min_frames: None,
+            pool_consumer_queue_frames: crate::core::DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY as i32,
         });
 
         unsafe {
@@ -2024,6 +2284,7 @@ unsafe fn ensure_d3d11va_frames_for_context(
             sw_format,
             unsafe { (*state).pool_budget_bytes },
             unsafe { (*state).pool_min_frames },
+            unsafe { (*state).pool_consumer_queue_frames },
         );
         d3d11_frames.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
         d3d11_frames.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
@@ -2086,7 +2347,8 @@ fn d3d11va_surface_alignment(codec_id: sys::AVCodecID) -> i32 {
 ///
 /// 64MiB 的取值依据：
 /// - 1080P H.264（coded 1920x1088，NV12 1.5B/px）单片 3.13MB →
-///   64MiB / 3.13MB ≈ 21 片；低于下界 26 时由下界兜底，所以 1080P 实际取 26；
+///   64MiB / 3.13MB ≈ 21 片；低于下界时由下界兜底，所以 1080P 实际取
+///   `d3d11va_pool_floor`（队列 3 → 21 片 ≈ 66MB，队列 8 → 26 片 ≈ 81MB）；
 /// - 720P 以下折算值高于下界，预算直接生效（720P ≈ 48 片 × 1.38MB ≈ 66MB），
 ///   并被 `d3d11va_pool_legacy_pool_size` 的上限夹住，不会因为预算富裕就
 ///   无限多占内存；
@@ -2095,34 +2357,35 @@ fn d3d11va_surface_alignment(codec_id: sys::AVCodecID) -> i32 {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const D3D11VA_POOL_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// 消费端在池里占用的常驻切片数。
+/// 消费端在池里占用的常驻切片数 = 视频帧 handoff 队列容量 + 渲染器常驻那一片。
 ///
 /// 这些切片不属于解码器，但同样从池里取，池深必须把它们算进去，否则解码器
 /// 自己的 `get_buffer` 就会撞上限：
-/// - `core.rs:1345-1353` 的视频帧 handoff 队列，容量来自
-///   `PlayerConfig::video_frame_queue_capacity`。宿主 bili-rs 设为 8
-///   （`bili-rs/src/player/mod.rs:350`），队列满时这 8 片全部被 pin 住；
-///   队列再满则 `emit_video_frame_from_worker`（`core.rs:3675-3684`）用
-///   `try_send` 丢弃而不是阻塞解码器，所以 8 就是这一项的上限，不会再涨，
-///   但也不会自己降下来。**渲染停摆（宿主 `pause_rendering` 的 open 窗口）
-///   正是队列会满的场景**，所以这一项不能按稳态的 0~2 计；
-/// - `renderer/d3d11.rs:1209-1220` 的 `try_clone_ref` 把当前帧的 AVFrame 引用
-///   存进 `ImportedVideoFrame::_frame`（同文件 1255-1256），直到下一次 import
-///   或 clear 才释放，稳态占 1 片。`preserve_current_frame_for_transition`
-///   （同文件 2045-2047）是空实现，transition 期间**不释放**这一片。
+/// - `core.rs` 的 `subscribe_video_frames` 按
+///   `PlayerConfig::video_frame_queue_capacity` 建的有界队列，队列满时这几片
+///   全部被 pin 住；队列再满则 `emit_video_frame_from_worker` 用 `try_send`
+///   丢弃而不是阻塞解码器，所以队列容量就是这一项的上限，不会再涨，但也不会
+///   自己降下来。**渲染停摆（宿主 `pause_rendering` 的 open 窗口）正是队列会
+///   满的场景**，所以这一项不能按稳态的 0~2 计；
+/// - `renderer/d3d11.rs` 的 `try_clone_ref` 把当前帧的 AVFrame 引用存进
+///   `ImportedVideoFrame::_frame`，直到下一次 import 或 clear 才释放，稳态占
+///   1 片。`preserve_current_frame_for_transition` 是空实现，transition 期间
+///   **不释放**这一片。
 ///
 /// 不重复计算 presenter 正在 import 的那一片：它是刚从队列里 `try_recv`
 /// 出来的，队列计数已经减一，两者是同一片。
 ///
-/// 合计 8 + 1 = 9。这是"最坏情况"而不是"稳态"：稳态下队列通常只有 0~2 帧。
-/// 之所以按下界而不是稳态取值，是因为池一旦耗尽就是解码中断、宿主换源重开、
-/// 进度归零——用几十 MB 换掉这个故障是划算的。
-///
-/// 真正想继续压低这一项，正确的杠杆是宿主把 `video_frame_queue_capacity`
-/// 从 8 调回 Erika 默认的 3（那时可以配合把 `DecoderConfig::
-/// d3d11va_pool_min_frames` 设成 21），而不是在这里少算。
+/// 注意会话内部还有一条解码输出队列（`playback.rs` 的
+/// `D3D11VA_VIDEO_FRAME_QUEUE_LIMIT = 8`），它**两种配置下都存在**，所以它是
+/// 常量而不是本项的自变量；它吃掉的余量见 `d3d11va_pool_floor` 的推导。
 #[cfg(target_os = "windows")]
-const D3D11VA_CONSUMER_HEADROOM_FRAMES: i32 = 9;
+fn d3d11va_consumer_headroom_frames(queue_frames: i32) -> i32 {
+    queue_frames.max(1) + D3D11VA_RENDERER_RESIDENT_FRAMES
+}
+
+/// 渲染器常驻的那一片（见 `d3d11va_consumer_headroom_frames`）。
+#[cfg(target_os = "windows")]
+const D3D11VA_RENDERER_RESIDENT_FRAMES: i32 = 1;
 
 /// DXVA 规范基线里的工作切片数：1 片解码工作面。
 ///
@@ -2153,12 +2416,39 @@ fn d3d11va_reference_surfaces(codec_id: sys::AVCodecID) -> i32 {
 
 /// 池深下界：低于它的池在某些播放路径上必然耗尽。
 ///
-/// = DXVA 基线（1 工作面 + 参考帧上限）+ 消费端常驻切片。
+/// = DXVA 基线（1 工作面 + 参考帧上限）+ 消费端常驻（handoff 队列 + 渲染器 1 片）。
+///
+/// # 为什么 handoff 队列容量 8→3 能让池 26→21 而不损失安全性
+///
+/// 池在 open 时定容、之后不能增长，所以下界必须覆盖"同时被签出切片数"的峰值：
+///
+/// ```text
+/// 峰值 = 工作面(1) + 参考帧(R) + 会话内解码输出队列(≤8) + handoff 队列(Q) + 渲染器(1)
+/// ```
+///
+/// `R` 是片源相关的量（规范上限 16，B站 1080P H.264 实测 ref 通常 2~4），建池
+/// 时拿不到，所以换个角度看：把规范上限 16 记为 R_max，则池深减掉"除参考帧以外
+/// 的确定项"就是**留给参考帧的余量**
+///
+/// ```text
+/// R_余量 = 池深 - 1(工作面) - 8(会话内队列) - Q - 1(渲染器)
+/// ```
+///
+/// - 旧配置（池 26，Q=8）：26 - 1 - 8 - 8 - 1 = 8
+/// - 新配置（池 21，Q=3）：21 - 1 - 8 - 3 - 1 = 8
+///
+/// 两者留下来的参考帧余量**完全相同**。也就是说把 handoff 队列从 8 降到 3 时，
+/// 池里那 5 片（26→21，1080P 15MB）本来就是"为队列多买的"，退回去不是降级。
+///
+/// **两个数字必须一起动**：只把池压到 21 而队列仍是 8，余量只剩 3，参考帧稍多
+/// 的片源就会撞 `get_buffer failed`（当年固定池 48 片崩溃是同一种故障）。
+/// 正因如此，这里不接受"魔法数字"而是由 `d3d11va_consumer_headroom_frames`
+/// 从队列容量推导——调用方把实际队列容量传进来，两者不可能对不上。
 #[cfg(target_os = "windows")]
-fn d3d11va_pool_floor(codec_id: sys::AVCodecID) -> i32 {
+fn d3d11va_pool_floor(codec_id: sys::AVCodecID, consumer_queue_frames: i32) -> i32 {
     D3D11VA_BASE_WORK_SURFACES
         + d3d11va_reference_surfaces(codec_id)
-        + D3D11VA_CONSUMER_HEADROOM_FRAMES
+        + d3d11va_consumer_headroom_frames(consumer_queue_frames)
 }
 
 /// 单片的显存字节数（对齐后尺寸 × 每像素字节）。
@@ -2193,6 +2483,13 @@ fn d3d11va_pool_legacy_pool_size(codec_id: sys::AVCodecID) -> i32 {
 ///
 /// `pool = clamp(预算 / 单片字节, 下界, 旧固定值)`
 ///
+/// 下界由 `d3d11va_pool_floor` 决定，而它把 `consumer_queue_frames`（视频帧
+/// handoff 队列容量）算成消费端预留——队列容量与池深必须同源，理由见
+/// `d3d11va_pool_floor` 的推导。1080P H.264：
+/// - 队列 8 → 下界 26 片 ≈ 81MB（宿主 bili-rs 现状）；
+/// - 队列 3 → 下界 21 片 ≈ 66MB（Erika 默认值）；
+/// - 队列 4 → 下界 22 片 ≈ 69MB。
+///
 /// 历史结论（保留，别删）：这个池曾经是固定值，且是**从 20 加到 60/40** 的。
 /// 当时宿主在快 CDN 源下遇到 `get_buffer failed`（表现为有声音无画面，随后宿主
 /// 换源重开、进度归零），把池从 20 加到 60/40 才稳住，因此 48 片一度被认为
@@ -2209,7 +2506,8 @@ fn d3d11va_pool_legacy_pool_size(codec_id: sys::AVCodecID) -> i32 {
 /// 因此现在改成两件事一起做：
 /// 1. 硬解路径把 `thread_count` 收敛为 1（见 `configure_d3d11va`），把解码器
 ///    内部的池需求压回 DXVA 规范基线；
-/// 2. 池深按"内存预算 / 单片字节"折算，下界由 `d3d11va_pool_floor` 保证。
+/// 2. 池深按"内存预算 / 单片字节"折算，下界由 `d3d11va_pool_floor` 保证，
+///    而后者由消费端队列容量推导。
 /// 只有 1 和 2 同时成立时，小于 48 的池深才是安全的；单独调小池深就是复现
 /// 当年那次崩溃。
 #[cfg(target_os = "windows")]
@@ -2220,12 +2518,13 @@ fn d3d11va_pool_size(
     sw_format: sys::AVPixelFormat,
     budget_bytes: usize,
     min_frames_override: Option<i32>,
+    consumer_queue_frames: i32,
 ) -> i32 {
     let slice_bytes = d3d11va_slice_bytes(width, height, sw_format);
     let by_budget = (budget_bytes / slice_bytes.max(1)) as i32;
     let floor = min_frames_override
         .map(|value| value.max(1))
-        .unwrap_or_else(|| d3d11va_pool_floor(codec_id));
+        .unwrap_or_else(|| d3d11va_pool_floor(codec_id, consumer_queue_frames));
     let legacy = d3d11va_pool_legacy_pool_size(codec_id);
     by_budget.clamp(floor, legacy)
 }
@@ -3873,6 +4172,14 @@ impl FormatContext {
     fn as_mut_ptr(&mut self) -> *mut sys::AVFormatContext {
         self.ptr
     }
+
+    /// 诊断读数 `(已消费字节总量, 读过的最大偏移)`；非自定义 AVIO（本地
+    /// 路径 `open_format_context`）返回 None。
+    fn avio_diag(&self) -> Option<(u64, u64)> {
+        self.avio
+            .as_ref()
+            .map(|avio| (avio.bytes_read, avio.max_offset))
+    }
 }
 
 impl Drop for FormatContext {
@@ -3882,11 +4189,41 @@ impl Drop for FormatContext {
     }
 }
 
+// SAFETY: `FormatContext` 独占持有它的 `AVFormatContext` 与 AVIO 上下文；把它
+// 整体移动到另一个线程不会造成对同一上下文的共享访问（Rust 的所有权保证独占，
+// 移动即转移，不存在别名）。FFmpeg 的格式上下文没有线程亲和性要求（不像 GUI
+// 对象），同 crate 的 `Demuxer` 已经用同样的论证声明了 `unsafe impl Send`。
+// 本 impl 的唯一用途是把 DASH 音频输入从它的 open 工作线程交回调用线程
+// （见 `Demuxer::open_video_audio` 的并行 open）。
+unsafe impl Send for FormatContext {}
+
+/// 一个输入在并行工作线程里完成 open + find_stream_info 后的产物。
+struct OpenedInput {
+    context: FormatContext,
+    /// `avformat_open_input` 自身耗时（含格式探测读取）。
+    open_ms: f64,
+    /// 该阶段结束时该输入累计消费的字节（格式探测读完的量）。
+    bytes_after_open: u64,
+    /// `avformat_find_stream_info` 耗时（含为判定流信息的追加读取）。
+    probe_ms: f64,
+    stream_count: usize,
+}
+
 struct CustomAvio {
     context: *mut sys::AVIOContext,
     source: Box<dyn MediaSource>,
     offset: u64,
     last_error: Option<String>,
+    /// 诊断计数：本输入自创建起从源消费的字节总量（含 seek 后重读的区段）。
+    /// 存在的理由：`avformat_open_input` / `avformat_find_stream_info` 都不是
+    /// "看一眼文件头就返回"——它们会按 `probesize`/`analyzeduration` 读入
+    /// 可观的流数据才能判定流信息。宿主侧只看到"网络在下载、时长还是 0"，
+    /// 无法区分「网络慢」与「内核在解析」；本计数把后者变成可读数字
+    /// （见 `Demuxer::open_video_audio` / `PlaybackSession` 的 open 阶段打点）。
+    bytes_read: u64,
+    /// 诊断计数：本输入读到过的最大文件偏移。能区分"顺序读完 N 字节"与
+    /// "跳到大偏移再读"（后者在 HTTP 源上是另一次 Range 往返）。
+    max_offset: u64,
 }
 
 fn normalize_avio_seek_whence(whence: c_int) -> c_int {
@@ -3907,6 +4244,8 @@ impl CustomAvio {
             source,
             offset: 0,
             last_error: None,
+            bytes_read: 0,
+            max_offset: 0,
         });
         let context = unsafe {
             sys::avio_alloc_context(
@@ -3955,6 +4294,8 @@ impl CustomAvio {
                 let copy_len = bytes.len().min(buffer_size as usize);
                 unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len) };
                 self.offset = self.offset.saturating_add(copy_len as u64);
+                self.bytes_read = self.bytes_read.saturating_add(copy_len as u64);
+                self.max_offset = self.max_offset.max(self.offset);
                 copy_len as c_int
             }
             Err(error) => {
@@ -4082,6 +4423,50 @@ fn open_format_context(uri: &str) -> Result<FormatContext> {
     FormatContext::new(format_context)
 }
 
+/// 自定义 AVIO 输入的可选 FFmpeg 选项（诊断/实验开关；**默认不设置 =
+/// 与从前完全一致，不做任何静默降级**）。
+///
+/// 存在的理由：`avformat_open_input` + `avformat_find_stream_info` 会按
+/// `probesize`（FFmpeg 默认 5MB）与 `analyzeduration`（默认 5 秒）读入流数据
+/// 才能判定流信息。对 B 站 m4s 的本地实测（`tests/open_stages_diag.rs`）是
+/// 每个输入约 0.9MB——在 300KB/s 的链路上一读就是数秒，这正是宿主侧
+/// 「网络在下载、`duration` 还是 0」那段 `Opening` 的主要构成。
+///
+/// 这两个环境变量让「读取量是否随解析窗口收紧」变成可测的事实：
+/// - `ERIKA_OPEN_ANALYZEDURATION_US`：微秒，对应 demuxer 的 `analyzeduration`；
+/// - `ERIKA_OPEN_PROBESIZE`：字节，对应 `probesize`。
+///
+/// 只做实验/诊断用：调小它们会改变「解析多久的流信息」这一契约，是否仍然
+/// 拿得到正确的 `duration`/轨道必须由实测定夺（见诊断测试的输出对照）。
+fn open_input_options() -> Result<*mut sys::AVDictionary> {
+    let mut options: *mut sys::AVDictionary = ptr::null_mut();
+    for (env_name, key) in [
+        ("ERIKA_OPEN_ANALYZEDURATION_US", c"analyzeduration"),
+        ("ERIKA_OPEN_PROBESIZE", c"probesize"),
+    ] {
+        let Some(value) = std::env::var(env_name).ok().filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let value = CString::new(value).map_err(|_| FfmpegError::InteriorNul)?;
+        if let Err(error) = check(
+            unsafe { sys::av_dict_set(&mut options, key.as_ptr(), value.as_ptr(), 0) },
+            "av_dict_set(open_input_options)",
+        ) {
+            unsafe { sys::av_dict_free(&mut options) };
+            return Err(error);
+        }
+        crate::trace::diagnostic(
+            serde_json::json!({
+                "event": "erika_open_input_option",
+                "name": env_name,
+                "value": value.to_string_lossy(),
+            })
+            .to_string(),
+        );
+    }
+    Ok(options)
+}
+
 fn open_source_format_context(source: Box<dyn MediaSource>) -> Result<FormatContext> {
     let uri = CString::new(source.uri()).map_err(|_| FfmpegError::InteriorNul)?;
     let avio = CustomAvio::new(source)?;
@@ -4094,18 +4479,23 @@ fn open_source_format_context(source: Box<dyn MediaSource>) -> Result<FormatCont
         (*format_context).flags |= sys::AVFMT_FLAG_CUSTOM_IO as c_int;
     }
 
+    let mut options = open_input_options()?;
     let mut opened_context = format_context;
-    match check(
+    let open_result = check(
         unsafe {
             sys::avformat_open_input(
                 &mut opened_context,
                 uri.as_ptr(),
                 ptr::null_mut(),
-                ptr::null_mut(),
+                &mut options,
             )
         },
         "avformat_open_input(custom_io)",
-    ) {
+    );
+    // `avformat_open_input` 会把它认识的选项从字典里摘走；剩下的必须显式
+    // 释放，否则字典连同其中的字符串一起泄漏。
+    unsafe { sys::av_dict_free(&mut options) };
+    match open_result {
         Ok(()) => FormatContext::new_with_custom_io(opened_context, avio),
         Err(error) => {
             if !opened_context.is_null() {
@@ -5075,7 +5465,8 @@ mod tests {
         };
 
         // 1080P H.264（coded 1920x1088，NV12 3.13MB/片）：64MiB 折算 21 片，
-        // 低于下界 26（1 工作面 + 16 参考帧 + 9 消费端）→ 取 26，≈81MB。
+        // 低于队列 8 时的下界 26（1 工作面 + 16 参考帧 + 8 队列 + 1 渲染器）
+        // → 取 26，≈81MB。
         assert_eq!(
             d3d11va_pool_size(
                 AVCodecID_AV_CODEC_ID_H264,
@@ -5083,7 +5474,8 @@ mod tests {
                 1088,
                 AVPixelFormat_AV_PIX_FMT_NV12,
                 D3D11VA_POOL_BUDGET_BYTES,
-                None
+                None,
+                8
             ),
             26
         );
@@ -5097,7 +5489,8 @@ mod tests {
                 2176,
                 AVPixelFormat_AV_PIX_FMT_P010LE,
                 D3D11VA_POOL_BUDGET_BYTES,
-                None
+                None,
+                8
             ),
             26
         );
@@ -5111,13 +5504,14 @@ mod tests {
                 720,
                 AVPixelFormat_AV_PIX_FMT_NV12,
                 D3D11VA_POOL_BUDGET_BYTES,
-                None
+                None,
+                8
             ),
             48
         );
 
-        // VP9/AV1 的参考帧上限是 8，下界降到 18；1080P 的预算折算 21 高于下界，
-        // 所以取 21。
+        // VP9/AV1 的参考帧上限是 8，队列 8 时下界降到 18；1080P 的预算折算 21
+        // 高于下界，所以取 21。
         assert_eq!(
             d3d11va_pool_size(
                 AVCodecID_AV_CODEC_ID_AV1,
@@ -5125,9 +5519,67 @@ mod tests {
                 1088,
                 AVPixelFormat_AV_PIX_FMT_NV12,
                 D3D11VA_POOL_BUDGET_BYTES,
-                None
+                None,
+                8
             ),
             21
+        );
+    }
+
+    /// 下界跟着 handoff 队列容量走：队列 8→3 时 1080P 池 26→21 片（≈81→66MB），
+    /// 两者留给参考帧的余量相同（见 `d3d11va_pool_floor` 的推导）。
+    ///
+    /// 这条测试就是"队列与池深必须同源"的回归线：谁把队列容量从
+    /// `DecoderConfig` 到建池的那条链路改断，这里立刻红。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn d3d11va_pool_floor_tracks_the_consumer_queue_capacity() {
+        use sys::{AVCodecID_AV_CODEC_ID_AV1, AVCodecID_AV_CODEC_ID_H264};
+
+        // 1080P H.264：下界 = 1 + 16 + (队列 + 1)。
+        for (queue, expected) in [(3, 21), (4, 22), (8, 26), (16, 34)] {
+            assert_eq!(
+                d3d11va_pool_floor(AVCodecID_AV_CODEC_ID_H264, queue),
+                expected,
+                "queue={queue}"
+            );
+        }
+        // VP9/AV1 参考帧上限 8：1080P 折算 21 片，队列 3 时下界 13 < 21 → 取预算值。
+        assert_eq!(d3d11va_pool_floor(AVCodecID_AV_CODEC_ID_AV1, 3), 13);
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_AV1,
+                1920,
+                1088,
+                sys::AVPixelFormat_AV_PIX_FMT_NV12,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None,
+                3
+            ),
+            21
+        );
+        // 1080P H.264 + 队列 3：预算折算 21 片 == 下界 21 → 21 片 ≈ 66MB。
+        assert_eq!(
+            d3d11va_pool_size(
+                AVCodecID_AV_CODEC_ID_H264,
+                1920,
+                1088,
+                sys::AVPixelFormat_AV_PIX_FMT_NV12,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None,
+                3
+            ),
+            21
+        );
+    }
+
+    /// `DecoderConfig` 的兜底队列容量必须与 `PlayerConfig` 的默认值一致，
+    /// 否则"没有 Player 层队列"的直接调用会拿到与默认 Player 不同的池。
+    #[test]
+    fn decoder_config_default_queue_matches_player_config_default() {
+        assert_eq!(
+            DecoderConfig::default().d3d11va_consumer_queue_frames,
+            crate::core::PlayerConfig::default().video_frame_queue_capacity as i32
         );
     }
 
@@ -5137,7 +5589,7 @@ mod tests {
     fn d3d11va_pool_size_respects_overrides_and_legacy_ceiling() {
         use sys::{AVCodecID_AV_CODEC_ID_H264, AVPixelFormat_AV_PIX_FMT_NV12};
 
-        // 宿主把视频帧队列调回 3 时，可以把下界显式压到 21。
+        // 下界覆盖值优先于队列推导值（逃生舱：救援/诊断时手工钉死池深）。
         assert_eq!(
             d3d11va_pool_size(
                 AVCodecID_AV_CODEC_ID_H264,
@@ -5145,7 +5597,8 @@ mod tests {
                 1088,
                 AVPixelFormat_AV_PIX_FMT_NV12,
                 D3D11VA_POOL_BUDGET_BYTES,
-                Some(21)
+                Some(21),
+                8
             ),
             21
         );
@@ -5158,7 +5611,8 @@ mod tests {
                 720,
                 AVPixelFormat_AV_PIX_FMT_NV12,
                 1 << 40,
-                None
+                None,
+                8
             ),
             60
         );
@@ -5171,7 +5625,8 @@ mod tests {
                 720,
                 AVPixelFormat_AV_PIX_FMT_NV12,
                 1 << 20,
-                None
+                None,
+                8
             ),
             26
         );

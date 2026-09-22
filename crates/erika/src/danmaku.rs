@@ -7,9 +7,12 @@
 mod dfm;
 pub mod dfm_core;
 mod outline;
+mod rules;
 mod typography;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+pub use rules::{BlockReason, DanmakuRuleSet, RuleError};
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -57,6 +60,28 @@ pub const DANMAKU_DEBUG_BUCKETS: usize = 16;
 // font fallback keeps a full copy of every font face it loads; without caps
 // both grow without limit for the lifetime of the session.
 const MAX_LOADED_SYSTEM_FACES: usize = 24; // faces, not bytes: budget on count
+
+/// 常驻**字体字节**上限（不是 face 数）。
+///
+/// 只按 face 数封顶是不够的：一个 face 背后的字体文件可以是上百 MB
+/// （实测一台装了 Source Han Sans 的机器上单个 `.ttc` 就有 111.9 MB，
+/// 且 `fontdb` 会把它的 45 个 face 登记成 45 个条目）。24 个 face 各自
+/// 读一份完整文件就是几百 MB —— 这是"进播放后内存起飞"的主因。
+///
+/// 这里按**不同源文件**累加：同一个 `.ttc` 的全部 face 共享一份字节，
+/// 所以多 face 不会重复计数。超限时按 LRU 逐出 face，被逐出的 face 下次
+/// 命中会重新读入文件——只换 CPU，不改变任何字形选择结果。
+///
+/// 128 MiB 的取值：足够常驻一个"最坏情况下单个大字体 + 若干小字体"的组合，
+/// 又能在面数上限之外兜住总量。低于单个最大字体文件时该字体会被反复读入，
+/// 因此不能再小。
+const MAX_LOADED_SYSTEM_FONT_BYTES: usize = 128 * 1024 * 1024;
+
+/// **探测缓存**上限：只为"判断某个 face 是否含某字符"读进来的字体字节。
+///
+/// 未命中的 face 不进 `loaded`（见 `SystemFontFallback::resolve`），它读过的
+/// 字节只留在这个 LRU 里，让同一个字体文件在一轮字形回退里只读一次。
+const MAX_SYSTEM_FONT_PROBE_BYTES: usize = 24 * 1024 * 1024;
 const TEXT_LAYOUT_CACHE_CAPACITY: usize = 4096; // distinct danmaku line layouts
 const GLYPH_CACHE_CAPACITY: usize = 8192; // (font × char × size) bitmaps
 // Atlas alpha buffers are width × height × 2 channels and only ever grow via
@@ -150,6 +175,21 @@ pub struct DanmakuItem {
     pub color: DanmakuColor,
     pub opacity: f32,
     pub is_self: bool,
+    /// 发送者标识。
+    ///
+    /// B 站 XML 的 `p` 属性第 7 段（`user_hash`，形如 `f11e5b6c-...`）落在这里；
+    /// JSON 来源认 `user_hash` / `uid` 键。空串 = 来源未提供，此时 `<标识>`
+    /// 屏蔽规则对它不生效。
+    pub user_id: String,
+    /// 发送者用户名。
+    ///
+    /// B 站点播 XML **不含**这一项（`p` 里只有 hash），只有直播/录播姬来源、
+    /// 或 JSON 来源显式给出 `user_name` / `name` 时才有值。
+    pub user_name: String,
+    /// 发送者等级；0 = 未知。
+    ///
+    /// 同样只有部分来源提供（B 站点播 XML 没有），`level:` 屏蔽规则在 0 时跳过。
+    pub user_level: u32,
 }
 
 impl DanmakuItem {
@@ -813,6 +853,19 @@ impl DfmPreparedLayout {
         self.stats
     }
 
+    /// 本次准备中编译失败的屏蔽规则（写错的正则/类型名）。
+    ///
+    /// 空 = 全部规则都已生效；非空说明这些规则**没有生效**，调用方应当把
+    /// 数量或全文回显给用户，而不是让用户以为"我明明配了却不生效"。
+    pub fn rule_errors(&self) -> &[RuleError] {
+        &self.dfm_layout.rule_errors
+    }
+
+    /// 编译失败的屏蔽规则条数（给只显示一个数的界面用）。
+    pub fn rule_error_count(&self) -> usize {
+        self.dfm_layout.rule_errors.len()
+    }
+
     pub(crate) fn apply_paint_config(&mut self, config: &DanmakuLayoutConfig) {
         let config = config.sanitized();
         // A layout replacement is prepared asynchronously. Its previous
@@ -959,12 +1012,112 @@ pub struct DanmakuDebugBucket {
     pub count: u32,
 }
 
+/// 屏蔽原因分类计数。
+///
+/// 诊断码（`dfm_core::filters::filter_param`）是内核内部编号，这里是给界面读的
+/// **分类桶**。两者一一对应，见 [`DanmakuFilterBreakdown::add_filter_param`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DanmakuFilterBreakdown {
+    /// 类型屏蔽（滚动/顶部/底部/逆向/特殊）
+    pub type_blocked: u32,
+    /// 同屏密度上限
+    pub quantity: u32,
+    /// 帧耗时保护
+    pub elapsed: u32,
+    /// 关键词屏蔽
+    pub keyword: u32,
+    /// 正则屏蔽
+    pub regex: u32,
+    /// 用户标识屏蔽（`<标识>`）
+    pub user: u32,
+    /// 用户名屏蔽（`[用户名]`）
+    pub name: u32,
+    /// 用户等级屏蔽（`level:`）
+    pub level: u32,
+    /// 文本长度屏蔽（`len:`）
+    pub text_length: u32,
+    /// 时间区间屏蔽（`time:`）
+    pub time_range: u32,
+    /// 彩色弹幕屏蔽（`type:color`）
+    pub color: u32,
+    /// 重复弹幕合并 / 轨道装不下
+    pub duplicate: u32,
+}
+
+impl DanmakuFilterBreakdown {
+    /// 按 `filter_param` 诊断码累加一条被屏蔽的弹幕。
+    ///
+    /// 编号来源是 `danmaku::dfm_core::filters::filter_param`；这里重复一份常量是
+    /// 因为 `dfm_core` 是移植层（对外公开的是本模块的类型），不想把内部编号
+    /// 变成公开契约。**两边改动必须同步**，测试 `filter_breakdown_matches_param_codes`
+    /// 会盯住这件事。
+    pub fn add_filter_param(&mut self, param: u32) {
+        match param {
+            0 => {}
+            1 => self.type_blocked += 1,
+            2 => self.quantity += 1,
+            3 => self.elapsed += 1,
+            4 => self.keyword += 1,
+            5 => self.duplicate += 1,
+            6 => self.user += 1,
+            7 => self.name += 1,
+            8 => self.level += 1,
+            9 => self.text_length += 1,
+            10 => self.time_range += 1,
+            11 => self.color += 1,
+            12 => self.regex += 1,
+            _ => self.duplicate += 1,
+        }
+    }
+
+    /// 分类计数之和。
+    pub fn total(&self) -> u32 {
+        self.type_blocked
+            + self.quantity
+            + self.elapsed
+            + self.keyword
+            + self.regex
+            + self.user
+            + self.name
+            + self.level
+            + self.text_length
+            + self.time_range
+            + self.color
+            + self.duplicate
+    }
+
+    /// 非零分类的中文摘要（如 `类型 12 · 关键词 20 · 正则 5`）；全零返回空串。
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut push = |label: &str, value: u32| {
+            if value > 0 {
+                parts.push(format!("{label} {value}"));
+            }
+        };
+        push("类型", self.type_blocked);
+        push("密度", self.quantity);
+        push("耗时保护", self.elapsed);
+        push("关键词", self.keyword);
+        push("正则", self.regex);
+        push("用户", self.user);
+        push("用户名", self.name);
+        push("等级", self.level);
+        push("长度", self.text_length);
+        push("时间区间", self.time_range);
+        push("彩色", self.color);
+        push("合并/装不下", self.duplicate);
+        parts.join(" · ")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DanmakuPreparedStats {
     pub source_items: usize,
     pub supported_items: usize,
     pub prepared_items: usize,
     pub filtered_items: usize,
+    /// 被屏蔽条目按原因分类的计数（分类之和 == `filtered_items`）。
+    pub filter_breakdown: DanmakuFilterBreakdown,
     pub prepared_scroll_items: usize,
     pub prepared_top_items: usize,
     pub prepared_bottom_items: usize,
@@ -978,6 +1131,29 @@ pub struct DanmakuPreparedStats {
     pub track_height: f32,
     pub scroll_bucket_count: usize,
     pub scroll_buckets: [DanmakuDebugBucket; DANMAKU_DEBUG_BUCKETS],
+}
+
+impl DanmakuPreparedStats {
+    /// 一行中文摘要，给诊断浮窗直接显示。
+    ///
+    /// 形如 `屏蔽 37 / 1200（类型 12 · 关键词 20 · 正则 5）`。没有任何屏蔽时显示
+    /// `屏蔽 0 / 1200`——**仍然显示**，因为"这一栏是 0"本身就是用户想知道的信息
+    /// （规则没生效时最容易看出来）。`source_items` 为 0（没加载弹幕）时返回 `—`。
+    pub fn filter_summary(&self) -> String {
+        if self.source_items == 0 {
+            return "—".to_string();
+        }
+        let detail = self.filter_breakdown.describe();
+        if detail.is_empty() {
+            format!("屏蔽 0 / {}", self.source_items)
+        } else {
+            format!(
+                "屏蔽 {} / {}（{detail}）",
+                self.filter_breakdown.total(),
+                self.source_items
+            )
+        }
+    }
 }
 
 impl DanmakuFrameStats {
@@ -1028,12 +1204,14 @@ impl DanmakuPreparedStats {
         viewport: DanmakuViewport,
         config: &DanmakuLayoutConfig,
         dfm_track_count: usize,
+        filter_breakdown: DanmakuFilterBreakdown,
     ) -> Self {
         let mut stats = Self {
             source_items,
             supported_items,
             prepared_items: prepared.len(),
             filtered_items: supported_items.saturating_sub(prepared.len()),
+            filter_breakdown,
             dfm_track_count,
             display_area_height: viewport.height as f32 * config.display_area.clamp(0.1, 1.0),
             scroll_area_height: viewport.height as f32 * config.display_area.clamp(0.1, 1.0),
@@ -1205,7 +1383,201 @@ impl DanmakuFontFace {
     }
 }
 
-#[derive(Debug)]
+/// 字体**源文件**的标识（一个 `.ttf`/`.ttc`/`.otf` 文件）。
+///
+/// `fontdb` 把 `.ttc`（字体集合）里的每个 face 登记成独立的 `fontdb::ID`，
+/// 但它们在内存里读到的是**同一个文件的同一份字节**。以源文件为单位共享
+/// 字体字节的所有权载体。
+///
+/// 进程内的 `Arc<[u8]>`（内嵌子集字体、自定义字体）与 `fontdb` 的共享源
+/// （磁盘文件、或 memmap 特性下的文件映射）都归一到这一个类型，使
+/// [`SharedFont`] 无论字节从哪来都能**零拷贝**共享，不需要像旧实现那样
+/// `data.to_vec()` 复制一份整文件。
+type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+/// 取字体文件字节：优先**只读文件映射**，失败才退回整份读入。
+///
+/// 字体文件（尤其 CJK 集合）动辄几十上百 MB，而渲染一次只访问 cmap / 表目录
+/// 那几页。`fs::read` 会把整个文件变成**进程私有内存**；文件映射后它只是
+/// **文件支持的只读页**：按需分页、系统在内存压力下可直接回收，同一文件被
+/// 多个 face 或多次加载也只对应同一份物理页。
+///
+/// 用裸 kernel32 FFI 而不是引依赖：本仓的 `windows` crate 没有开
+/// `Win32_Storage_FileSystem`/`Win32_System_Memory` feature，为这一处改
+/// Cargo.toml 不划算；映射失败时照旧走 `fs::read`，功能不受影响。
+fn font_file_bytes(path: &Path) -> Option<FontBytes> {
+    #[cfg(target_os = "windows")]
+    if let Some(mapped) = font_file_map::MappedFontFile::try_map(path) {
+        let handle: FontBytes = Arc::new(mapped);
+        return Some(handle);
+    }
+    let data = fs::read(path).ok()?;
+    Some(owned_font_bytes(Arc::from(data)))
+}
+
+/// 只读内存映射的字体文件视图（Windows）。
+#[cfg(target_os = "windows")]
+mod font_file_map {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const OPEN_EXISTING: u32 = 3;
+    const PAGE_READONLY: u32 = 0x02;
+    const FILE_MAP_READ: u32 = 0x0004;
+
+    unsafe extern "system" {
+        fn CreateFileW(
+            file_name: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *mut c_void,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: *mut c_void,
+        ) -> *mut c_void;
+        fn CreateFileMappingW(
+            file: *mut c_void,
+            security_attributes: *mut c_void,
+            protect: u32,
+            maximum_size_high: u32,
+            maximum_size_low: u32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn MapViewOfFile(
+            file_mapping: *mut c_void,
+            desired_access: u32,
+            file_offset_high: u32,
+            file_offset_low: u32,
+            number_of_bytes_to_map: usize,
+        ) -> *mut c_void;
+        fn UnmapViewOfFile(base_address: *const c_void) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    pub(super) struct MappedFontFile {
+        base: *const u8,
+        len: usize,
+        mapping: *mut c_void,
+        file: *mut c_void,
+    }
+
+    // SAFETY: 映射视图只读，且在自身 `Drop` 之前一直有效；`*const u8` 指向
+    // 文件内容，不构成可变别名。
+    unsafe impl Send for MappedFontFile {}
+    unsafe impl Sync for MappedFontFile {}
+
+    impl MappedFontFile {
+        pub(super) fn try_map(path: &Path) -> Option<Self> {
+            let len = usize::try_from(std::fs::metadata(path).ok()?.len()).ok()?;
+            if len == 0 {
+                return None;
+            }
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0u16]).collect();
+            // SAFETY: 参数按 Win32 约定传入；每一步都检查返回值，失败路径按
+            // 相反顺序释放已经取得的句柄（不泄漏、不重复释放）。
+            let (file, mapping, base) = unsafe {
+                let file = CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                if file.is_null() || file as isize == -1 {
+                    return None;
+                }
+                let mapping = CreateFileMappingW(
+                    file,
+                    std::ptr::null_mut(),
+                    PAGE_READONLY,
+                    0,
+                    0,
+                    std::ptr::null(),
+                );
+                if mapping.is_null() {
+                    CloseHandle(file);
+                    return None;
+                }
+                let base = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+                if base.is_null() {
+                    CloseHandle(mapping);
+                    CloseHandle(file);
+                    return None;
+                }
+                (file, mapping, base)
+            };
+            Some(Self {
+                base: base.cast::<u8>(),
+                len,
+                mapping,
+                file,
+            })
+        }
+    }
+
+    impl AsRef<[u8]> for MappedFontFile {
+        fn as_ref(&self) -> &[u8] {
+            // SAFETY: `base`/`len` 来自一次成功的 `MapViewOfFile`，视图在
+            // `Drop` 之前一直有效，且映射是只读的。
+            unsafe { std::slice::from_raw_parts(self.base, self.len) }
+        }
+    }
+
+    impl Drop for MappedFontFile {
+        fn drop(&mut self) {
+            // SAFETY: 三个句柄都由本值独占持有，且只会在这里释放一次。
+            unsafe {
+                UnmapViewOfFile(self.base.cast::<c_void>());
+                CloseHandle(self.mapping);
+                CloseHandle(self.file);
+            }
+        }
+    }
+}
+
+/// 取 [`FontBytes`] 底层的字节切片。
+fn font_bytes_slice(bytes: &FontBytes) -> &[u8] {
+    AsRef::<[u8]>::as_ref(&**bytes)
+}
+
+/// 把进程内的 `Arc<[u8]>` 归一成 [`FontBytes`]。
+///
+/// 显式包一层 `Arc<Arc<[u8]>>`（`Arc<[u8]>` 自身实现 `AsRef<[u8]>`），
+/// 而不是直接写 unsized coercion——后者在 `let`/`match` 位置会被推断歧义。
+/// 这一层只是多一次间接寻址，**不复制任何字节**。
+fn owned_font_bytes(data: Arc<[u8]>) -> FontBytes {
+    Arc::new(data)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FontSourceKey {
+    /// 磁盘上的字体文件（`Source::File` / `Source::SharedFile`）。
+    Path(PathBuf),
+    /// 进程内字节源（`Source::Binary`，例如内嵌的子集字体）：
+    /// 以数据地址区分，同一个 `Arc` 只算一个源。
+    Inline(usize),
+}
+
+impl FontSourceKey {
+    fn from_source(source: &fontdb::Source) -> Self {
+        match source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                Self::Path(path.clone())
+            }
+            fontdb::Source::Binary(bytes) => {
+                Self::Inline(font_bytes_slice(bytes).as_ptr() as usize)
+            }
+        }
+    }
+}
+
 struct SystemFontFallback {
     db: fontdb::Database,
     faces: Vec<fontdb::ID>,
@@ -1214,34 +1586,72 @@ struct SystemFontFallback {
     loaded_order: VecDeque<fontdb::ID>,
     char_cache: HashMap<char, Option<u32>>,
     next_font_id: u32,
+    /// face → 它所属的字体文件（同一 `.ttc` 的全部 face 同源）。
+    source_keys: HashMap<fontdb::ID, FontSourceKey>,
+    /// 源文件字节：同一个字体文件的全部 face 共享这一份，[`SharedFont`]
+    /// 零拷贝借用它。
+    sources: HashMap<FontSourceKey, FontBytes>,
+    /// 被 `loaded` 引用的源：常驻，字节计入 `MAX_LOADED_SYSTEM_FONT_BYTES`。
+    pinned_sources: HashSet<FontSourceKey>,
+    /// 只被"探测"过、未被 `loaded` 引用的源的 LRU 顺序（front = 最久未用）。
+    probe_order: VecDeque<FontSourceKey>,
+    /// `probe_order` 里源的字节总量。
+    probe_bytes: usize,
+}
+
+/// 手写 `Debug`：`sources` 里装的是 trait object（没有 `Debug`），而调试输出
+/// 只需要看数量与预算用量，不需要把字体字节本身打印出来。
+impl std::fmt::Debug for SystemFontFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemFontFallback")
+            .field("faces", &self.faces.len())
+            .field("loaded", &self.loaded.len())
+            .field("sources", &self.sources.len())
+            .field("pinned_sources", &self.pinned_sources.len())
+            .field("probe_bytes", &self.probe_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SystemFontFallback {
     fn new(next_font_id: u32) -> Self {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
-        let preferred = [
-            "PingFang SC",
-            "Hiragino Sans GB",
-            "Hiragino Sans",
-            "Apple SD Gothic Neo",
-            "Songti SC",
-            "STHeiti",
-            "Microsoft YaHei",
-            "SimHei",
-            "Noto Sans CJK SC",
-            "Noto Sans CJK JP",
-            "Noto Sans CJK",
-            "Source Han Sans SC",
-            "Source Han Sans",
-            "Arial Unicode MS",
-            "Arial Unicode",
-            "Segoe UI Symbol",
-        ];
+        // 回退候选：**Windows 走显式白名单，一个都不多**。
+        //
+        // 原先的候选来自两个"越大越糟"的来源：下面的 preferred 列表（含
+        // "Source Han Sans SC" / "Noto Sans CJK SC" 这类第三方字体名）× 再把
+        // `db.faces()`（机器上已安装的**全部** face）整个追加。两者都会把用户
+        // 自装的字体拉进候选，而回退解析对候选逐个探测字形、命中即整份读入
+        // 常驻：实测一台装了 Source Han Sans（单个 `.ttc` 111.9 MB）外加一批
+        // 20+ MB 第三方字体的机器上，仅字体一项就常驻数百 MB。
+        //
+        // **按路径区分"系统自带 vs 用户自装"行不通**：本机 `%WINDIR%\Fonts`
+        // 实测 205 个文件、844 MB，其中大量是用户自己装进系统目录的第三方字体
+        // （MapleMono/Noto 等，单个 20 MB 上下），与自带字体同目录。所以改成
+        // **显式白名单**——"系统里装了什么"从此不影响常驻内存。
+        //
+        // 白名单里**故意不含雅黑**：首选字体就是雅黑（宿主
+        // `DEFAULT_DANMAKU_FONT_FAMILY`），`resolve_font` 每次都先问它，能走到
+        // 这里说明雅黑已确认没有该字形，再列一遍只会白读一份 18.8 MB。留下的
+        // 两个都是"首选缺字"的兜底，且**只在真的用到时才被读入**：
+        // - `Segoe UI Symbol`：箭头/数学/几何等符号（有轮廓，能栅格化）；
+        // - `SimSun`：宋体，GBK 覆盖面比雅黑更宽，中文生僻字的最后兜底。
+        //
+        // 不列 `Segoe UI Emoji`：它是彩色字体，本渲染路径只走轮廓，读进来
+        // 12.3 MB 也画不出彩色 emoji。
+        #[cfg(target_os = "windows")]
+        const WINDOWS_FALLBACK_FONT_FAMILIES: &[&str] = &["Segoe UI Symbol", "SimSun"];
+
         let mut faces = Vec::new();
-        for family in preferred {
+
+        #[cfg(target_os = "windows")]
+        for family in WINDOWS_FALLBACK_FONT_FAMILIES {
             let query = fontdb::Query {
                 families: &[fontdb::Family::Name(family)],
+                // 只取常规字重 / 直立 / 标准宽度：回退永远只用同一个字体实例，
+                // 没有必要把 Bold/Light/Semibold 变体也读进来。雅黑在本机就有
+                // msyhbd/msyhl/msyhsb/msyhsl/msyhhv 五个变体，合计 82 MB。
                 weight: fontdb::Weight::NORMAL,
                 stretch: fontdb::Stretch::Normal,
                 style: fontdb::Style::Normal,
@@ -1250,20 +1660,58 @@ impl SystemFontFallback {
                 push_unique_face(&mut faces, id);
             }
         }
-        for family in [fontdb::Family::SansSerif, fontdb::Family::Serif] {
-            let query = fontdb::Query {
-                families: &[family],
-                weight: fontdb::Weight::NORMAL,
-                stretch: fontdb::Stretch::Normal,
-                style: fontdb::Style::Normal,
-            };
-            if let Some(id) = db.query(&query) {
-                push_unique_face(&mut faces, id);
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let preferred = [
+                "PingFang SC",
+                "Hiragino Sans GB",
+                "Hiragino Sans",
+                "Apple SD Gothic Neo",
+                "Songti SC",
+                "STHeiti",
+                "Microsoft YaHei",
+                "SimHei",
+                "Noto Sans CJK SC",
+                "Noto Sans CJK JP",
+                "Noto Sans CJK",
+                "Source Han Sans SC",
+                "Source Han Sans",
+                "Arial Unicode MS",
+                "Arial Unicode",
+                "Segoe UI Symbol",
+            ];
+            for family in preferred {
+                let query = fontdb::Query {
+                    families: &[fontdb::Family::Name(family)],
+                    weight: fontdb::Weight::NORMAL,
+                    stretch: fontdb::Stretch::Normal,
+                    style: fontdb::Style::Normal,
+                };
+                if let Some(id) = db.query(&query) {
+                    push_unique_face(&mut faces, id);
+                }
+            }
+            for family in [fontdb::Family::SansSerif, fontdb::Family::Serif] {
+                let query = fontdb::Query {
+                    families: &[family],
+                    weight: fontdb::Weight::NORMAL,
+                    stretch: fontdb::Stretch::Normal,
+                    style: fontdb::Style::Normal,
+                };
+                if let Some(id) = db.query(&query) {
+                    push_unique_face(&mut faces, id);
+                }
+            }
+            for face in db.faces() {
+                push_unique_face(&mut faces, face.id);
             }
         }
-        let face_infos = db.faces().map(|face| face.id).collect::<Vec<_>>();
-        for id in face_infos {
-            push_unique_face(&mut faces, id);
+        // face → 源文件：`resolve` 要在**不复制字体字节**的前提下定位具体
+        // face（见 `probe_face_has_glyph`），这里一次性建表。
+        let mut source_keys = HashMap::new();
+        for face in db.faces() {
+            source_keys.insert(face.id, FontSourceKey::from_source(&face.source));
         }
         Self {
             db,
@@ -1272,6 +1720,11 @@ impl SystemFontFallback {
             loaded_order: VecDeque::new(),
             char_cache: HashMap::new(),
             next_font_id,
+            source_keys,
+            sources: HashMap::new(),
+            pinned_sources: HashSet::new(),
+            probe_order: VecDeque::new(),
+            probe_bytes: 0,
         }
     }
 
@@ -1292,6 +1745,29 @@ impl SystemFontFallback {
         }
         let faces = self.faces.clone();
         for face_id in faces {
+            match self.loaded.get(&face_id).cloned() {
+                // 已加载且可用：直接查，零额外开销。
+                Some(Some(face)) => {
+                    self.touch_loaded(face_id);
+                    if face.has_glyph(ch) {
+                        self.char_cache.insert(ch, Some(face.id));
+                        return Some(face);
+                    }
+                    continue;
+                }
+                // 已确认"这个 face 读不出来"：不再重复尝试。
+                Some(None) => continue,
+                None => {}
+            }
+            // 未加载的 face：先**零拷贝探测**它是否含该字符。
+            //
+            // 这里曾经无条件 `load_face`，于是每遇到一个字形就要把沿途所有
+            // 候选字体整份读入并常驻——一台装了大型 CJK 字体集合的机器上，
+            // 单单这一项实测就吃掉几百 MB，而其中绝大多数 face 与这个字符
+            // 无关。改成"探测命中才加载"后，常驻的只剩真正参与渲染的字体。
+            if !self.probe_face_has_glyph(face_id, ch) {
+                continue;
+            }
             let Some(face) = self.load_face(face_id) else {
                 continue;
             };
@@ -1302,6 +1778,88 @@ impl SystemFontFallback {
         }
         self.char_cache.insert(ch, None);
         None
+    }
+
+    /// 该 face 是否含 `ch` 的字形——**不把字体字节注册为常驻**。
+    ///
+    /// 依赖 `source_bytes` 的探测 LRU：同一个字体文件在一轮字形回退里只读
+    /// 一次盘，且未被真正用到的字体不会常驻。
+    fn probe_face_has_glyph(&mut self, id: fontdb::ID, ch: char) -> bool {
+        let Some((bytes, index)) = self.source_bytes(id) else {
+            return false;
+        };
+        // SAFETY: `bytes` 在本次调用期间一直存活，`FontRef` 不逃逸出函数。
+        let slice: &[u8] = bytes.as_ref().as_ref();
+        FontRef::try_from_slice_and_index(slice, index)
+            .map(|font| font.glyph_id(ch).0 != 0)
+            .unwrap_or(false)
+    }
+
+    /// 取某个 face 所属**字体文件**的字节与它的 face 索引。
+    ///
+    /// 同一个文件的全部 face 共享同一份 [`FontBytes`]：`fontdb` 在 memmap
+    /// 特性下给的是已经映射好的共享源，直接复用即可（旧实现走
+    /// `with_face_data` + `to_vec()`，每加载一个 face 就整份复制一次文件）。
+    /// 未被 `loaded` 引用的源放在有上限的 LRU 里，超限即淘汰——淘汰只会让
+    /// 下次探测重新取一次源，不改变字形选择结果。
+    fn source_bytes(&mut self, id: fontdb::ID) -> Option<(FontBytes, u32)> {
+        let key = self.source_keys.get(&id)?.clone();
+        let (source, index) = self.db.face_source(id)?;
+        if let Some(bytes) = self.sources.get(&key).cloned() {
+            if !self.pinned_sources.contains(&key) {
+                self.touch_probe(&key);
+            }
+            return Some((bytes, index));
+        }
+        let bytes: FontBytes = match source {
+            fontdb::Source::SharedFile(_, bytes) | fontdb::Source::Binary(bytes) => bytes,
+            fontdb::Source::File(path) => font_file_bytes(&path)?,
+        };
+        let len = font_bytes_slice(&bytes).len();
+        self.sources.insert(key.clone(), bytes.clone());
+        self.probe_order.push_back(key);
+        self.probe_bytes = self.probe_bytes.saturating_add(len);
+        self.enforce_probe_budget();
+        Some((bytes, index))
+    }
+
+    /// 把某个源移出探测 LRU（它已被 `loaded` 引用，字节改由面预算管）。
+    fn pin_source(&mut self, id: fontdb::ID) {
+        let Some(key) = self.source_keys.get(&id).cloned() else {
+            return;
+        };
+        if self.pinned_sources.insert(key.clone()) {
+            if let Some(pos) = self.probe_order.iter().position(|k| *k == key) {
+                self.probe_order.remove(pos);
+            }
+            if let Some(bytes) = self.sources.get(&key) {
+                let len = font_bytes_slice(bytes).len();
+                self.probe_bytes = self.probe_bytes.saturating_sub(len);
+            }
+        }
+    }
+
+    fn touch_probe(&mut self, key: &FontSourceKey) {
+        if let Some(pos) = self.probe_order.iter().position(|k| k == key) {
+            self.probe_order.remove(pos);
+            self.probe_order.push_back(key.clone());
+        }
+    }
+
+    fn enforce_probe_budget(&mut self) {
+        while self.probe_bytes > MAX_SYSTEM_FONT_PROBE_BYTES && !self.probe_order.is_empty() {
+            let Some(old_key) = self.probe_order.pop_front() else {
+                break;
+            };
+            if self.pinned_sources.contains(&old_key) {
+                continue;
+            }
+            let Some(bytes) = self.sources.remove(&old_key) else {
+                continue;
+            };
+            let len = font_bytes_slice(&bytes).len();
+            self.probe_bytes = self.probe_bytes.saturating_sub(len);
+        }
     }
 
     fn loaded_font_by_id(&mut self, font_id: u32) -> Option<DanmakuFontFace> {
@@ -1325,21 +1883,20 @@ impl SystemFontFallback {
             self.touch_loaded(id);
             return face;
         }
-        let font = self
-            .db
-            .with_face_data(id, |data, face_index| {
-                FontVec::try_from_vec_and_index(data.to_vec(), face_index)
-                    .map(FontArc::new)
-                    .ok()
-            })
-            .flatten();
-        let face = font.map(|font| {
+        // 共享源字节：同一个 `.ttc` 的多个 face 只保留**一份**文件字节，
+        // `SharedFont`（`FontRef`）零拷贝借用它。旧实现是
+        // `with_face_data(... data.to_vec() ...)`——每加载一个 face 就整份
+        // 复制一次字体文件，45-face 的 CJK 集合就是 45 份上百 MB 的副本。
+        let (bytes, index) = self.source_bytes(id)?;
+        let face = load_shared_font_data(bytes, index).map(|font| {
             let id = self.next_font_id;
             self.next_font_id = self.next_font_id.saturating_add(1).max(1);
             DanmakuFontFace::new(id, font)
         });
         self.loaded.insert(id, face.clone());
         self.loaded_order.push_back(id);
+        // 该源现在被 `loaded` 引用：字节计入面预算，并移出探测 LRU。
+        self.pin_source(id);
         self.enforce_loaded_budget();
         face
     }
@@ -1356,12 +1913,19 @@ impl SystemFontFallback {
         }
     }
 
-    /// Cap the number of retained font faces. Eviction releases the face's
-    /// full font bytes (unless a rasterized glyph elsewhere still holds an
-    /// Arc to it). Any char_cache entry that pointed at an evicted face is
-    /// dropped so the next lookup re-resolves through the full scan.
+    /// Cap the number of retained font faces **and** the retained font bytes.
+    /// Eviction releases the face's full font bytes (unless a rasterized glyph
+    /// elsewhere still holds an Arc to it). Any char_cache entry that pointed at
+    /// an evicted face is dropped so the next lookup re-resolves through the
+    /// full scan.
+    ///
+    /// 面数上限挡不住"只加载了一个 face、但它是上百 MB 的 CJK 集合"这种
+    /// 情况（面数只算 1），所以字节上限必须同时成立；两者都只换 CPU，
+    /// 不改变字形选择结果。
     fn enforce_loaded_budget(&mut self) {
-        while self.loaded_order.len() > MAX_LOADED_SYSTEM_FACES {
+        while self.loaded_order.len() > MAX_LOADED_SYSTEM_FACES
+            || self.pinned_source_bytes() > MAX_LOADED_SYSTEM_FONT_BYTES
+        {
             let Some(old_id) = self.loaded_order.pop_front() else {
                 break;
             };
@@ -1373,6 +1937,52 @@ impl SystemFontFallback {
                 self.char_cache
                     .retain(|_, cached| *cached != Some(internal_id));
             }
+            self.unpin_if_unused(old_id);
+        }
+    }
+
+    /// `loaded` 里各 face 引用的**不同源文件**的字节总量。
+    ///
+    /// 同一个 `.ttc` 的多个 face 只算一次，所以"一个字体集合被加载了多个
+    /// face"不会把预算放大成 N 倍。
+    fn pinned_source_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut seen: Vec<&FontSourceKey> = Vec::new();
+        for id in self.loaded.keys() {
+            let Some(key) = self.source_keys.get(id) else {
+                continue;
+            };
+            if seen.iter().any(|candidate| *candidate == key) {
+                continue;
+            }
+            seen.push(key);
+            if let Some(bytes) = self.sources.get(key) {
+                total = total.saturating_add(font_bytes_slice(bytes).len());
+            }
+        }
+        total
+    }
+
+    /// 某个 face 被逐出后，若它的源已不再被任何 `loaded` face 引用，
+    /// 就从常驻集合降级回探测 LRU（下次用到再取一次源）。
+    fn unpin_if_unused(&mut self, id: fontdb::ID) {
+        let Some(key) = self.source_keys.get(&id).cloned() else {
+            return;
+        };
+        let still_used = self
+            .loaded
+            .keys()
+            .any(|other| self.source_keys.get(other).is_some_and(|k| *k == key));
+        if still_used {
+            return;
+        }
+        if self.pinned_sources.remove(&key) {
+            if let Some(bytes) = self.sources.get(&key) {
+                let len = font_bytes_slice(bytes).len();
+                self.probe_bytes = self.probe_bytes.saturating_add(len);
+            }
+            self.probe_order.push_back(key);
+            self.enforce_probe_budget();
         }
     }
 }
@@ -2431,6 +3041,8 @@ fn prepare_layout(
             items: Vec::new(),
             item_times: Vec::new(),
             track_count: 0,
+            rule_errors: Vec::new(),
+            filter_breakdown: DanmakuFilterBreakdown::default(),
         };
         return DfmPreparedLayout {
             viewport,
@@ -2465,6 +3077,9 @@ fn prepare_layout(
             font_size,
             paint_width: measure.width as f64,
             paint_height: measure.height.max(font_size * 1.2) as f64,
+            user_id: source.user_id.clone(),
+            user_name: source.user_name.clone(),
+            user_level: source.user_level,
         });
     }
     let supported_count = source_items.len();
@@ -2497,6 +3112,8 @@ fn prepare_layout(
         items: Vec::new(),
         item_times: Vec::new(),
         track_count: 0,
+        rule_errors: Vec::new(),
+        filter_breakdown: DanmakuFilterBreakdown::default(),
     });
 
     let prepared = dfm_layout
@@ -2545,6 +3162,7 @@ fn prepare_layout(
         viewport,
         config,
         dfm_layout.track_count.max(0) as usize,
+        dfm_layout.filter_breakdown,
     );
     DfmPreparedLayout {
         viewport,
@@ -2584,6 +3202,11 @@ pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(1);
         let mode = DanmakuMode::from_bilibili_mode(mode_code);
+        // mode 7（高级弹幕）的文本体是「[起点X,起点Y,"透明度",生存时间,"正文",…]」，
+        // 把它当普通文字写出来就是一段乱码。Erika 目前没有高级弹幕的路径渲染
+        // （`prepare_layout` 同样跳过 `DanmakuMode::Special`，`dfm.rs` 的轨道分配
+        // 也没有 Special 分支），因此这里丢弃整条。代价是这一条不会进入任何统计
+        // 计数（解析阶段就没了），调试时只能从「XML 条数 - 时间线条数」反推。
         if mode == DanmakuMode::Special {
             continue;
         }
@@ -2609,6 +3232,15 @@ pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
             ),
             opacity: 1.0,
             is_self: false,
+            // `p` 第 7 段（下标 6）是发送者 hash。Erika 早期实现整体丢弃了它，
+            // 于是 `<标识>` 屏蔽规则在 XML 来源上永远匹配不到任何东西。
+            user_id: fields
+                .get(6)
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default(),
+            // B 站点播 XML 的 `p` 里没有用户名与等级。
+            user_name: String::new(),
+            user_level: 0,
             text,
         });
     }
@@ -2697,6 +3329,16 @@ fn item_from_json_value(value: &Value, fallback_id: u64) -> Result<DanmakuItem> 
         color,
         opacity: numeric_field(object, &["opacity", "alpha", "a"]).unwrap_or(1.0) as f32,
         is_self: bool_field(object, &["is_me", "isMe", "self", "mine"]).unwrap_or(false),
+        // 发送者元数据：JSON 来源可以带，键名对齐 B 站与录播姬两套叫法。
+        // `uid` 与 `user_hash` 都落进同一个 `user_id`——内核只做原样字符串比较，
+        // 不关心来源给的是 hash 还是数值 uid。
+        user_id: string_field(object, &["user_hash", "userHash", "uid", "mid", "user_id"])
+            .unwrap_or_default(),
+        user_name: string_field(object, &["user_name", "userName", "uname", "name"])
+            .unwrap_or_default(),
+        user_level: u64_field(object, &["user_level", "userLevel", "level"])
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
     })
 }
 
@@ -2869,7 +3511,8 @@ fn load_selected_fonts(
         database.load_font_source(fontdb::Source::Binary(Arc::new(attachment.data.clone())));
         let face_indices = database.faces().map(|face| face.index).collect::<Vec<_>>();
         for face_index in face_indices {
-            if let Some(font) = load_shared_font_data(attachment.data.clone(), face_index) {
+            let bytes = owned_font_bytes(attachment.data.clone());
+            if let Some(font) = load_shared_font_data(bytes, face_index) {
                 let id = first_font_id.saturating_add(fonts.len() as u32);
                 fonts.push(DanmakuFontFace::new(id, font));
             }
@@ -2982,15 +3625,16 @@ struct SharedFont {
     // This field must be dropped before `data`, because its internal references
     // point into the allocation kept alive by `data`.
     font: FontRef<'static>,
-    data: Arc<[u8]>,
+    data: FontBytes,
 }
 
 impl SharedFont {
-    fn try_new(data: Arc<[u8]>, face_index: u32) -> Option<Self> {
-        // SAFETY: `bytes` points into the allocation owned by `data`. The Arc is
-        // stored in the same value and is declared after `font`, so it remains
-        // alive until all references held by FontRef have been dropped.
-        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+    fn try_new(data: FontBytes, face_index: u32) -> Option<Self> {
+        // SAFETY: `bytes` points into the allocation owned by `data`. The handle
+        // is stored in the same value and is declared after `font`, so it
+        // remains alive until all references held by FontRef have been dropped.
+        let source: &[u8] = font_bytes_slice(&data);
+        let bytes = unsafe { std::slice::from_raw_parts(source.as_ptr(), source.len()) };
         let font = FontRef::try_from_slice_and_index(bytes, face_index).ok()?;
         Some(Self { font, data })
     }
@@ -3062,11 +3706,11 @@ impl Font for SharedFont {
     }
 
     fn font_data(&self) -> &[u8] {
-        &self.data
+        font_bytes_slice(&self.data)
     }
 }
 
-fn load_shared_font_data(data: Arc<[u8]>, face_index: u32) -> Option<FontArc> {
+fn load_shared_font_data(data: FontBytes, face_index: u32) -> Option<FontArc> {
     SharedFont::try_new(data, face_index).map(FontArc::new)
 }
 
@@ -3293,6 +3937,29 @@ mod tests {
             color: DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            user_id: String::new(),
+            user_name: String::new(),
+            user_level: 0,
+        }
+    }
+
+    /// 带发送者元数据的条目，用于屏蔽规则测试。
+    ///
+    /// 当前无调用点（屏蔽规则的用例在 `danmaku::rules` 里自带构造），保留待用。
+    #[allow(dead_code)]
+    fn item_with_user(
+        time: f64,
+        text: &str,
+        mode: DanmakuMode,
+        user_id: &str,
+        user_name: &str,
+        user_level: u32,
+    ) -> DanmakuItem {
+        DanmakuItem {
+            user_id: user_id.to_string(),
+            user_name: user_name.to_string(),
+            user_level,
+            ..item(time, text, mode)
         }
     }
 
@@ -3762,6 +4429,24 @@ mod tests {
         assert!(atlas.packed.contains_key(&key));
     }
 
+    /// 回退候选必须是**显式白名单**，而不是"遍历字体库"。
+    ///
+    /// 这条断言守住的是内存：候选集一旦来自 `db.faces()`（机器上装了什么就是
+    /// 什么），用户自装的第三方字体会全部进来——本机实测 `%WINDIR%\Fonts` 有
+    /// 205 个文件 844 MB，其中单个 CJK 集合 111.9 MB，且多个 face 各自一份。
+    /// 回退首次缺字时遍历到它们就会把它们整份读入常驻。
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn system_font_fallback_candidates_stay_a_small_explicit_whitelist() {
+        let fb = SystemFontFallback::new(1);
+        assert!(
+            fb.faces.len() <= 4,
+            "回退候选应保持为显式白名单（Windows 上至多 4 个），实际 {} 个——\
+             候选里出现大量 face 通常意味着又退回成遍历字体库了",
+            fb.faces.len()
+        );
+    }
+
     #[test]
     fn system_font_fallback_evicts_oldest_faces_over_budget() {
         let font = FontArc::new(
@@ -3783,6 +4468,11 @@ mod tests {
             loaded_order: VecDeque::new(),
             char_cache: HashMap::new(),
             next_font_id: 1,
+            source_keys: HashMap::new(),
+            sources: HashMap::new(),
+            pinned_sources: HashSet::new(),
+            probe_order: VecDeque::new(),
+            probe_bytes: 0,
         };
         for (index, db_id) in db_ids.iter().copied().enumerate() {
             fb.loaded.insert(
@@ -4300,5 +4990,81 @@ mod tests {
         assert_eq!(fonts.len(), 2);
         assert_eq!(fonts[0].font.font_data().as_ptr(), attachment.data.as_ptr());
         assert_eq!(fonts[1].font.font_data().as_ptr(), attachment.data.as_ptr());
+    }
+
+    /// 分类桶与内核诊断码必须一一对应。
+    ///
+    /// `DanmakuFilterBreakdown::add_filter_param` 里为了不让 `dfm_core` 的内部编号
+    /// 变成公开契约，把编号抄了一份；这个测试盯住两边不要漂移——它直接用诊断码
+    /// 常量（而不是字面数字）驱动分类，所以任何一侧改编号都会在这里失败。
+    #[test]
+    fn filter_breakdown_matches_param_codes() {
+        use crate::danmaku::dfm_core::filters::filter_param as code;
+
+        let mut breakdown = DanmakuFilterBreakdown::default();
+        for param in [
+            code::TYPE,
+            code::QUANTITY,
+            code::ELAPSED,
+            code::KEYWORD,
+            code::REGEX,
+            code::USER,
+            code::NAME,
+            code::LEVEL,
+            code::TEXT_LENGTH,
+            code::TIME_RANGE,
+            code::COLOR,
+            code::DUPLICATE,
+        ] {
+            breakdown.add_filter_param(param);
+        }
+        // 未屏蔽（0）与轨道装不下（99）都算进"合并/装不下"桶，所以 99 再加一次
+        breakdown.add_filter_param(0);
+        breakdown.add_filter_param(code::OVERFLOW);
+
+        assert_eq!(breakdown.type_blocked, 1);
+        assert_eq!(breakdown.quantity, 1);
+        assert_eq!(breakdown.elapsed, 1);
+        assert_eq!(breakdown.keyword, 1);
+        assert_eq!(breakdown.regex, 1);
+        assert_eq!(breakdown.user, 1);
+        assert_eq!(breakdown.name, 1);
+        assert_eq!(breakdown.level, 1);
+        assert_eq!(breakdown.text_length, 1);
+        assert_eq!(breakdown.time_range, 1);
+        assert_eq!(breakdown.color, 1);
+        assert_eq!(breakdown.duplicate, 2, "重复合并与轨道装不下共用一个桶");
+        // 诊断码 0 是"没被屏蔽"，不该计入任何桶
+        assert_eq!(breakdown.total(), 13);
+    }
+
+    /// 诊断行文字：**没有任何屏蔽时也要给出数字**，而不是让那一行消失或留空。
+    #[test]
+    fn filter_summary_always_reports_a_number() {
+        // 没加载弹幕：显示占位符（不是 "屏蔽 0 / 0"）
+        assert_eq!(DanmakuPreparedStats::default().filter_summary(), "—");
+
+        // 加载了 1200 条、一条没屏蔽：仍然给出 0 与总数
+        let none_filtered = DanmakuPreparedStats {
+            source_items: 1200,
+            ..DanmakuPreparedStats::default()
+        };
+        assert_eq!(none_filtered.filter_summary(), "屏蔽 0 / 1200");
+
+        // 有屏蔽：按原因分类，且分类之和等于总数
+        let mut breakdown = DanmakuFilterBreakdown::default();
+        breakdown.type_blocked = 12;
+        breakdown.keyword = 20;
+        breakdown.regex = 5;
+        let some_filtered = DanmakuPreparedStats {
+            source_items: 1200,
+            filtered_items: 37,
+            filter_breakdown: breakdown,
+            ..DanmakuPreparedStats::default()
+        };
+        assert_eq!(
+            some_filtered.filter_summary(),
+            "屏蔽 37 / 1200（类型 12 · 关键词 20 · 正则 5）"
+        );
     }
 }

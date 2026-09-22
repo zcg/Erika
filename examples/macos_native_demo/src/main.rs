@@ -148,6 +148,9 @@ fn demo_danmaku_timeline() -> DanmakuTimeline {
             color: erika::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            user_id: String::new(),
+            user_name: String::new(),
+            user_level: 0,
         })
         .expect("demo danmaku item is valid");
     danmaku

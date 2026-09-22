@@ -33,12 +33,13 @@ use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC,
 };
 use ::windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_WAS_STILL_DRAWING, DXGI_HDR_METADATA_HDR10, DXGI_HDR_METADATA_TYPE_HDR10,
-    DXGI_HDR_METADATA_TYPE_NONE, DXGI_PRESENT_DO_NOT_WAIT, DXGI_PRESENT_PARAMETERS,
-    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_ERROR_WAS_STILL_DRAWING, DXGI_FRAME_STATISTICS, DXGI_HDR_METADATA_HDR10,
+    DXGI_HDR_METADATA_TYPE_HDR10, DXGI_HDR_METADATA_TYPE_NONE, DXGI_PRESENT_DO_NOT_WAIT,
+    DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH,
+    DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIResource,
-    IDXGISwapChain1, IDXGISwapChain3, IDXGISwapChain4,
+    IDXGISwapChain, IDXGISwapChain1, IDXGISwapChain3, IDXGISwapChain4,
 };
 use ::windows::core::{BOOL, IUnknown, Interface, PCSTR};
 
@@ -582,12 +583,182 @@ pub struct D3d11RendererStats {
     pub import_failures: u64,
     pub prepared_overlay_frames: u64,
     pub prepared_overlay_subtitle_planes: u64,
+    /// 叠加层平面纹理（字幕平面 + alpha 图集）的 `CreateTexture2D` 次数。
+    ///
+    /// 这是"每帧新建纹理"抖动的直接计数：缓存命中时它不增长。
+    pub overlay_plane_texture_creates: u64,
+    /// 叠加层平面纹理复用次数：命中缓存，只做一次 `UpdateSubresource`，
+    /// 没有新建/释放纹理。
+    pub overlay_plane_texture_reuses: u64,
     pub overlay_alpha_atlas_uploads: u64,
     pub overlay_alpha_atlas_reuses: u64,
     pub danmaku_passes: u64,
     pub danmaku_items: u64,
     pub attached: bool,
+    // ===== UI 线程（宿主渲染回调）分段耗时 =====
+    //
+    // 这一组是**回答「一拍多少 ms 花在哪」的唯一直接证据**。存在的理由：
+    // 宿主把 `render_tick` 挂在显示合成回调（WinUI `CompositionTarget::Rendering`）
+    // 上，而那个回调与窗口消息（`WM_MOVING`/`WM_SIZING`/`WM_NCMOUSEMOVE`）**共用
+    // 同一个 UI 线程**。所以这里每一项都是「窗口交互被推迟多久」的直接构成项：
+    // 用户在拖窗口/缩放/最大化的瞬间感受到的卡顿，就是这些数字之和。
+    //
+    // 这些是 **CPU/提交侧**耗时（`Instant::now()` 差值），不是 GPU 执行耗时：
+    // D3D11 的 immediate context 是异步提交，`Present1` 返回时 GPU 可能还在跑
+    // 上一个命令流。要 GPU 真时间必须用 timestamp query，本后端**没有**实现
+    // —— 所以 `RendererRuntimeStats::last_gpu_duration` 在 Windows/D3D11 上
+    // 恒为 0（只有 Metal 后端赋值）。诊断面板上的 `gpu=` 在本平台因此不可信，
+    // 看这一组。
+    /// 最近一拍的 `prepare_overlay_draws` 耗时（字幕/HUD 平面准备）。
+    pub last_overlay_prepare_duration: Duration,
+    /// 最近一拍的 `prepare_danmaku_draws` 耗时（弹幕字形图集查找/光栅化 + 顶点构建）。
+    ///
+    /// 这是**候选热点**：CJK 字形首次出现要跑 freetype/harfbuzz 光栅化并上传
+    /// 图集，图集未命中时会显著慢于命中。与真机日志「慢拍集中在前 600s 且单调
+    /// 递减」的模式一致（字形逐渐被缓存）。
+    pub last_danmaku_prepare_duration: Duration,
+    /// 最近一拍的 `draw_video` 提交耗时（不含 GPU 执行）。
+    pub last_draw_video_duration: Duration,
+    /// 最近一拍的叠加层（字幕 + 弹幕）`draw_overlays` 提交耗时。
+    pub last_draw_overlay_duration: Duration,
+    /// 最近一拍的 `render_video` 总耗时（含上面各项 + present + 表面校验）。
+    ///
+    /// 与 `last_render_current_duration`（presenter 侧测的同一段）互为交叉校验：
+    /// 两者应当接近相等，差得多说明慢在 `render_current_frame` 的外壳（设备丢失
+    /// 检查等）。
+    pub last_present_duration: Duration,
+    /// `Present1` 真正提交进 DXGI 队列的累计次数。
+    pub present_submitted: u64,
+    /// `Present1` 返回 `DXGI_ERROR_WAS_STILL_DRAWING` 被丢弃的累计次数。
+    ///
+    /// **这是判定「present 是否在阻塞 UI 线程」的判决性计数器**：本后端刻意用
+    /// `Present1(0, DXGI_PRESENT_DO_NOT_WAIT)`，队列满时丢弃本拍而不是等待。
+    /// 所以正常情况下这个数应当持续增长（每拍或多拍一次），而
+    /// `last_present_duration` 应当保持在**亚毫秒**量级。若真机上看到
+    /// `present_submitted` 几乎不涨、`last_present_duration` 却是 10ms+，那才是
+    /// 「present 同步等待 vsync」——此时再看 `present_dropped` 是否也在涨。
+    pub present_dropped: u64,
+    /// 最近一次 [`wait_for_gpu`] 视频帧交接栅栏的等待时长。
+    ///
+    /// **这是判定「UI 线程是否被无谓空等」的判决性数字**，也是本次修复的验证点。
+    /// 历史实现用 `sleep(1ms)` 轮询，撞上 Windows 默认 15.625ms 时钟粒度 →
+    /// 每个上屏视频帧白等 ≈15.5ms。修复后（阻塞 `GetData`）应当降到**亚毫秒**。
+    ///
+    /// 看这个数的方法：播放中让它保持 <1ms；若它又回到 10ms+ 量级，说明栅栏
+    /// 重新变成了瓶颈（或被换回轮询实现）。
+    pub last_wait_gpu_duration: Duration,
+    /// [`wait_for_gpu`] 被调用的累计次数（≈ 上屏视频帧数）。
+    pub wait_gpu_calls: u64,
+    /// 其中等待超过 2ms 的次数。稳态播放时应**恒为 0**；持续增长即回归。
+    pub slow_wait_gpu_count: u64,
+    /// 视频帧交接栅栏的 `ID3D11Query` 对象的**实际 `CreateQuery` 次数**。
+    ///
+    /// 这是"每个上屏视频帧新建一个 query 再释放"是否被消掉的直接计数：复用
+    /// 生效时它只在**设备重建**时 +1（一次连续播放通常不超过 2~3），不会随
+    /// [`Self::wait_gpu_calls`] 同步增长。若它与 `wait_gpu_calls` 同阶增长，
+    /// 说明 [`D3d11Renderer::wait_for_gpu`] 的复用槽被改回了"每次新建"。
+    pub gpu_fence_query_creates: u64,
+    /// 视频帧交接栅栏**复用既有 query** 的次数（只做 `End`/`GetData`，
+    /// 没有 `CreateQuery`）。稳态播放时它应当 ≈ [`Self::wait_gpu_calls`]。
+    pub gpu_fence_query_reuses: u64,
+    // ===== present 的真实分布 + 合成器节拍 =====
+    //
+    // 存在的理由（真机日志实测，498 秒采样）：此前只有 `last_present_duration`
+    // 一个**最后一个采样**，于是 0.52 / 1.88 / 0.32 这类单点容易被当成"平均
+    // 0.5ms"。把这 498 个单点摊开后的真实分布是 p50=0.41ms、p90=1.11ms、
+    // p99=14.55ms —— 单点既看不到中位数，也看不到那条 15ms 的尾。
+    /// `Present1` 的累计调用次数。均值 = [`Self::present_total`] / 本值。
+    pub present_calls: u64,
+    /// `Present1` 的累计耗时。
+    pub present_total: Duration,
+    /// 单次 `Present1` 的最长耗时。
+    pub present_max: Duration,
+    /// `present` 耗时超过 1ms 的次数：「这一拍被 present 拖住」的计数。
+    pub present_over_1ms: u64,
+    /// `present` 耗时超过 8ms 的次数。
+    ///
+    /// 8ms 是 120Hz 的一帧（8.33ms）。这个计数**持续增长**说明 present 在
+    /// **等合成器的一帧**：真机日志里存在整秒的 `n=60、present=12.4~15.8ms`
+    /// 段落，那些秒里 UI 线程 67~92% 的时间花在 present 内，而同一行里的
+    /// `准备/绘制` 仍是 0.00~0.29ms —— 不是我们在算，是在等。
+    ///
+    /// 反过来，只有在**本计数不增长**而 `present` 仍然高的时候，那份耗时才是
+    /// 我们自己的提交成本（最典型的是叠加层平面上传在 flush 边界结算，见
+    /// [`Self::overlay_plane_uploads`]）。
+    pub present_over_8ms: u64,
+    /// [`D3d11FrameStatsSampler`] 是否成功从 `GetFrameStatistics` 取到读数。
+    pub frame_stats_available: bool,
+    /// 采样窗口内**显示器的 vblank 速率**，单位**毫赫兹**（120000 = 120.000Hz）。
+    ///
+    /// 这是"面板此刻跑在几 Hz"的直接读数，用来区分两种完全不同的归因：
+    /// * 掉到 60000 → 面板/系统真的切到了 60Hz（此时我们的代码无从优化）；
+    /// * 仍是 120000 而 [`Self::presents_per_refresh_milli`] ≈ 500 → 面板仍是
+    ///   120Hz，是合成器在按 60Hz 消费我们的帧。
+    ///
+    /// 用整数毫赫兹而不是 f32：本结构体与 [`RendererRuntimeStats`] 都派生
+    /// `Eq`，引入浮点会把这个 derive 打掉（宿主与测试都在用 `assert_eq!`）。
+    pub display_refresh_hz_milli: u32,
+    /// 每个 vblank 我们提交了几帧，单位**千分之一**（1000 = 1.000 帧/vblank）。
+    pub presents_per_refresh_milli: u32,
+    /// 每个 vblank **真正上屏**了几帧，单位同上。
+    ///
+    /// 明显小于 [`Self::presents_per_refresh_milli`] 时，说明提交进去的帧被
+    /// 合成器丢掉了（我们交了、没显示）。
+    pub shown_frames_per_refresh_milli: u32,
+    // ===== 叠加层平面上传（候选 C：内容未变就不传）=====
+    /// 叠加层平面**真正执行** `UpdateSubresource` 的累计次数。
+    ///
+    /// 每次上传本身几乎不花时间，但它的 flush 会在下游结算 —— 实测（本机
+    /// AMD Radeon 集显、未挂 XAML visual 的 composition swapchain、按 120Hz
+    /// 节拍 present）：present 前插 1 次 768x64 RGBA（0.20MB）上传，present
+    /// p50 从 240µs 涨到 339µs（+99µs）；插 1 次 1080p RGBA（8.29MB）上传，
+    /// p50 涨到 1062µs（+822µs）。所以"少传一次"省的是 **present 里的时间**。
+    pub overlay_plane_uploads: u64,
+    /// 上传进 GPU 的叠加层平面总字节数。
+    pub overlay_plane_upload_bytes: u64,
+    /// 因内容与上次逐字节相同而**跳过**上传的次数。跳过的每一次都少付一次
+    /// 上面那笔提交成本。
+    pub overlay_plane_upload_skips: u64,
 }
+
+/// `IDXGISwapChain::GetFrameStatistics` 采样器：读出**显示器的 vblank 速率**与
+/// 「每个 vblank 我们提交/上屏了几帧」。
+///
+/// 一手依据（Microsoft Learn）：
+/// * `IDXGISwapChain::GetFrameStatistics` 的 Remarks 原文："You can only use
+///   GetFrameStatistics for swap chains that either use the flip presentation
+///   model or draw in full-screen mode." —— 本后端走
+///   `DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL`，所以窗口化下可用（该页同时写明
+///   "Statistics are not reliable in many multiple monitor scenarios, as well as
+///   scenarios where other fullscreen apps are running. It may be necessary to
+///   call DwmFlush before frame statistics are updated on systems that support
+///   Hardware Flip Queue."）。
+/// * `DXGI_FRAME_STATISTICS` 的字段语义：`PresentCount` = "running total count
+///   of times that an image was presented to the monitor"（**不是**我们调用
+///   `Present1` 的次数）；`PresentRefreshCount` = "running total count of
+///   v-blanks at which the last image was presented to the monitor"；
+///   `SyncRefreshCount` = "running total count of v-blanks when the scheduler
+///   last sampled the machine time"。
+///
+/// 因此 `ΔSyncRefreshCount / Δt` 就是**显示器此刻的刷新率**（与我们的提交
+/// 行为无关），而 `ΔPresentCount / ΔSyncRefreshCount` 是"每个 vblank 我们
+/// 交了几帧"。两者一起才能区分"面板掉到 60Hz"与"面板 120Hz 但合成器压我们"。
+///
+/// 采样周期固定为 [`FRAME_STATS_SAMPLE_TICKS`] 拍（120 拍 ≈ 1 秒），只做趋势
+/// 判读 —— 上面那条 "not reliable" 的限制决定了它不能用来做逐帧断言。
+struct D3d11FrameStatsSampler {
+    last: DXGI_FRAME_STATISTICS,
+    last_at: Instant,
+    ticks: u32,
+}
+
+/// 每 120 拍采一次 `GetFrameStatistics`（120Hz 下约 1 秒）。
+const FRAME_STATS_SAMPLE_TICKS: u32 = 120;
+
+/// `present` 超过它就算「本拍被 present 拖住」（1ms）。
+const PRESENT_SLOW_THRESHOLD: Duration = Duration::from_millis(1);
+/// `present` 超过它按「在等合成器一帧」计：120Hz 一帧 8.33ms，取 8ms。
+const PRESENT_COMPOSITOR_WAIT_THRESHOLD: Duration = Duration::from_millis(8);
 
 struct D3d11DeviceState {
     device: ID3D11Device,
@@ -839,12 +1010,423 @@ impl D3d11DanmakuAtlasCache {
     }
 }
 
+/// 叠加层平面纹理缓存的条目上限（张）。
+///
+/// 一条字幕的包围盒在它的显示期内是稳定的（libass 只在文本/样式变化时改
+/// 包围盒），所以「格式 + 尺寸」就是稳定的命中键。常见并发规模是 1 条原文 +
+/// 1 条译文 + 偶尔的屏幕字；6 张足够覆盖。超出的平面退回按帧新建/释放
+/// （修改前的行为），不会因为缓存不够而画错。
+const OVERLAY_TEXTURE_CACHE_CAPACITY: usize = 6;
+
+/// 叠加层平面纹理缓存的常驻字节上限。
+///
+/// 文本字幕平面很小（1080P 单行 ≈ 0.1MB），但位图字幕（PGS/VobSub）的平面
+/// 可以整屏大（1080P RGBA ≈ 8MB）。按字节封顶，保证"复用"不会退化成"把整屏
+/// 平面钉死在显存里"；单张超过预算的平面不进缓存。
+const OVERLAY_TEXTURE_CACHE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// 缓存条目的形状与使用信息。与 D3D 资源分离，让淘汰策略可以单独单测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct D3d11OverlayTextureSlot {
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    bytes: usize,
+    /// 最近一次使用它的渲染帧序号，用于 LRU 与"本帧是否已交出"判定。
+    last_frame: u64,
+}
+
+/// 本帧这张平面该走哪条路径。见 `plan_overlay_texture_slot`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D3d11OverlayTexturePlan {
+    /// 命中第 `index` 条：`UpdateSubresource` 复用，不新建。
+    Reuse(usize),
+    /// 第 `index` 条是空位：新建并缓存。
+    Insert(usize),
+    /// 淘汰第 `index` 条（LRU）后新建并缓存。
+    Replace(usize),
+    /// 不进缓存：本帧新建、帧末释放（容量或字节预算不允许）。
+    Transient,
+}
+
+/// 叠加层平面纹理的「格式 + 尺寸」小 LRU 缓存。
+///
+/// 修改前：`prepare_overlay_draws` 对每个字幕平面、每一帧都调
+/// `create_overlay_texture`（`CreateTexture2D` + `CreateShaderResourceView`），
+/// 帧末随 `draws` 一起释放。1080P 单行字幕平面约 0.1MB，60fps 下就是约
+/// 6MB/s 的分配/释放抖动，WDDM 下每次都是驱动级分配。
+///
+/// 现在：同格式同尺寸的平面命中条目，只做一次 `UpdateSubresource`，纹理对象
+/// （含已建好的 SRV）跨帧复用；常驻被 `OVERLAY_TEXTURE_CACHE_BUDGET_BYTES`
+/// 与 `OVERLAY_TEXTURE_CACHE_CAPACITY` 双重封顶。
+///
+/// 同一帧内已交出去的条目不会再被命中（`last_frame == frame` 判定）：一帧里
+/// 两张尺寸相同的平面必须各自持有一张纹理，否则后一次上传会覆盖前一张的
+/// 像素。容量不够时新平面走 `Transient`，即修改前的行为。
+///
+/// **设备绑定**：条目里的纹理属于创建它的 D3D11 设备，任何设备切换/重建
+/// （`set_device`）都必须清空，否则会拿到旧设备的纹理。
+struct D3d11OverlayTextureCache {
+    /// 当前渲染帧序号，`begin_frame` 每帧 +1。
+    frame: u64,
+    entries: Vec<D3d11OverlayTextureEntry>,
+    cached_bytes: usize,
+}
+
+struct D3d11OverlayTextureEntry {
+    slot: D3d11OverlayTextureSlot,
+    texture: D3d11OverlayTexture,
+    /// 这张纹理当前内容的副本；`None` = 内容未知，必须重传。
+    ///
+    /// 存在的理由（实测，不是推测）：`UpdateSubresource` 的成本**不在调用点**，
+    /// 而在下游 flush 边界结算。本机（AMD Radeon 集显、composition swapchain、
+    /// 按 120Hz 节拍 present）实测：present 前插 1 次 768x64 RGBA（0.20MB）上传，
+    /// present p50 240µs → 339µs（+99µs）；插 1 次 1080p RGBA（8.29MB），p50 →
+    /// 1062µs（+822µs）—— **单次调用的成本几乎与字节数无关**。
+    ///
+    /// 而字幕在"同一句字幕期间"逐拍逐字节相同：实测同一句静态字幕连续 120 拍
+    /// （libass 的 2 张 alpha 位图 828x57 / 47,420 字节，以及 debug 渲染器的
+    /// 360x28 RGBA 平面）**119/119 完全相同**。逐字节比对 40KB 实测 p50 1.5µs，
+    /// 比无条件重传便宜约两个数量级。
+    ///
+    /// 正确性边界：条目被 `Insert`/`Replace` 换入新纹理时同步写入内容（初始数据
+    /// 也在创建时上传）；`clear()`（设备重建）、`Transient`（不入缓存）都不会
+    /// 留下"内容已知"的假象 —— 这两条路径必须重新上传，否则静态字幕会在纹理被
+    /// 驱逐/重建后消失。
+    content: Option<Vec<u8>>,
+}
+
+impl D3d11OverlayTextureCache {
+    const fn new() -> Self {
+        Self {
+            frame: 0,
+            entries: Vec::new(),
+            cached_bytes: 0,
+        }
+    }
+
+    /// 渲染帧开始：帧序号 +1。同一帧内的"已交出"判定全部与它比较。
+    fn begin_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// 设备重建：丢掉所有属于旧设备的纹理。
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.cached_bytes = 0;
+    }
+
+    /// 取一张写有 `data` 的纹理，能复用就复用。
+    ///
+    /// `bytes_per_row` 与 `height` 一起决定这张平面的字节数（缓存预算用它计量）。
+    fn acquire(
+        &mut self,
+        state: &D3d11DeviceState,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+        data: &[u8],
+        bytes_per_row: u32,
+        stats: &mut D3d11RendererStats,
+    ) -> Result<D3d11OverlayTexture> {
+        let bytes = (bytes_per_row.max(1) as usize).saturating_mul(height.max(1) as usize);
+        let mut slots = [None; OVERLAY_TEXTURE_CACHE_CAPACITY];
+        let occupied = self.entries.len().min(OVERLAY_TEXTURE_CACHE_CAPACITY);
+        for (index, entry) in self.entries.iter().take(occupied).enumerate() {
+            slots[index] = Some(entry.slot);
+        }
+        match plan_overlay_texture_slot(
+            &slots[..occupied],
+            self.cached_bytes,
+            width,
+            height,
+            format,
+            bytes,
+            self.frame,
+        ) {
+            D3d11OverlayTexturePlan::Reuse(index) => {
+                let entry = &mut self.entries[index];
+                entry.slot.last_frame = self.frame;
+                stats.overlay_plane_texture_reuses += 1;
+                // 内容与这张纹理里已有的一致 → 跳过 `UpdateSubresource`。
+                // 跳过的是**下游 flush 里那笔 ~100µs 的提交成本**（见
+                // `D3d11OverlayTextureEntry::content` 的实测数据），不是省一次
+                // 内存拷贝。
+                if entry.content.as_deref() == Some(data) {
+                    stats.overlay_plane_upload_skips += 1;
+                    return Ok(entry.texture.clone());
+                }
+                upload_overlay_texture(state, &entry.texture._texture, data, bytes_per_row);
+                entry.content = Some(data.to_vec());
+                stats.overlay_plane_uploads += 1;
+                stats.overlay_plane_upload_bytes += data.len() as u64;
+                Ok(entry.texture.clone())
+            }
+            D3d11OverlayTexturePlan::Insert(index) => {
+                let texture =
+                    create_overlay_texture(state, width, height, format, data, bytes_per_row)?;
+                let slot = D3d11OverlayTextureSlot {
+                    width,
+                    height,
+                    format,
+                    bytes,
+                    last_frame: self.frame,
+                };
+                if index < self.entries.len() {
+                    // 条目一旦写满就只会走 Replace；这里只是防御性兜底。
+                    let replaced = mem::replace(
+                        &mut self.entries[index],
+                        D3d11OverlayTextureEntry {
+                            slot,
+                            texture: texture.clone(),
+                            content: Some(data.to_vec()),
+                        },
+                    );
+                    self.cached_bytes = self
+                        .cached_bytes
+                        .saturating_sub(replaced.slot.bytes)
+                        .saturating_add(bytes);
+                } else {
+                    self.entries.push(D3d11OverlayTextureEntry {
+                        slot,
+                        texture: texture.clone(),
+                        content: Some(data.to_vec()),
+                    });
+                    self.cached_bytes = self.cached_bytes.saturating_add(bytes);
+                }
+                stats.overlay_plane_texture_creates += 1;
+                Ok(texture)
+            }
+            D3d11OverlayTexturePlan::Replace(index) => {
+                let texture =
+                    create_overlay_texture(state, width, height, format, data, bytes_per_row)?;
+                let replaced = mem::replace(
+                    &mut self.entries[index],
+                    D3d11OverlayTextureEntry {
+                        slot: D3d11OverlayTextureSlot {
+                            width,
+                            height,
+                            format,
+                            bytes,
+                            last_frame: self.frame,
+                        },
+                        texture: texture.clone(),
+                        content: Some(data.to_vec()),
+                    },
+                );
+                self.cached_bytes = self
+                    .cached_bytes
+                    .saturating_sub(replaced.slot.bytes)
+                    .saturating_add(bytes);
+                stats.overlay_plane_texture_creates += 1;
+                Ok(texture)
+            }
+            D3d11OverlayTexturePlan::Transient => {
+                stats.overlay_plane_texture_creates += 1;
+                create_overlay_texture(state, width, height, format, data, bytes_per_row)
+            }
+        }
+    }
+}
+
+/// 选出本帧这张平面该用哪条缓存路径。纯函数：只读元信息，便于单测。
+///
+/// 规则（顺序即优先级）：
+/// 1. 本帧还没交出去的「格式 + 尺寸」相同条目 → `Reuse`；
+/// 2. 单张就超过字节预算 → `Transient`（避免一张整屏位图把显存钉死）；
+/// 3. 还有空位且加进去不超预算 → `Insert`；
+/// 4. 淘汰本帧未使用的最旧条目（LRU），换入后不超预算 → `Replace`；
+/// 5. 其余 → `Transient`（同帧同尺寸平面多于容量时的兜底，行为同修改前）。
+fn plan_overlay_texture_slot(
+    slots: &[Option<D3d11OverlayTextureSlot>],
+    cached_bytes: usize,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    bytes: usize,
+    frame: u64,
+) -> D3d11OverlayTexturePlan {
+    let occupied = || {
+        slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.map(|slot| (index, slot)))
+    };
+    if let Some((index, _)) = occupied().find(|(_, slot)| {
+        slot.last_frame != frame
+            && slot.width == width
+            && slot.height == height
+            && slot.format == format
+    }) {
+        return D3d11OverlayTexturePlan::Reuse(index);
+    }
+    if bytes > OVERLAY_TEXTURE_CACHE_BUDGET_BYTES {
+        return D3d11OverlayTexturePlan::Transient;
+    }
+    let used = occupied().count();
+    if used < OVERLAY_TEXTURE_CACHE_CAPACITY
+        && cached_bytes.saturating_add(bytes) <= OVERLAY_TEXTURE_CACHE_BUDGET_BYTES
+    {
+        // 条目按插入顺序紧凑存放，空位就是最后一条之后。
+        return D3d11OverlayTexturePlan::Insert(used);
+    }
+    let victim = occupied()
+        .filter(|(_, slot)| slot.last_frame != frame)
+        .min_by_key(|(index, slot)| (slot.last_frame, *index));
+    if let Some((index, slot)) = victim {
+        if cached_bytes
+            .saturating_sub(slot.bytes)
+            .saturating_add(bytes)
+            <= OVERLAY_TEXTURE_CACHE_BUDGET_BYTES
+        {
+            return D3d11OverlayTexturePlan::Replace(index);
+        }
+    }
+    D3d11OverlayTexturePlan::Transient
+}
+
+/// `append_alpha_atlas_draws` 重建 alpha 图集时的 CPU 侧缓冲，跨帧复用。
+///
+/// 修改前每拍 `vec![0u8; atlas_w * atlas_h]` + `Vec::new()`（placements），
+/// 帧末整块释放。图集形状由这一拍参与拼接的平面尺寸决定，而一句字幕的显示期内
+/// 它是稳定的，于是每拍都在为同一形状付一次「分配 + 释放」。
+///
+/// **别名判断（为什么复用不会改坏输出）**：这块缓冲只以 `&[u8]` 交给
+/// `D3d11OverlayTextureCache::acquire`，两条出口都不保留指针 —— 命中缓存走
+/// `ID3D11DeviceContext::UpdateSubresource`，未命中走 `ID3D11Device::CreateTexture2D`
+/// 的 `pInitialData`。两者都只在调用期间读取调用方内存：本机 WARP 实测见
+/// `d3d11_overlay_upload_does_not_retain_source_buffer`（调用返回后**立刻改写**
+/// 源缓冲，读回纹理仍是调用时的字节），所以返回后缓冲即可改写。缓冲也不会
+/// 跨线程或跨帧逃逸：它只在本渲染器的这一次调用里被借用一次。
+///
+/// **实测成本与量级**（release，本机 2026-09-15，Windows 进程堆；跑法
+/// `cargo test --release --lib alpha_atlas_rebuild_cost_is_measured -- --nocapture`）：
+/// 同一形状（图集 1656x57 = 94,392 字节，2 张 828x57 / stride 832）下，
+/// 复用后的重建 p50 ≈ 2.3µs、多轮实测 p95 ≤ 2.9µs；每拍新建缓冲的同一段
+/// min ≈ 2.5µs、p50 2.6–3.9µs，同一台机器上有其它负载时 p50 会到 5–36µs、p95 45µs。
+/// 即：**消除稳态下每拍一次堆分配；实测收益 0.2~0.3µs/拍（120 拍/s 折 0.03ms/s，
+/// 约 0.003% 单核时间），主要价值是消除负载下的分配抖动**。
+///
+/// **这不是性能修复**：稳态收益小到会被噪声淹没（前序估计的 10–20µs/拍实测不成立），
+/// 它只是把热路径上的每拍分配清掉。能稳定拿到的是「成本恒定」：复用后的 p50/p95
+/// 在机器有其它负载时也不动（上面对照组是同一台机器、同一时段的数字）。
+/// 分配器是宿主进程的全局分配器（bili-rs 用 mimalloc），换分配器会改变绝对数字。
+#[derive(Default)]
+struct D3d11AlphaAtlasScratch {
+    /// 最近一次成功拼接出的图集宽度（像素）。
+    width: usize,
+    /// 最近一次成功拼接出的图集高度（像素）。
+    height: usize,
+    /// 图集像素缓冲，长度 ≥ `width * height`；形状缩小时不缩容，
+    /// 免得窗口 resize 反复分配。
+    pixels: Vec<u8>,
+    /// 参与拼接的平面（`bitmaps` 下标）与它在图集里的起始 x。
+    placements: Vec<(usize, usize)>,
+}
+
+impl D3d11AlphaAtlasScratch {
+    /// 按 `bitmaps` 重拼图集，复用内部缓冲；`Ok(false)` = 没有可拼的平面
+    /// （调用方直接返回，不画）。出错返回时 `pixels` 内容无意义，但
+    /// `width`/`height` 仍是上一次成功拼接的形状。
+    ///
+    /// **等价性契约**：对同一 `bitmaps`，本函数产出的
+    /// `pixels[..width * height]` 与「`vec![0u8; width * height]` 起手、再按
+    /// 修改前的逐行 `copy_from_slice` 填充」逐字节相同 —— 无论这块缓冲此前
+    /// 装过什么（别的尺寸的图集、被写脏的字节都算）。
+    ///
+    /// 契约里唯一容易破的点：图集里存在**任何一次拷贝都写不到**的字节。
+    /// 某项高度小于 `atlas_height` 时，它下方各行的这一列区间就是这类字节：
+    /// 新建缓冲里它们是 0，复用缓冲里则可能残留上一拍的像素。所以下面的整块
+    /// 清零不是可选优化，而是维持输出逐字节等价的前提。测试：
+    /// `alpha_atlas_scratch_reuses_buffer_with_identical_bytes`。
+    fn rebuild(&mut self, bitmaps: &[crate::subtitle::SubtitleAlphaBitmap]) -> Result<bool> {
+        let mut width = 0usize;
+        let mut height = 0usize;
+        for bitmap in bitmaps {
+            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
+                continue;
+            }
+            width += bitmap.placement.width as usize;
+            height = height.max(bitmap.placement.height as usize);
+        }
+        if width == 0 || height == 0 {
+            return Ok(false);
+        }
+
+        let len = width * height;
+        if self.pixels.len() < len {
+            self.pixels.resize(len, 0);
+        }
+        self.pixels[..len].fill(0);
+
+        {
+            let (pixels, placements) = (&mut self.pixels, &mut self.placements);
+            let pixels = &mut pixels[..len];
+            placements.clear();
+            let mut cursor_x = 0usize;
+            for (index, bitmap) in bitmaps.iter().enumerate() {
+                let bw = bitmap.placement.width as usize;
+                let bh = bitmap.placement.height as usize;
+                if bw == 0 || bh == 0 {
+                    continue;
+                }
+                if !bitmap.is_valid() {
+                    return Err(PlayerError::Renderer(format!(
+                        "d3d11: overlay alpha bitmap has {} bytes, expected at least {} for {}x{} stride {}",
+                        bitmap.alpha.len(),
+                        bitmap.required_len(),
+                        bitmap.placement.width,
+                        bitmap.placement.height,
+                        bitmap.stride
+                    )));
+                }
+                for row in 0..bh {
+                    let src = row * bitmap.stride;
+                    let dst = row * width + cursor_x;
+                    pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
+                }
+                placements.push((index, cursor_x));
+                cursor_x += bw;
+            }
+        }
+        self.width = width;
+        self.height = height;
+        Ok(true)
+    }
+}
+
+/// 把 CPU 像素写进已存在的叠加层纹理（等价于 `CreateTexture2D` 的初始数据，
+/// 但省掉了纹理的创建与释放）。
+fn upload_overlay_texture(
+    state: &D3d11DeviceState,
+    texture: &ID3D11Texture2D,
+    data: &[u8],
+    bytes_per_row: u32,
+) {
+    unsafe {
+        state.context.UpdateSubresource(
+            texture,
+            0,
+            None,
+            data.as_ptr().cast::<c_void>(),
+            bytes_per_row,
+            0,
+        );
+    }
+}
+
 pub struct D3d11Renderer {
     state: Option<D3d11DeviceState>,
     surface: Option<AttachedSurface>,
     current_video: Option<ImportedVideoFrame>,
     flutter_scene: Option<FlutterTextureScene>,
     danmaku_atlas_cache: Option<D3d11DanmakuAtlasCache>,
+    /// 字幕平面 / alpha 图集的小 LRU 纹理缓存：同尺寸平面跨帧复用纹理，
+    /// 消除每帧 `CreateTexture2D` + 帧末释放的分配抖动。设备重建时清空。
+    overlay_textures: D3d11OverlayTextureCache,
+    /// alpha 图集的 CPU 侧拼接缓冲（见 [`D3d11AlphaAtlasScratch`]）。
+    /// 纯 CPU 数据，与 D3D 设备无关，`set_device` 无需清空它。
+    alpha_atlas_scratch: D3d11AlphaAtlasScratch,
     requested_output_mode: crate::renderer::output::OutputMode,
     video_alpha_mode: VideoAlphaMode,
     upscaler_mode: LumaUpscalerMode,
@@ -855,6 +1437,17 @@ pub struct D3d11Renderer {
     /// （`DXGI_ERROR_DEVICE_REMOVED`）后，所有设备操作失败。由
     /// `render_current_frame` 检测置位，`PresenterRuntime` 据此触发自愈。
     device_lost: bool,
+    /// 视频帧交接栅栏（[`Self::wait_for_gpu`]）复用的 `D3D11_QUERY_EVENT` query。
+    ///
+    /// 存在的理由与"为什么单个槽就够"见 `wait_for_gpu` 的文档。query 由创建它的
+    /// 设备拥有，所以 [`Self::set_device`] 必须丢弃它（旧设备 TDR 后更是如此）。
+    gpu_fence_query: Option<ID3D11Query>,
+    /// present/合成器节拍采样槽（[`D3d11FrameStatsSampler`]）。
+    ///
+    /// 属于某个 swapchain 的一次采样窗口；换面/重建（`attach_surface`、
+    /// `recreate_surface_targets`）时丢弃重来，否则会把旧链的 vblank 计数与
+    /// 新链的计数相减，得到一个纯属虚构的刷新率。
+    present_frame_stats: Option<D3d11FrameStatsSampler>,
     stats: D3d11RendererStats,
     /// 尺寸诊断节流键：上次记录的视频帧/backbuffer/target_rect 尺寸。
     /// 任一变化时打一条 `[size-diag]` 日志，避免每帧刷屏。
@@ -877,6 +1470,8 @@ impl D3d11Renderer {
             current_video: None,
             flutter_scene: None,
             danmaku_atlas_cache: None,
+            overlay_textures: D3d11OverlayTextureCache::new(),
+            alpha_atlas_scratch: D3d11AlphaAtlasScratch::default(),
             requested_output_mode: config.output_mode,
             video_alpha_mode: config.video_alpha_mode,
             upscaler_mode: config.luma_upscaler,
@@ -884,6 +1479,8 @@ impl D3d11Renderer {
             next_frame_token: 0,
             hdr10_output_unavailable: false,
             device_lost: false,
+            gpu_fence_query: None,
+            present_frame_stats: None,
             stats: D3d11RendererStats::default(),
             last_size_diag: None,
         })
@@ -903,32 +1500,235 @@ impl D3d11Renderer {
                 .as_ref()
                 .is_some_and(|s| s.composition || s.flutter_texture)
         {
-            if let Some(state) = self.state.as_ref() {
-                wait_for_gpu(&state.device, &state.context)?;
+            // 这里的等待时长是**头号诊断指标**：它跑在宿主的 UI 渲染回调线程
+            // （WinUI `CompositionTarget::Rendering`）上，与 `WM_MOVING`/
+            // `WM_SIZING` 共用同一个线程。历史上它因为 `sleep(1ms)` 轮询撞上
+            // 15.625ms 的系统时钟粒度，每导入一个视频帧白等约 15.5ms —— 这就是
+            // 「拖动/缩放窗口不跟手、120Hz 屏拉不满」的直接来源。改动见
+            // `wait_for_gpu` 的文档。修复后本字段应当在**亚毫秒**量级。
+            let waited = self.wait_for_gpu()?;
+            self.stats.last_wait_gpu_duration = waited;
+            if is_slow_gpu_wait(waited) {
+                self.stats.slow_wait_gpu_count += 1;
             }
+            self.stats.wait_gpu_calls += 1;
         }
         self.current_video = None;
         Ok(())
     }
 
     fn publish_flutter_texture(&mut self) -> Result<()> {
-        let surface = self.surface.as_mut().expect("surface ensured");
-        if !surface.flutter_texture {
+        if !self
+            .surface
+            .as_ref()
+            .expect("surface ensured")
+            .flutter_texture
+        {
             return Ok(());
         }
-        let state = self.state.as_ref().expect("device ensured");
-        let source = surface.output_texture.as_ref().expect("texture ensured");
-        let extent = surface.metrics.physical_extent;
-        let (snapshot, _) =
-            create_flutter_texture_target(&state.device, extent.width, extent.height)?;
-        unsafe {
-            state.context.CopyResource(&snapshot, source);
-        }
+        // 快照创建 + 拷贝放在一个内层作用域里完成：下面 `wait_for_gpu` 需要
+        // `&mut self`（复用槽挂在 `self` 上），不能在 `surface`/`state` 还活着时调用。
+        let snapshot = {
+            let state = self.state.as_ref().expect("device ensured");
+            let surface = self.surface.as_ref().expect("surface ensured");
+            let source = surface.output_texture.as_ref().expect("texture ensured");
+            let extent = surface.metrics.physical_extent;
+            let (snapshot, _) =
+                create_flutter_texture_target(&state.device, extent.width, extent.height)?;
+            unsafe {
+                state.context.CopyResource(&snapshot, source);
+            }
+            snapshot
+        };
         // Flush only submits work. Complete the copy before another D3D device
         // opens this immutable snapshot. The extra GPU copy is texture-only.
-        wait_for_gpu(&state.device, &state.context)?;
-        surface.published_texture = Some(snapshot);
+        // 返回值（等待时长）只在 composition 主路径记入诊断，这里丢弃：flutter
+        // 纹理不是 WinUI 宿主路径，混进同一个字段会让主路径的数字不可读。
+        let _ = self.wait_for_gpu()?;
+        self.surface
+            .as_mut()
+            .expect("surface ensured")
+            .published_texture = Some(snapshot);
         Ok(())
+    }
+
+    /// 等 GPU 执行到当前命令队列末尾，用作「交还解码器视频帧」的栅栏。
+    ///
+    /// 返回本次实际等待时长（供诊断；见 [`D3d11RendererStats::last_wait_gpu_duration`]）。
+    /// 设备尚未建立时返回 [`Duration::ZERO`]（没有命令队列可等，与历史行为一致）。
+    ///
+    /// # 为什么不能用 `sleep` 轮询（曾经的实现，已修）
+    ///
+    /// 旧实现在这里 `std::thread::sleep(Duration::from_millis(1))` 轮询
+    /// `d3d11_event_query_complete`。那个 "1ms" 是**假的**：`Sleep`/`nanosleep`
+    /// 的精度取决于**进程的系统时钟粒度**，而 Windows 默认为 15.625ms（64Hz），
+    /// 且进程必须显式调用 `timeBeginPeriod(1)` 才能提到 ~1ms —— **Erika 全树没有
+    /// 任何 `timeBeginPeriod` 调用**（`grep timeBeginPeriod` 为空）。于是每调用一次
+    /// `sleep(1ms)`，实际睡满一个完整时钟中断周期 ≈ **15.6ms**。
+    ///
+    /// 这个栅栏的调用条件是「导入一个新的 D3D11VA 解码帧」——即**每个上屏的视频帧
+    /// 恰好一次**，这解释了真机日志的全部形状：
+    ///   * `tick avg` 与 `max` 几乎相等且稳定在 15.2~16.4ms（`sleep` 是定长等待，
+    ///     真等 GPU 的耗时会散开，不会这么整齐）；
+    ///   * 与视频帧率线性相关（9fps→3.92ms、30fps→10.09ms 的拟合）；
+    ///   * `Paused` 时降到 0.03ms（暂停不导入新帧，栅栏根本不进）。
+    ///
+    /// 改成**阻塞式 `GetData`**（`flags = 0`，不带 `D3D11_ASYNC_GETDATA_DONOTFLUSH`）
+    /// 后，驱动在 query 完成时直接唤醒本线程，等待精度是 GPU 中断级（亚毫秒），
+    /// 且不再有轮询开销。这一改动**不改变同步语义**（仍然等 GPU 真正读完旧纹理
+    /// 才把它还给解码器池，不会引入花屏），只是把"定长空等"换成"精确等到就醒"。
+    ///
+    /// # query 复用（`gpu_fence_query` 槽）
+    ///
+    /// 本函数**每个上屏视频帧调用一次**（30fps → 每秒 30 次，120Hz 上屏更高）。
+    /// 旧实现每次调用都 `CreateQuery` 一个新的 `D3D11_QUERY_EVENT` 对象、返回时
+    /// 随局部变量释放，于是每帧都付一次驱动侧对象创建 + runtime 记账。现在改为
+    /// 复用同一个 query 对象（计数见 `gpu_fence_query_creates` /
+    /// `gpu_fence_query_reuses`）。
+    ///
+    /// 复用依据（每条都可在 Microsoft Learn 原文核对，此处只引用原文、不引申）：
+    ///
+    ///   1. **`D3D11_QUERY_EVENT` 只需要 `End`**：`D3D11_QUERY` 枚举文档原文
+    ///      "When using this type of query, `ID3D11DeviceContext::Begin` is
+    ///      disabled."，所以复用不必（也不能）补 `Begin`。
+    ///   2. **同一个 query 对象可以反复 `End`**：`GetData` 文档原文
+    ///      "Certain queries only require a call to `End` in which case the data
+    ///      returned by `GetData` is accurate up to the last call to `End`"。
+    ///      "截至**最后一次** `End`"这一措辞本身就定义了多次 `End` 的语义。
+    ///   3. **`Flush()` 必须保留**：命令若还压在命令缓冲里没提交给 GPU，GPU 就
+    ///      永远走不到这个 `End` 点。`D3D11_ASYNC_GETDATA_DONOTFLUSH` 文档原文
+    ///      给的是同一个机理的反面："Do not flush the command buffer. ...
+    ///      Since the commands in the command buffer are not flushed they will not
+    ///      be processed and therefore `GetData` will never return S_OK."
+    ///      （该文档同时说明不设此标志时 runtime 自己会 flush，所以这里显式
+    ///      `Flush()` 可能与 `GetData` 内部的提交重复；原文亦称 "Each call to
+    ///      `Flush` incurs a significant amount of overhead."。本函数**保持现状
+    ///      不动**：删除它需要真机测量证明 `GetData` 不会长时间挂起，属于待验证项
+    ///      而不是已证结论。）
+    ///
+    /// # 为什么**一个**槽就够（改异步前必须重读）
+    ///
+    /// 本函数是**同步**的：`End` → `Flush` → **阻塞** `GetData` → 返回。
+    /// `GetData` 返回 `S_OK` 意味着 GPU 已经越过这一拍插入的 `End` 标记，因此
+    /// 函数返回时槽里的 query 已经**没有在飞的 `End`**；下一次进入本函数时，槽里
+    /// 最多只有"上一次已完成、结果已被取走"的 query。同步的调用序列保证任一时刻
+    /// **至多一个 `End` 在飞**，所以单个槽足够。
+    ///
+    /// **若以后改异步**（例如先 `End` 不等结果就继续渲染下一帧、或多帧同时在飞），
+    /// 单槽立刻失效：同一个 query 上会同时存在两个未完成的 `End`，而按上面的依据 2，
+    /// `GetData` 返回的是"截至**最后一次** `End`"的状态——前一个栅栏的等待条件被
+    /// 后一个覆盖，等于**提前把纹理还给解码器**（花屏/撕裂），栅栏也就不再是栅栏。
+    /// 那时需要的是 N 个 query 的环形池（N = 允许在飞的最大帧数），而不是这一个槽。
+    fn wait_for_gpu(&mut self) -> Result<Duration> {
+        let Some(state) = self.state.as_ref() else {
+            return Ok(Duration::ZERO);
+        };
+        // 复用槽：只有槽为空时才新建（`set_device` 换设备时清槽）。
+        if self.gpu_fence_query.is_none() {
+            let query = create_d3d11_event_query(&state.device)?;
+            self.gpu_fence_query = Some(query);
+            self.stats.gpu_fence_query_creates += 1;
+        } else {
+            self.stats.gpu_fence_query_reuses += 1;
+        }
+        let query = self.gpu_fence_query.as_ref().expect("query ensured");
+        unsafe {
+            state.context.End(query);
+            state.context.Flush();
+        }
+        let started = Instant::now();
+        // 阻塞等待。`D3D11_QUERY_EVENT` 的 `GetData` 在未完成时会挂起调用线程直到
+        // GPU 抵达该 `End()` 点；设备被移除（TDR）时返回错误，因此不需要另外套一层
+        // 超时循环——旧实现那个 100ms 超时只是 sleep 轮询的补丁。
+        let mut complete = BOOL::default();
+        let data = unsafe {
+            state.context.GetData(
+                // 注意必须传引用：`GetData` 要的是 `Param<ID3D11Asynchronous>`，
+                // `ID3D11Query` 自身不满足，`&ID3D11Query` 才满足。
+                query,
+                Some((&mut complete as *mut BOOL).cast::<c_void>()),
+                mem::size_of::<BOOL>() as u32,
+                0,
+            )
+        };
+        if let Err(error) = data {
+            // 失败的 query 状态未知（设备移除/TDR 时 `GetData` 返回
+            // `DXGI_ERROR_DEVICE_REMOVED`）。**绝不能留着复用**：下一次 `End` 会落在
+            // 一个"已 `End`、结果却没被取走"的 query 上，在依据 2 的语义下那个 `End`
+            // 的完成条件等不到 → 栅栏要么立刻误判完成（提前还帧 → 花屏），要么永久挂起。
+            self.gpu_fence_query = None;
+            return Err(d3d_error(
+                "ID3D11DeviceContext::GetData(video retirement, blocking)",
+                error,
+            ));
+        }
+        Ok(started.elapsed())
+    }
+
+    /// 每 [`FRAME_STATS_SAMPLE_TICKS`] 拍采一次 `IDXGISwapChain::GetFrameStatistics`，
+    /// 把「显示器 vblank 速率」与「每 vblank 提交/上屏帧数」写进诊断字段。
+    ///
+    /// 依据、限制与字段语义见 [`D3d11FrameStatsSampler`]。取不到读数时把
+    /// [`D3d11RendererStats::frame_stats_available`] 置 false 并**保留上次读数**
+    /// —— 「取不到」不等于「0Hz」，把两者混起来会让诊断反向误导。
+    fn sample_present_frame_stats(&mut self) {
+        let Some(swapchain) = self
+            .surface
+            .as_ref()
+            .and_then(|surface| surface.swapchain.as_ref())
+        else {
+            self.present_frame_stats = None;
+            self.stats.frame_stats_available = false;
+            return;
+        };
+        let swapchain: IDXGISwapChain = match swapchain.cast() {
+            Ok(swapchain) => swapchain,
+            Err(_) => {
+                self.present_frame_stats = None;
+                self.stats.frame_stats_available = false;
+                return;
+            }
+        };
+        let mut current = DXGI_FRAME_STATISTICS::default();
+        if unsafe { swapchain.GetFrameStatistics(&mut current) }.is_err() {
+            self.present_frame_stats = None;
+            self.stats.frame_stats_available = false;
+            return;
+        }
+        self.stats.frame_stats_available = true;
+        let Some(sampler) = self.present_frame_stats.as_mut() else {
+            self.present_frame_stats = Some(D3d11FrameStatsSampler {
+                last: current,
+                last_at: Instant::now(),
+                ticks: 0,
+            });
+            return;
+        };
+        sampler.ticks = sampler.ticks.wrapping_add(1);
+        if sampler.ticks < FRAME_STATS_SAMPLE_TICKS {
+            return;
+        }
+        sampler.ticks = 0;
+        let seconds = sampler.last_at.elapsed().as_secs_f64();
+        sampler.last_at = Instant::now();
+        // 三个计数都是 `u32` 的启动以来累计值（窗口化下自 swapchain 创建起算），
+        // 用 `wrapping_sub` 取窗口增量：绕回时差值仍然正确。
+        let refresh_delta = current
+            .SyncRefreshCount
+            .wrapping_sub(sampler.last.SyncRefreshCount) as f64;
+        let presents_delta = current.PresentCount.wrapping_sub(sampler.last.PresentCount) as f64;
+        let shown_delta = current
+            .PresentRefreshCount
+            .wrapping_sub(sampler.last.PresentRefreshCount) as f64;
+        sampler.last = current;
+        if seconds <= 0.0 || refresh_delta <= 0.0 {
+            return;
+        }
+        let to_milli =
+            |value: f64| -> u32 { (value * 1000.0).round().clamp(0.0, u32::MAX as f64) as u32 };
+        self.stats.display_refresh_hz_milli = to_milli(refresh_delta / seconds);
+        self.stats.presents_per_refresh_milli = to_milli(presents_delta / refresh_delta);
+        self.stats.shown_frames_per_refresh_milli = to_milli(shown_delta / refresh_delta);
     }
 
     fn ensure_default_device(&mut self) -> Result<()> {
@@ -953,6 +1753,7 @@ impl D3d11Renderer {
             .map_err(|error| d3d_error("ID3D11Device::GetImmediateContext", error))?;
         self.retire_current_video()?;
         self.danmaku_atlas_cache = None;
+        self.overlay_textures.clear();
         self.set_device(frame_device, context)
     }
 
@@ -965,6 +1766,19 @@ impl D3d11Renderer {
     }
 
     fn set_device(&mut self, device: ID3D11Device, context: ID3D11DeviceContext) -> Result<()> {
+        // 缓存的纹理/图集属于旧设备：设备一换就必须全部失效，否则会拿旧设备
+        // 的资源去画（TDR 后旧设备已死，表现为黑屏或花屏）。这里收口，
+        // `ensure_device_for_texture` / `ensure_default_device` 两条重建路径
+        // 都经过本函数。
+        self.overlay_textures.clear();
+        self.danmaku_atlas_cache = None;
+        // 复用槽里的栅栏 query 同样属于旧设备：`ID3D11Query` 由创建它的
+        // `ID3D11Device` 拥有，换设备后在新设备上对它 `End`/`GetData` 无效
+        // （TDR 后旧设备已死，更是必然失败）。丢弃，不要留着复用。
+        self.gpu_fence_query = None;
+        // 帧统计计数器按 swapchain 记（窗口化下自创建起算），换设备必然换链，
+        // 留着旧窗口会在新链上算出一个纯属虚构的刷新率。
+        self.present_frame_stats = None;
         if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
             unsafe {
                 let _ = multithread.SetMultithreadProtected(true);
@@ -1000,6 +1814,10 @@ impl D3d11Renderer {
     }
 
     fn recreate_surface_targets(&mut self) -> Result<()> {
+        // 换面可能换链（新建）也可能原地 `ResizeBuffers`（同一个链）。两种都
+        // 从新窗口重新采样：`GetFrameStatistics` 的计数是"自 swapchain 创建
+        // 起算"的累计值，跨链相减会得到负数/虚构值。
+        self.present_frame_stats = None;
         let Some(surface) = self.surface.as_mut() else {
             return Ok(());
         };
@@ -1353,13 +2171,14 @@ impl D3d11Renderer {
             }
             let texture = {
                 let state = self.state.as_ref().expect("device ensured");
-                create_overlay_texture(
+                self.overlay_textures.acquire(
                     state,
                     plane.width,
                     plane.height,
                     DXGI_FORMAT_R8G8B8A8_UNORM,
                     &plane.rgba,
                     plane.width * 4,
+                    &mut self.stats,
                 )?
             };
             let (x, y, width, height) = plane.scaled_rect(viewport_w, viewport_h);
@@ -1557,6 +2376,9 @@ impl D3d11Renderer {
         });
     }
 
+    /// 把本拍的 alpha 位图横向拼成一张 `DXGI_FORMAT_R8_UNORM` 图集，按平面排进
+    /// `draws`。拼接缓冲挂在 `self.alpha_atlas_scratch` 上跨帧复用
+    /// （改动前每拍新建，见 [`D3d11AlphaAtlasScratch`]）。
     fn append_alpha_atlas_draws(
         &mut self,
         frame: &OverlayFrame,
@@ -1566,60 +2388,26 @@ impl D3d11Renderer {
         draws: &mut Vec<D3d11OverlayDraw>,
     ) -> Result<()> {
         let bitmaps = &frame.subtitle_alpha_planes;
-        let mut atlas_width = 0usize;
-        let mut atlas_height = 0usize;
-        for bitmap in bitmaps {
-            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
-                continue;
-            }
-            atlas_width += bitmap.placement.width as usize;
-            atlas_height = atlas_height.max(bitmap.placement.height as usize);
-        }
-        if atlas_width == 0 || atlas_height == 0 {
+        if !self.alpha_atlas_scratch.rebuild(bitmaps)? {
             return Ok(());
         }
-
-        let mut pixels = vec![0u8; atlas_width * atlas_height];
-        let mut cursor_x = 0usize;
-        let mut placements = Vec::new();
-        for (index, bitmap) in bitmaps.iter().enumerate() {
-            let bw = bitmap.placement.width as usize;
-            let bh = bitmap.placement.height as usize;
-            if bw == 0 || bh == 0 {
-                continue;
-            }
-            if !bitmap.is_valid() {
-                return Err(PlayerError::Renderer(format!(
-                    "d3d11: overlay alpha bitmap has {} bytes, expected at least {} for {}x{} stride {}",
-                    bitmap.alpha.len(),
-                    bitmap.required_len(),
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    bitmap.stride
-                )));
-            }
-            for row in 0..bh {
-                let src = row * bitmap.stride;
-                let dst = row * atlas_width + cursor_x;
-                pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
-            }
-            placements.push((index, cursor_x));
-            cursor_x += bw;
-        }
+        let atlas_width = self.alpha_atlas_scratch.width;
+        let atlas_height = self.alpha_atlas_scratch.height;
 
         let texture = {
             let state = self.state.as_ref().expect("device ensured");
-            create_overlay_texture(
+            self.overlay_textures.acquire(
                 state,
                 atlas_width as u32,
                 atlas_height as u32,
                 DXGI_FORMAT_R8_UNORM,
-                &pixels,
+                &self.alpha_atlas_scratch.pixels[..atlas_width * atlas_height],
                 atlas_width as u32,
+                &mut self.stats,
             )?
         };
         self.stats.overlay_alpha_atlas_uploads += 1;
-        for (index, atlas_x) in placements {
+        for &(index, atlas_x) in &self.alpha_atlas_scratch.placements {
             let bitmap = &bitmaps[index];
             draws.push(D3d11OverlayDraw {
                 texture: texture.clone(),
@@ -1667,8 +2455,15 @@ impl D3d11Renderer {
         {
             return Ok(true);
         }
+        // 本帧序号 +1：叠加层纹理缓存据此判定「这条尺寸本帧是否已经交出去」，
+        // 同帧内两张同尺寸平面必须各占一张纹理。
+        self.overlay_textures.begin_frame();
+        let overlay_prepare_started = Instant::now();
         let overlay_draws = self.prepare_overlay_draws(context.overlay)?;
+        let overlay_prepare_duration = overlay_prepare_started.elapsed();
+        let danmaku_prepare_started = Instant::now();
         let danmaku_draws = self.prepare_danmaku_draws(context.danmaku)?;
+        let danmaku_prepare_duration = danmaku_prepare_started.elapsed();
         let (video_width, video_height, frame_token, native_luma) = {
             let video = self.current_video.as_ref().expect("video checked");
             (
@@ -1788,7 +2583,10 @@ impl D3d11Renderer {
                 ],
             );
         }
+        let draw_video_started = Instant::now();
         state.draw_video(video, upscaled_luma.as_ref(), scene_rtv, target_rect)?;
+        let draw_video_duration = draw_video_started.elapsed();
+        let draw_overlay_started = Instant::now();
         if !overlay_draws.is_empty() {
             // Subtitle coordinates are produced in the video-frame viewport.
             // Composite them through the same aspect-fit viewport as the video
@@ -1816,9 +2614,18 @@ impl D3d11Renderer {
                 video.constants,
             )?;
         }
+        let draw_overlay_duration = draw_overlay_started.elapsed();
+        // present 单独计时：这是「UI 线程是否被同步 present 卡住」的唯一直接证据。
+        // `Present1(0, DXGI_PRESENT_DO_NOT_WAIT)` 在队列满时**立即**返回
+        // `DXGI_ERROR_WAS_STILL_DRAWING`，所以正常值应当是亚毫秒；真机上若看到
+        // 它稳定在 10ms+，那才是 vsync 同步等待（此时看 present_submitted /
+        // present_dropped 的比值即可分辨「真的等」还是「一直丢」）。
+        let present_started = Instant::now();
+        let mut present_outcome = PresentOutcome::Dropped;
         if let Some(swapchain) = surface.swapchain.as_ref() {
-            present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
+            present_outcome = present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
         }
+        let present_duration = present_started.elapsed();
         if flutter_texture {
             self.publish_flutter_texture()?;
             if let Some(scene) = self.flutter_scene.as_mut() {
@@ -1832,6 +2639,32 @@ impl D3d11Renderer {
             }
         }
         self.stats.rendered_frames += 1;
+        // —— 分段计时落账（本拍）——
+        // 必须在上面所有对 `state`/`surface`/`video` 的不可变借用结束之后写，
+        // 否则借用冲突。这些字段由宿主 `runtime_snapshot()` 读出并落到
+        // `[perf][CLIENT][1s]` 的「渲染分解」行。
+        self.stats.last_overlay_prepare_duration = overlay_prepare_duration;
+        self.stats.last_danmaku_prepare_duration = danmaku_prepare_duration;
+        self.stats.last_draw_video_duration = draw_video_duration;
+        self.stats.last_draw_overlay_duration = draw_overlay_duration;
+        self.stats.last_present_duration = present_duration;
+        // present 的**真实分布**（不只是一拍）：见 `present_over_8ms` 的文档。
+        self.stats.present_calls += 1;
+        self.stats.present_total = self.stats.present_total.saturating_add(present_duration);
+        if present_duration > self.stats.present_max {
+            self.stats.present_max = present_duration;
+        }
+        if present_duration > PRESENT_SLOW_THRESHOLD {
+            self.stats.present_over_1ms += 1;
+        }
+        if present_duration > PRESENT_COMPOSITOR_WAIT_THRESHOLD {
+            self.stats.present_over_8ms += 1;
+        }
+        self.sample_present_frame_stats();
+        match present_outcome {
+            PresentOutcome::Submitted => self.stats.present_submitted += 1,
+            PresentOutcome::Dropped => self.stats.present_dropped += 1,
+        }
         if !danmaku_draws.is_empty() {
             self.stats.danmaku_passes += 1;
             self.stats.danmaku_items += danmaku_draws.len() as u64;
@@ -1885,18 +2718,33 @@ impl D3d11Renderer {
                 1.0
             },
         ];
+        // 清屏路径也走同一个 present 计数：它出现在换源/暂停/resize 后。若在
+        // 诊断里看到 `present_submitted` **只在清屏时增长**，说明常规播放路径
+        // 一直在 `Dropped`（DXGI 队列满）——那正是 UI 线程还能服务窗口消息的
+        // 前提，见 `present_swapchain` 的 `Dropped` 文档。
+        //
+        // 结果先落局部变量再写 `self.stats`：上面 `state`/`surface` 是不可变
+        // 借用，在它们存活期间不能改 `self.stats`。
+        let clear_present_started = Instant::now();
+        let mut clear_outcome = PresentOutcome::Dropped;
         unsafe {
             trace("render_clear: clear");
             state.context.ClearRenderTargetView(rtv, &color);
             trace("render_clear: present");
             if let Some(swapchain) = surface.swapchain.as_ref() {
-                present_swapchain(swapchain, "IDXGISwapChain1::Present1(clear)")?;
+                clear_outcome = present_swapchain(swapchain, "IDXGISwapChain1::Present1(clear)")?;
             }
         }
+        let clear_present_duration = clear_present_started.elapsed();
         self.publish_flutter_texture()?;
         self.flutter_scene = None;
         trace("render_clear: done");
         self.stats.rendered_frames += 1;
+        self.stats.last_present_duration = clear_present_duration;
+        match clear_outcome {
+            PresentOutcome::Submitted => self.stats.present_submitted += 1,
+            PresentOutcome::Dropped => self.stats.present_dropped += 1,
+        }
         Ok(())
     }
 }
@@ -1953,6 +2801,8 @@ impl RendererBackend for D3d11Renderer {
                 ));
             }
         };
+        // 新面板 = 新 swapchain（下面 `swapchain: None`），帧统计窗口必须重来。
+        self.present_frame_stats = None;
         self.surface = Some(AttachedSurface {
             hwnd,
             panel,
@@ -1985,6 +2835,7 @@ impl RendererBackend for D3d11Renderer {
         self.retire_current_video()?;
         self.surface = None;
         self.danmaku_atlas_cache = None;
+        self.overlay_textures.clear();
         self.stats.attached = false;
         self.stats.surface_width = 0;
         self.stats.surface_height = 0;
@@ -2036,6 +2887,7 @@ impl RendererBackend for D3d11Renderer {
     fn clear_current_frame(&mut self) -> Result<()> {
         self.retire_current_video()?;
         self.danmaku_atlas_cache = None;
+        self.overlay_textures.clear();
         if self.surface.is_some() {
             self.render_clear(0.0)?;
         }
@@ -2129,6 +2981,29 @@ impl RendererBackend for D3d11Renderer {
             upscaler_fallbacks: self.upscaler.fallback_count(),
             upscaled_frames: self.upscaler.upscaled_frames(),
             last_upscaler_encode_duration: self.upscaler.last_encode_duration(),
+            // UI 线程（宿主渲染回调）分段耗时，见 `D3d11RendererStats` 的字段文档。
+            last_overlay_prepare_duration: self.stats.last_overlay_prepare_duration,
+            last_danmaku_prepare_duration: self.stats.last_danmaku_prepare_duration,
+            last_draw_video_duration: self.stats.last_draw_video_duration,
+            last_draw_overlay_duration: self.stats.last_draw_overlay_duration,
+            last_present_duration: self.stats.last_present_duration,
+            present_submitted: self.stats.present_submitted,
+            present_dropped: self.stats.present_dropped,
+            present_calls: self.stats.present_calls,
+            present_total: self.stats.present_total,
+            present_max: self.stats.present_max,
+            present_over_1ms: self.stats.present_over_1ms,
+            present_over_8ms: self.stats.present_over_8ms,
+            frame_stats_available: self.stats.frame_stats_available,
+            display_refresh_hz_milli: self.stats.display_refresh_hz_milli,
+            presents_per_refresh_milli: self.stats.presents_per_refresh_milli,
+            shown_frames_per_refresh_milli: self.stats.shown_frames_per_refresh_milli,
+            overlay_plane_uploads: self.stats.overlay_plane_uploads,
+            overlay_plane_upload_bytes: self.stats.overlay_plane_upload_bytes,
+            overlay_plane_upload_skips: self.stats.overlay_plane_upload_skips,
+            last_wait_gpu_duration: self.stats.last_wait_gpu_duration,
+            wait_gpu_calls: self.stats.wait_gpu_calls,
+            slow_wait_gpu_count: self.stats.slow_wait_gpu_count,
             ..Default::default()
         }
     }
@@ -2773,6 +3648,11 @@ fn release_backbuffer_views(context: &ID3D11DeviceContext, surface: &mut Attache
     surface.linear_shader_resource = None;
 }
 
+/// 创建栅栏用的 `D3D11_QUERY_EVENT` 对象。
+///
+/// **只在 [`D3d11Renderer::wait_for_gpu`] 的复用槽为空时调用**：稳态播放中应当
+/// 只在设备重建后命中一次（计数见 `D3d11RendererStats::gpu_fence_query_creates`）。
+/// 历史实现是每个上屏视频帧都调用它一次，见 `wait_for_gpu` 的「query 复用」一节。
 fn create_d3d11_event_query(device: &ID3D11Device) -> Result<ID3D11Query> {
     let desc = D3D11_QUERY_DESC {
         Query: D3D11_QUERY_EVENT,
@@ -2787,6 +3667,13 @@ fn create_d3d11_event_query(device: &ID3D11Device) -> Result<ID3D11Query> {
     query.ok_or_else(|| PlayerError::Renderer("d3d11: video retirement query was null".to_string()))
 }
 
+/// 非阻塞探测：query 是否已完成（`D3D11_ASYNC_GETDATA_DONOTFLUSH`）。
+///
+/// 热路径**不再使用**它：`wait_for_gpu` 已改为阻塞式 `GetData`（见那里的文档，
+/// 轮询 sleep 撞系统时钟粒度是历史卡顿根因）。保留它是因为它是本文件唯一一处
+/// 演示 `D3D11_ASYNC_GETDATA_DONOTFLUSH` 语义的实现，后续做「栅栏是否为空」
+/// 这类零等待探测时可直接复用，不必重新推导标志位含义。
+#[allow(dead_code)]
 fn d3d11_event_query_complete(context: &ID3D11DeviceContext, query: &ID3D11Query) -> Result<bool> {
     let mut complete = BOOL::default();
     unsafe {
@@ -2802,23 +3689,21 @@ fn d3d11_event_query_complete(context: &ID3D11DeviceContext, query: &ID3D11Query
     Ok(complete.as_bool())
 }
 
-fn wait_for_gpu(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<()> {
-    let query = create_d3d11_event_query(device)?;
-    unsafe {
-        context.End(&query);
-        context.Flush();
-    }
-    let started = Instant::now();
-    while !d3d11_event_query_complete(context, &query)? {
-        if started.elapsed() >= Duration::from_millis(100) {
-            return Err(PlayerError::Renderer(
-                "d3d11: compositor GPU handoff timed out; retaining the current decoder frame"
-                    .into(),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    Ok(())
+/// 栅栏等待超过此值时计入 [`D3d11RendererStats::slow_wait_gpu_count`]。
+///
+/// 取值 2ms 的依据：阻塞式 `GetData` 在稳态下应当 **<1ms** —— GPU 队列此时通常
+/// 已经空了（上一拍的命令早执行完），驱动几乎立刻返回。一旦超过 2ms，就说明
+/// 要么 GPU 真的排了很深的队，要么实现退化回了轮询等待
+/// （历史缺陷下是 **15.5ms**，撞 Windows 默认 15.625ms 时钟粒度）。
+///
+/// **这是回归告警线，不是性能目标**：它存在的唯一目的是让"有人把
+/// `wait_for_gpu` 改回 sleep 轮询"这件事**在诊断面板上立刻可见**
+/// （`慢栅栏` 计数开始增长），而不是只能靠用户体感重新发现一次卡顿。
+const GPU_WAIT_SLOW_THRESHOLD: Duration = Duration::from_millis(2);
+
+/// 栅栏等待是否算"慢"（回归信号）。见 [`GPU_WAIT_SLOW_THRESHOLD`]。
+fn is_slow_gpu_wait(waited: Duration) -> bool {
+    waited > GPU_WAIT_SLOW_THRESHOLD
 }
 
 fn create_flutter_texture_target(
@@ -2953,7 +3838,26 @@ fn create_linear_render_target(
     ))
 }
 
-fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Result<()> {
+/// `Present1` 的结果：真正提交了，还是因队列满被丢弃。
+///
+/// 分成两种而不是 `Result<()>`，是为了让调用方能把「本拍没上屏」计入诊断
+/// 计数器 —— 见 [`D3d11RendererStats::present_dropped`]。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PresentOutcome {
+    /// 命令已进 DXGI 队列，本拍内容会（在某个 vblank）上屏。
+    Submitted,
+    /// `DXGI_ERROR_WAS_STILL_DRAWING`：队列仍被上一拍占用，本拍丢弃。
+    ///
+    /// 丢弃是**故意的**：UI 线程同时服务 `WM_MOVING`/`WM_SIZING`，在这里等
+    /// 一个 vblank 会直接把窗口拖拽变成「延迟 16ms 不跟手」。丢帧不会丢内容
+    /// —— 交换链保持上一拍，下一拍只要内容还是新的就会再画一次。
+    Dropped,
+}
+
+fn present_swapchain(
+    swapchain: &IDXGISwapChain1,
+    operation: &'static str,
+) -> Result<PresentOutcome> {
     trace("present_swapchain: enter");
     let params = DXGI_PRESENT_PARAMETERS {
         DirtyRectsCount: 0,
@@ -2966,9 +3870,10 @@ fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Re
     // for a full DXGI queue here: dropping one presentation keeps window
     // interaction responsive while decode/audio continue normally.
     if status == DXGI_ERROR_WAS_STILL_DRAWING {
-        return Ok(());
+        return Ok(PresentOutcome::Dropped);
     }
-    status.ok().map_err(|error| d3d_error(operation, error))
+    status.ok().map_err(|error| d3d_error(operation, error))?;
+    Ok(PresentOutcome::Submitted)
 }
 
 fn create_plane_srv(
@@ -3542,6 +4447,44 @@ fn d3d_error(operation: &'static str, error: ::windows::core::Error) -> PlayerEr
 mod tests {
     use super::*;
 
+    /// 回归守卫：`slow_wait_gpu_count` 必须能把"轮询式退化"认出来。
+    ///
+    /// 这条测试锁的是**修复不被悄悄改回去**。历史上 `wait_for_gpu` 用
+    /// `sleep(1ms)` 轮询，撞上 Windows 默认 15.625ms 的系统时钟粒度，于是每个
+    /// 上屏视频帧都白等约 15.5ms —— 直接表现为 UI 线程（与 `WM_MOVING` 同一个
+    /// 线程）每帧被占满，窗口拖拽/缩放发涩、120Hz 屏拉不满。
+    ///
+    /// 如果有人把实现改回轮询，等待时长会回到 15ms 量级；只要 `is_slow_gpu_wait`
+    /// 仍把它判为"慢"，诊断面板上的 `慢栅栏` 计数就会立刻增长，使用者不必重新
+    /// 体感一轮才发现回归。
+    #[test]
+    fn slow_gpu_wait_detects_poll_style_regression() {
+        // 轮询撞 15.625ms 时钟粒度的典型实测值（真机日志 15.2~16.4ms）。
+        assert!(
+            is_slow_gpu_wait(Duration::from_micros(15_520)),
+            "15.5ms 量级的栅栏等待必须被判为慢（这正是回归的指纹）"
+        );
+        assert!(
+            is_slow_gpu_wait(Duration::from_micros(16_370)),
+            "真机 max 观测值 16.37ms 必须被判为慢"
+        );
+        // 阻塞式 `GetData` 的稳态值：GPU 队列通常已空，几乎立即返回。
+        assert!(
+            !is_slow_gpu_wait(Duration::from_micros(300)),
+            "亚毫秒的栅栏等待不得误报为慢"
+        );
+        assert!(!is_slow_gpu_wait(Duration::ZERO));
+    }
+
+    /// 阈值语义：恰好等于阈值不算慢（严格大于），保证"2ms 整"不会被误计。
+    #[test]
+    fn slow_gpu_wait_threshold_is_exclusive() {
+        assert!(!is_slow_gpu_wait(GPU_WAIT_SLOW_THRESHOLD));
+        assert!(is_slow_gpu_wait(
+            GPU_WAIT_SLOW_THRESHOLD + Duration::from_micros(1)
+        ));
+    }
+
     #[test]
     fn flutter_scene_ignores_clock_ticks_but_detects_output_changes() {
         use crate::overlay::OverlayViewport;
@@ -4059,5 +5002,899 @@ mod tests {
         assert_eq!(metadata.MinMasteringLuminance, 50);
         assert_eq!(metadata.MaxContentLightLevel, 4000);
         assert_eq!(metadata.MaxFrameAverageLightLevel, 450);
+    }
+
+    fn overlay_slot(
+        width: u32,
+        height: u32,
+        bytes: usize,
+        last_frame: u64,
+    ) -> D3d11OverlayTextureSlot {
+        D3d11OverlayTextureSlot {
+            width,
+            height,
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            bytes,
+            last_frame,
+        }
+    }
+
+    /// 淘汰策略是纯函数：命中/插入/LRU 淘汰/退回新建四种结果都能在这里钉死，
+    /// 不需要 GPU。
+    #[test]
+    fn overlay_texture_plan_reuses_by_shape_and_protects_the_current_frame() {
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let small = overlay_slot(322, 60, 322 * 60 * 4, 7);
+
+        // 上一帧用过的同格式同尺寸条目：命中复用（这就是消掉 6MB/s 抖动的那条路）。
+        assert_eq!(
+            plan_overlay_texture_slot(&[Some(small)], 322 * 60 * 4, 322, 60, rgba, 322 * 60 * 4, 8),
+            D3d11OverlayTexturePlan::Reuse(0)
+        );
+        // 本帧已交出去的同尺寸条目不能再命中：一帧里两张同尺寸平面共用一张
+        // 纹理会让后上传的那张覆盖前一张。
+        assert_eq!(
+            plan_overlay_texture_slot(
+                &[Some(overlay_slot(322, 60, 322 * 60 * 4, 8))],
+                322 * 60 * 4,
+                322,
+                60,
+                rgba,
+                322 * 60 * 4,
+                8
+            ),
+            D3d11OverlayTexturePlan::Insert(1)
+        );
+        // 格式不同（R8 的 alpha 图集 vs RGBA 字幕平面）不算命中。
+        assert_eq!(
+            plan_overlay_texture_slot(
+                &[Some(small)],
+                322 * 60 * 4,
+                322,
+                60,
+                DXGI_FORMAT_R8_UNORM,
+                322 * 60,
+                8
+            ),
+            D3d11OverlayTexturePlan::Insert(1)
+        );
+        // 尺寸变了但还有空位：插新条目（旧尺寸留着，字幕换行回来还能命中）。
+        assert_eq!(
+            plan_overlay_texture_slot(&[Some(small)], 322 * 60 * 4, 340, 60, rgba, 340 * 60 * 4, 8),
+            D3d11OverlayTexturePlan::Insert(1)
+        );
+    }
+
+    #[test]
+    fn overlay_texture_plan_evicts_lru_but_never_the_frame_in_flight() {
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let bytes = 400usize;
+        let full: Vec<Option<D3d11OverlayTextureSlot>> = (0..OVERLAY_TEXTURE_CACHE_CAPACITY)
+            .map(|index| Some(overlay_slot(10 + index as u32, 10, bytes, 3 + index as u64)))
+            .collect();
+        let cached = bytes * OVERLAY_TEXTURE_CACHE_CAPACITY;
+
+        // 满了 + 新尺寸：淘汰最久没用过的那条。
+        assert_eq!(
+            plan_overlay_texture_slot(&full, cached, 99, 99, rgba, bytes, 8),
+            D3d11OverlayTexturePlan::Replace(0)
+        );
+        // 最旧那条属于本帧时改淘汰第二旧的。
+        let mut current_first = full.clone();
+        current_first[0] = Some(overlay_slot(10, 10, bytes, 8));
+        assert_eq!(
+            plan_overlay_texture_slot(&current_first, cached, 99, 99, rgba, bytes, 8),
+            D3d11OverlayTexturePlan::Replace(1)
+        );
+        // 整张缓存都属于本帧：谁都不能动，退回按帧新建（与修改前一致）。
+        let all_current: Vec<Option<D3d11OverlayTextureSlot>> = (0..OVERLAY_TEXTURE_CACHE_CAPACITY)
+            .map(|index| Some(overlay_slot(10 + index as u32, 10, bytes, 8)))
+            .collect();
+        assert_eq!(
+            plan_overlay_texture_slot(&all_current, cached, 99, 99, rgba, bytes, 8),
+            D3d11OverlayTexturePlan::Transient
+        );
+    }
+
+    /// 字节预算：文本字幕平面（0.1MB 级）随便缓存，整屏位图不允许把显存钉死。
+    #[test]
+    fn overlay_texture_plan_caps_resident_bytes() {
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let budget = OVERLAY_TEXTURE_CACHE_BUDGET_BYTES;
+
+        // 单张就超过预算：不进缓存。
+        assert_eq!(
+            plan_overlay_texture_slot(&[], 0, 3840, 2160, rgba, budget + 1, 1),
+            D3d11OverlayTexturePlan::Transient
+        );
+        // 空缓存里的小平面照常插入。
+        assert_eq!(
+            plan_overlay_texture_slot(&[], 0, 100, 100, rgba, 64, 1),
+            D3d11OverlayTexturePlan::Insert(0)
+        );
+        // 缓存里已有一条吃满预算的整屏平面：淘汰最旧的小条目也腾不出空间，
+        // 宁可让这张退回按帧新建，也不额外钉住第二张整屏平面。
+        assert_eq!(
+            plan_overlay_texture_slot(
+                &[
+                    Some(overlay_slot(1, 1, 64, 3)),
+                    Some(overlay_slot(2, 2, budget, 4))
+                ],
+                64 + budget,
+                3,
+                3,
+                rgba,
+                budget,
+                5
+            ),
+            D3d11OverlayTexturePlan::Transient
+        );
+        // 换入更小的平面则允许（释放旧的整屏平面，常驻不增长）。
+        assert_eq!(
+            plan_overlay_texture_slot(
+                &[Some(overlay_slot(2, 2, budget, 4))],
+                budget,
+                3,
+                3,
+                rgba,
+                64,
+                5
+            ),
+            D3d11OverlayTexturePlan::Replace(0)
+        );
+    }
+
+    /// 修改前 `append_alpha_atlas_draws` 里 CPU 侧拼接逻辑的逐行副本
+    /// （`vec![0u8; atlas_w * atlas_h]` 起手 + 逐行 `copy_from_slice` +
+    /// `Vec::new()` placements）。只在测试里当等价性与性能的基线用。
+    fn pack_alpha_atlas_baseline(
+        bitmaps: &[crate::subtitle::SubtitleAlphaBitmap],
+    ) -> Option<(usize, usize, Vec<u8>, Vec<(usize, usize)>)> {
+        let mut atlas_width = 0usize;
+        let mut atlas_height = 0usize;
+        for bitmap in bitmaps {
+            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
+                continue;
+            }
+            atlas_width += bitmap.placement.width as usize;
+            atlas_height = atlas_height.max(bitmap.placement.height as usize);
+        }
+        if atlas_width == 0 || atlas_height == 0 {
+            return None;
+        }
+        let mut pixels = vec![0u8; atlas_width * atlas_height];
+        let mut cursor_x = 0usize;
+        let mut placements = Vec::new();
+        for (index, bitmap) in bitmaps.iter().enumerate() {
+            let bw = bitmap.placement.width as usize;
+            let bh = bitmap.placement.height as usize;
+            if bw == 0 || bh == 0 {
+                continue;
+            }
+            assert!(bitmap.is_valid(), "baseline 只用于合法输入");
+            for row in 0..bh {
+                let src = row * bitmap.stride;
+                let dst = row * atlas_width + cursor_x;
+                pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
+            }
+            placements.push((index, cursor_x));
+            cursor_x += bw;
+        }
+        Some((atlas_width, atlas_height, pixels, placements))
+    }
+
+    /// 一张 libass 固定字幕规格的 alpha 位图：宽 828、行 stride 832（行 padding
+    /// 4 字节），也就是 `D3d11OverlayTextureEntry::content` 里记的
+    /// 「828x57 / 47,420 字节」那张（`832 * 56 + 828 == 47,420`）。
+    fn alpha_bitmap_828(
+        width: u32,
+        height: u32,
+        stride: usize,
+        seed: u8,
+    ) -> crate::subtitle::SubtitleAlphaBitmap {
+        use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement};
+        let len = stride * (height as usize - 1) + width as usize;
+        let alpha = (0..len)
+            .map(|i| seed.wrapping_add((i % 251) as u8))
+            .collect();
+        SubtitleAlphaBitmap::new(
+            SubtitleBitmapPlacement::new(0, 0, width, height),
+            stride,
+            0xffff_ffff,
+            alpha,
+        )
+    }
+
+    /// 把整张纹理读回 CPU（staging + `Map`），返回 `(width, height, 逐行紧凑字节)`。
+    /// `read_bgra_pixel` 只能读首像素，这里要看整张 alpha 图集。
+    fn read_texture_bytes(
+        state: &D3d11DeviceState,
+        texture: &ID3D11Texture2D,
+    ) -> (u32, u32, Vec<u8>) {
+        use ::windows::Win32::Graphics::Direct3D11::{
+            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING,
+        };
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            texture.GetDesc(&mut desc);
+        }
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.MiscFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging = None;
+        unsafe {
+            state
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .unwrap();
+        }
+        let staging = staging.unwrap();
+        unsafe {
+            state.context.CopyResource(&staging, texture);
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let mut bytes = vec![0u8; desc.Width as usize * desc.Height as usize];
+        unsafe {
+            state
+                .context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .unwrap();
+            for row in 0..desc.Height as usize {
+                let src = mapped
+                    .pData
+                    .cast::<u8>()
+                    .add(row * mapped.RowPitch as usize);
+                let dst = row * desc.Width as usize;
+                std::ptr::copy_nonoverlapping(src, bytes[dst..].as_mut_ptr(), desc.Width as usize);
+            }
+            state.context.Unmap(&staging, 0);
+        }
+        (desc.Width, desc.Height, bytes)
+    }
+
+    /// 一批 `batch` 次操作只取一次 `Instant` 样本，摊掉计时开销
+    /// （单次操作在几十纳秒量级时，两次 `Instant::now()` 本身占比可观）。
+    struct BenchStats {
+        min_ns: f64,
+        p50_ns: f64,
+        p95_ns: f64,
+        mean_ns: f64,
+    }
+
+    fn bench_batched(mut body: impl FnMut(), batches: usize, batch: usize) -> BenchStats {
+        for _ in 0..batch {
+            body();
+        }
+        let mut samples = Vec::with_capacity(batches);
+        for _ in 0..batches {
+            let started = Instant::now();
+            for _ in 0..batch {
+                body();
+            }
+            samples.push(started.elapsed().as_nanos() as f64 / batch as f64);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("样本不含 NaN"));
+        BenchStats {
+            min_ns: samples[0],
+            p50_ns: samples[samples.len() / 2],
+            p95_ns: samples[(samples.len() * 95) / 100],
+            mean_ns: samples.iter().sum::<f64>() / samples.len() as f64,
+        }
+    }
+
+    /// 复用缓冲的等价性契约（纯 CPU，不需要设备）：对同一 `bitmaps`，
+    /// 「复用 scratch」产出的 `pixels[..w*h]` 必须与「每次新建 `vec![0u8; w*h]`
+    /// 再逐行拷贝」逐字节相同。四个容易出错的输入都覆盖：
+    ///   1. 高度不齐 —— 图集里存在任何一次拷贝都写不到的区域（残留像素的唯一入口）；
+    ///   2. 尺寸骤变 —— 大 → 小 → 大，缓冲长度比本次用到的前缀长；
+    ///   3. 空尺寸平面 —— 跳过但会影响 cursor 累加；
+    ///   4. 缓冲被写脏 —— 每轮先把 scratch 填成 0xA5，模拟上一拍留下的像素。
+    #[test]
+    fn alpha_atlas_scratch_reuses_buffer_with_identical_bytes() {
+        use crate::subtitle::SubtitleAlphaBitmap;
+
+        let cases: Vec<Vec<SubtitleAlphaBitmap>> = vec![
+            // 真实尺寸：两张 828x57
+            vec![
+                alpha_bitmap_828(828, 57, 832, 7),
+                alpha_bitmap_828(828, 57, 832, 9),
+            ],
+            // 高度不齐：第二张矮 37 行 → 那 37 行 × 828 字节任何拷贝都写不到
+            vec![
+                alpha_bitmap_828(828, 57, 832, 3),
+                alpha_bitmap_828(828, 20, 832, 5),
+            ],
+            // 尺寸骤变：大 → 小 → 大
+            vec![
+                alpha_bitmap_828(828, 57, 832, 11),
+                alpha_bitmap_828(828, 57, 832, 13),
+            ],
+            vec![alpha_bitmap_828(40, 12, 64, 17)],
+            vec![
+                alpha_bitmap_828(828, 57, 832, 19),
+                alpha_bitmap_828(828, 57, 832, 21),
+            ],
+            // 空尺寸平面（跳过）+ 单像素平面
+            vec![alpha_bitmap_828(0, 9, 0, 23), alpha_bitmap_828(1, 1, 1, 29)],
+            // 完全没有可拼的平面
+            vec![],
+        ];
+
+        let mut scratch = D3d11AlphaAtlasScratch::default();
+        for (round, case) in cases.iter().enumerate() {
+            let baseline = pack_alpha_atlas_baseline(case);
+            // 先污染：复用路径必须自己把这些字节清掉。
+            scratch.pixels.fill(0xA5);
+            scratch.placements.clear();
+            scratch.placements.push((usize::MAX, usize::MAX));
+
+            let rebuilt = scratch.rebuild(case).unwrap();
+            match baseline {
+                None => assert!(!rebuilt, "round {round}: 无可拼平面时应返回 false"),
+                Some((width, height, pixels, placements)) => {
+                    assert!(rebuilt, "round {round}");
+                    assert_eq!(
+                        (scratch.width, scratch.height),
+                        (width, height),
+                        "round {round}: 图集形状"
+                    );
+                    assert_eq!(scratch.placements, placements, "round {round}: 放置表");
+                    assert_eq!(
+                        scratch.pixels[..width * height],
+                        pixels[..],
+                        "round {round}: 复用缓冲的像素必须逐字节等于新建缓冲"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 端到端（WARP 真设备）：落到**纹理里**的字节也必须与「每拍新建缓冲」的
+    /// 基线逐字节相同，覆盖命中缓存的 `UpdateSubresource` 路径与未命中时
+    /// `CreateTexture2D(pInitialData)` 路径。第二拍特意让第二张平面变矮：
+    /// 图集里那片「任何拷贝都写不到」的区域若残留上一拍的像素，这里会直接读到。
+    #[test]
+    fn alpha_atlas_texture_bytes_match_new_buffer_baseline() {
+        use crate::overlay::OverlayViewport;
+
+        let (device, context) = warp_device();
+        let mut renderer = D3d11Renderer::new().unwrap();
+        renderer.set_device(device, context).unwrap();
+
+        let frames: Vec<Vec<crate::subtitle::SubtitleAlphaBitmap>> = vec![
+            // 首拍：新建纹理（pInitialData 路径）
+            vec![
+                alpha_bitmap_828(828, 57, 832, 7),
+                alpha_bitmap_828(828, 57, 832, 9),
+            ],
+            // 同尺寸不同内容：命中缓存 → UpdateSubresource；第二张矮 → 未覆盖区
+            vec![
+                alpha_bitmap_828(828, 57, 832, 21),
+                alpha_bitmap_828(828, 20, 832, 23),
+            ],
+            // 换小尺寸：缓存里没有这个形状 → 新建/替换
+            vec![alpha_bitmap_828(828, 40, 832, 31)],
+            // 回到大尺寸：再次命中缓存 → UpdateSubresource
+            vec![
+                alpha_bitmap_828(828, 57, 832, 41),
+                alpha_bitmap_828(828, 57, 832, 43),
+            ],
+        ];
+
+        for (frame, bitmaps) in frames.iter().enumerate() {
+            let overlay = OverlayFrame {
+                pts: Duration::from_millis(frame as u64 * 33),
+                viewport: OverlayViewport::new(1920, 1080),
+                subtitle_planes: Vec::new(),
+                subtitle_alpha_planes: bitmaps.clone(),
+                subtitle_changed: true,
+            };
+            renderer.overlay_textures.begin_frame();
+            let draws = renderer.prepare_overlay_draws(Some(&overlay)).unwrap();
+            assert_eq!(
+                draws.len(),
+                bitmaps.len(),
+                "frame {frame}: 每张平面一个 draw"
+            );
+            let atlas_draw = draws.last().unwrap();
+            let state = renderer.state.as_ref().unwrap();
+            let (width, height, bytes) = read_texture_bytes(state, &atlas_draw.texture._texture);
+            let (want_width, want_height, want_pixels, _) =
+                pack_alpha_atlas_baseline(bitmaps).unwrap();
+            assert_eq!(
+                (width as usize, height as usize),
+                (want_width, want_height),
+                "frame {frame}: 图集纹理尺寸"
+            );
+            assert_eq!(
+                bytes, want_pixels,
+                "frame {frame}: 纹理字节必须逐字节等于新建缓冲的基线"
+            );
+        }
+    }
+
+    /// 成本实测：现状（每拍新建缓冲）vs 复用缓冲，并拆出分配 / 清零 / 拷贝各自
+    /// 的成本。微秒级量级，**只在 `--release` 下有意义**（debug 会把切片循环与
+    /// 边界检查放大数倍）。
+    ///
+    /// 跑法：
+    /// `cargo test --release --lib alpha_atlas_rebuild_cost_is_measured -- --nocapture`
+    #[test]
+    fn alpha_atlas_rebuild_cost_is_measured() {
+        use std::hint::black_box;
+
+        // 真实尺寸：两张 828x57（stride 832）= 47,420 字节/张，
+        // 图集 1656x57 = 94,392 字节。
+        let bitmaps = vec![
+            alpha_bitmap_828(828, 57, 832, 7),
+            alpha_bitmap_828(828, 57, 832, 9),
+        ];
+        let (width, height, baseline_pixels, _) = pack_alpha_atlas_baseline(&bitmaps).unwrap();
+        let len = baseline_pixels.len();
+        drop(baseline_pixels);
+
+        let mut scratch = D3d11AlphaAtlasScratch::default();
+        assert!(scratch.rebuild(&bitmaps).unwrap());
+        let mut plain = vec![0u8; len];
+
+        const BATCHES: usize = 200;
+        const BATCH: usize = 16;
+
+        let fresh = bench_batched(
+            || {
+                black_box(pack_alpha_atlas_baseline(black_box(&bitmaps)));
+            },
+            BATCHES,
+            BATCH,
+        );
+        let reuse = bench_batched(
+            || {
+                assert!(scratch.rebuild(black_box(&bitmaps)).unwrap());
+                black_box(&scratch.pixels[..len]);
+            },
+            BATCHES,
+            BATCH,
+        );
+        let alloc = bench_batched(
+            || {
+                let buffer = vec![0u8; black_box(len)];
+                black_box(&buffer);
+                drop(buffer);
+            },
+            BATCHES,
+            BATCH,
+        );
+        let memset = bench_batched(
+            || {
+                scratch.pixels[..len].fill(0);
+                black_box(&scratch.pixels[..len]);
+            },
+            BATCHES,
+            BATCH,
+        );
+        let row_copy = bench_batched(
+            || {
+                let pixels = &mut plain[..len];
+                let mut cursor_x = 0usize;
+                for bitmap in black_box(&bitmaps) {
+                    let bw = bitmap.placement.width as usize;
+                    let bh = bitmap.placement.height as usize;
+                    for row in 0..bh {
+                        let src = row * bitmap.stride;
+                        let dst = row * width + cursor_x;
+                        pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
+                    }
+                    cursor_x += bw;
+                }
+                black_box(&plain[..len]);
+            },
+            BATCHES,
+            BATCH,
+        );
+        // 隔离项：同一个函数里「分配 + 清零 + 拷贝」，但不经函数返回、不算放置表。
+        // 用来判断现状的耗时里究竟有多少来自「新分配的内存必须被写一遍」这件事本身。
+        let alloc_copy = bench_batched(
+            || {
+                let mut buffer = vec![0u8; black_box(len)];
+                let pixels = &mut buffer[..len];
+                let mut cursor_x = 0usize;
+                for bitmap in black_box(&bitmaps) {
+                    let bw = bitmap.placement.width as usize;
+                    let bh = bitmap.placement.height as usize;
+                    for row in 0..bh {
+                        let src = row * bitmap.stride;
+                        let dst = row * width + cursor_x;
+                        pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
+                    }
+                    cursor_x += bw;
+                }
+                black_box(&buffer[..len]);
+            },
+            BATCHES,
+            BATCH,
+        );
+
+        eprintln!(
+            "[alpha-atlas bench] 图集 {width}x{height} = {len} 字节（2 张 828x57 / stride 832），\
+             每批 {BATCH} 次 × {BATCHES} 批"
+        );
+        for (label, stats) in [
+            ("现状: vec![0;len] + 逐行拷贝 + 放置表", &fresh),
+            ("复用: 整块清零 + 逐行拷贝 + 放置表", &reuse),
+            ("仅 vec![0;len] 分配+清零+释放", &alloc),
+            ("仅 94KB fill(0) 清零（复用缓冲）", &memset),
+            ("仅 94KB 逐行拷贝（复用缓冲，57 行×2）", &row_copy),
+            ("vec![0;len] + 逐行拷贝（无函数边界/放置表）", &alloc_copy),
+        ] {
+            eprintln!(
+                "[alpha-atlas bench] {label}: min {:.0}ns p50 {:.0}ns p95 {:.0}ns mean {:.0}ns",
+                stats.min_ns, stats.p50_ns, stats.p95_ns, stats.mean_ns
+            );
+        }
+        eprintln!(
+            "[alpha-atlas bench] 复用相对现状(min)节省 {:.0}ns/拍，相对 p50 节省 {:.0}ns/拍",
+            fresh.min_ns - reuse.min_ns,
+            fresh.p50_ns - reuse.p50_ns
+        );
+    }
+
+    /// 别名判断的实测依据：D3D11 不在调用返回后继续引用源缓冲。
+    ///
+    /// `D3d11AlphaAtlasScratch` 复用同一块缓冲的前提是「两次上传都不会把这块
+    /// 内存留作己用」，而这两条上传路径都是 `unsafe` 的裸指针调用、Rust 类型
+    /// 系统管不到。这里用真 WARP 设备做行为实验：填好数据 → 调 API →
+    /// **立刻把源缓冲改写成另一组字节** → 读回纹理。纹理必须仍是调用时的内容，
+    /// 否则复用一块会被下一拍改写的缓冲就是别名风险。
+    #[test]
+    fn d3d11_overlay_upload_does_not_retain_source_buffer() {
+        let (device, context) = warp_device();
+        let mut renderer = D3d11Renderer::new().unwrap();
+        renderer.set_device(device, context).unwrap();
+
+        // 1) CreateTexture2D 的 pInitialData 路径
+        let mut initial = vec![0x11u8; 16 * 8];
+        let texture = {
+            let state = renderer.state.as_ref().unwrap();
+            create_overlay_texture(state, 16, 8, DXGI_FORMAT_R8_UNORM, &initial, 16).unwrap()
+        };
+        initial.fill(0x22);
+        {
+            let state = renderer.state.as_ref().unwrap();
+            let (width, height, bytes) = read_texture_bytes(state, &texture._texture);
+            assert_eq!((width, height), (16, 8));
+            assert!(
+                bytes.iter().all(|byte| *byte == 0x11),
+                "CreateTexture2D 返回后改写源缓冲不应影响纹理内容，首 8 字节 {:?}",
+                &bytes[..8]
+            );
+        }
+
+        // 2) UpdateSubresource 的 pSrcData 路径
+        let mut update = vec![0x33u8; 16 * 8];
+        {
+            let state = renderer.state.as_ref().unwrap();
+            upload_overlay_texture(state, &texture._texture, &update, 16);
+        }
+        update.fill(0x44);
+        {
+            let state = renderer.state.as_ref().unwrap();
+            let (_, _, bytes) = read_texture_bytes(state, &texture._texture);
+            assert!(
+                bytes.iter().all(|byte| *byte == 0x33),
+                "UpdateSubresource 返回后改写源缓冲不应影响纹理内容，首 8 字节 {:?}",
+                &bytes[..8]
+            );
+        }
+    }
+
+    fn warp_device() -> (ID3D11Device, ID3D11DeviceContext) {
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .unwrap();
+        }
+        (device.unwrap(), context.unwrap())
+    }
+
+    /// 真设备契约：同尺寸字幕平面在后续帧复用同一张纹理（不再 `CreateTexture2D`），
+    /// 同帧内同尺寸的两张平面各占一张，设备重建后缓存作废。
+    #[test]
+    fn overlay_texture_cache_reuses_across_frames_and_resets_on_device_swap() {
+        use crate::overlay::OverlayViewport;
+        use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
+        let rgba_bytes = 4 * 2 * 4;
+        let (device, context) = warp_device();
+        let device_raw = device.as_raw();
+        let mut renderer = D3d11Renderer::new().unwrap();
+        renderer.set_device(device, context).unwrap();
+
+        let mut overlay = OverlayFrame {
+            pts: Duration::ZERO,
+            viewport: OverlayViewport::new(16, 16),
+            subtitle_planes: vec![
+                SubtitleBitmapPlane::new(0, 0, 4, 2, vec![255; rgba_bytes]),
+                SubtitleBitmapPlane::new(0, 2, 4, 2, vec![128; rgba_bytes]),
+            ],
+            subtitle_alpha_planes: vec![SubtitleAlphaBitmap::new(
+                SubtitleBitmapPlacement::new(0, 0, 4, 2),
+                4,
+                0xffffffff,
+                vec![255; 4 * 2],
+            )],
+            subtitle_changed: true,
+        };
+
+        renderer.overlay_textures.begin_frame();
+        let first = renderer.prepare_overlay_draws(Some(&overlay)).unwrap();
+        assert_eq!(first.len(), 3, "2 张 RGBA 平面 + 1 张 alpha 图集");
+        assert_eq!(renderer.stats.overlay_plane_texture_creates, 3);
+        assert_eq!(renderer.stats.overlay_plane_texture_reuses, 0);
+        let first_ids: Vec<*mut c_void> = first
+            .iter()
+            .map(|draw| draw.texture._texture.as_raw())
+            .collect();
+        // 旧纹理必须**一直持有到测试结束**：下面要断言"设备重建后拿到的是新对象"，
+        // 而裸指针只在对象存活期间才唯一 —— 旧对象一旦被释放，它的地址会被分配器
+        // 复用给新对象，于是 `assert_ne!(new.as_raw(), old_raw)` 会随机失败
+        // （这条测试此前就是这样偶发失败的，2026-09-15 实测 5 轮里挂 2 轮）。
+        // 持有引用之后，两个对象同时存活，指针相等 ⇔ 真的是同一个对象。
+        let held_textures: Vec<ID3D11Texture2D> = first
+            .iter()
+            .map(|draw| draw.texture._texture.clone())
+            .collect();
+        assert_ne!(
+            first_ids[0], first_ids[1],
+            "同帧同尺寸的两张字幕平面不能共用一张纹理"
+        );
+        drop(first);
+
+        // 稳态 120 帧（约 2 秒 60fps）：同尺寸字幕平面全部命中缓存，
+        // `CreateTexture2D` 计数恒为 3 —— 这就是"每帧新建纹理、帧末释放"的
+        // 6MB/s 抖动被消掉的直接证据。
+        for frame in 2..=120u64 {
+            overlay.pts = Duration::from_millis(frame * 33);
+            renderer.overlay_textures.begin_frame();
+            let draws = renderer.prepare_overlay_draws(Some(&overlay)).unwrap();
+            let ids: Vec<*mut c_void> = draws
+                .iter()
+                .map(|draw| draw.texture._texture.as_raw())
+                .collect();
+            assert_eq!(ids, first_ids, "frame {frame} 应复用同一批纹理");
+            assert_eq!(
+                renderer.stats.overlay_plane_texture_creates, 3,
+                "frame {frame} 不应再新建纹理"
+            );
+            assert_eq!(
+                renderer.stats.overlay_plane_texture_reuses,
+                3 * (frame - 1),
+                "frame {frame}"
+            );
+        }
+        assert_eq!(
+            renderer.overlay_textures.cached_bytes,
+            2 * rgba_bytes + 4 * 2
+        );
+
+        // 设备重建（TDR 自愈 / 切到解码器设备）：缓存必须清空，新帧必须用新设备
+        // 的纹理，而不是旧设备上那张。
+        let (next_device, next_context) = warp_device();
+        let next_device_raw = next_device.as_raw();
+        assert_ne!(device_raw, next_device_raw);
+        renderer.set_device(next_device, next_context).unwrap();
+        assert!(renderer.overlay_textures.entries.is_empty());
+
+        renderer.overlay_textures.begin_frame();
+        let third = renderer.prepare_overlay_draws(Some(&overlay)).unwrap();
+        assert_eq!(renderer.stats.overlay_plane_texture_creates, 6);
+        let third_texture = &third[0].texture._texture;
+        assert!(
+            held_textures
+                .iter()
+                .all(|held| held.as_raw() != third_texture.as_raw()),
+            "设备重建后必须新建纹理，不能命中旧设备上那张（旧纹理对象此处仍被持有，\
+             地址比较因此是可靠的对象身份比较）"
+        );
+        assert_ne!(third_texture.as_raw(), first_ids[0]);
+        assert_eq!(
+            unsafe { third_texture.GetDevice().unwrap() }.as_raw(),
+            next_device_raw
+        );
+    }
+
+    /// 真设备契约（候选 C）：叠加层平面内容与纹理里已有的**逐字节相同**时跳过
+    /// `UpdateSubresource`；同一尺寸的内容变了必须真的写进去；**纹理被 LRU 驱逐
+    /// 后必须重新上传** —— 静态字幕不能因为"跳过上传"而在驱逐后消失。
+    ///
+    /// 为什么值得做（实测依据，见 `D3d11OverlayTextureEntry::content`）：一次
+    /// `UpdateSubresource` 的成本在下游 flush 边界结算，本机实测 0.20MB 上传使
+    /// present p50 +99µs、8.29MB 上传 +822µs；而同一句静态字幕连续 120 拍的内容
+    /// 逐字节完全相同（119/119）。逐字节比对 40KB 实测 p50 1.5µs。
+    ///
+    /// 为什么不能只读计数器：还要读回纹理首像素，证明"该传的时候真的传了、
+    /// 该跳的时候一个字节都没被改坏"。
+    #[test]
+    fn overlay_plane_skips_identical_uploads_and_reeuploads_after_eviction() {
+        use crate::overlay::OverlayViewport;
+        use crate::subtitle::SubtitleBitmapPlane;
+
+        let (device, context) = warp_device();
+        let mut renderer = D3d11Renderer::new().unwrap();
+        renderer.set_device(device, context).unwrap();
+
+        fn plane(width: u32, height: u32, fill: u8) -> SubtitleBitmapPlane {
+            SubtitleBitmapPlane::new(
+                0,
+                0,
+                width,
+                height,
+                vec![fill; (width * height * 4) as usize],
+            )
+        }
+        fn overlay(planes: Vec<SubtitleBitmapPlane>) -> OverlayFrame {
+            OverlayFrame {
+                pts: Duration::ZERO,
+                viewport: OverlayViewport::new(64, 64),
+                subtitle_planes: planes,
+                subtitle_alpha_planes: Vec::new(),
+                subtitle_changed: true,
+            }
+        }
+        let read = |renderer: &D3d11Renderer, texture: &ID3D11Texture2D| {
+            read_bgra_pixel(renderer.state.as_ref().unwrap(), texture)
+        };
+
+        // 第 1 帧：走创建路径（`CreateTexture2D` 自带初始数据），不计入上传。
+        renderer.overlay_textures.begin_frame();
+        let draws = renderer
+            .prepare_overlay_draws(Some(&overlay(vec![plane(4, 2, 9)])))
+            .unwrap();
+        assert_eq!(renderer.stats.overlay_plane_texture_creates, 1);
+        assert_eq!(renderer.stats.overlay_plane_uploads, 0);
+        assert_eq!(renderer.stats.overlay_plane_upload_skips, 0);
+        let steady = draws[0].texture._texture.clone();
+        assert_eq!(read(&renderer, &steady), [9, 9, 9, 9]);
+
+        // 第 2 帧：内容逐字节相同 → 跳过上传（省的是 present 里的提交成本）。
+        renderer.overlay_textures.begin_frame();
+        let _ = renderer
+            .prepare_overlay_draws(Some(&overlay(vec![plane(4, 2, 9)])))
+            .unwrap();
+        assert_eq!(renderer.stats.overlay_plane_upload_skips, 1);
+        assert_eq!(renderer.stats.overlay_plane_uploads, 0);
+        assert_eq!(renderer.stats.overlay_plane_texture_creates, 1);
+        assert_eq!(
+            read(&renderer, &steady),
+            [9, 9, 9, 9],
+            "跳过的前提是内容真的没变，像素必须保持原样"
+        );
+
+        // 第 3 帧：同一尺寸但内容变了 → 必须真的上传，像素跟着变。
+        renderer.overlay_textures.begin_frame();
+        let _ = renderer
+            .prepare_overlay_draws(Some(&overlay(vec![plane(4, 2, 7)])))
+            .unwrap();
+        assert_eq!(renderer.stats.overlay_plane_uploads, 1);
+        assert_eq!(renderer.stats.overlay_plane_upload_skips, 1);
+        assert_eq!(
+            read(&renderer, &steady),
+            [7, 7, 7, 7],
+            "内容变化必须真的写进纹理，不能沿用旧内容"
+        );
+
+        // 塞满缓存（容量 6）→ 再用第 7 种尺寸把最旧的条目（4x2，第 3 帧用过）
+        // 挤出去。这一步走的就是 LRU 的 `Replace` 分支。
+        for width in [8u32, 12, 16, 20, 24] {
+            renderer.overlay_textures.begin_frame();
+            let _ = renderer
+                .prepare_overlay_draws(Some(&overlay(vec![plane(width, 2, 1)])))
+                .unwrap();
+        }
+        assert_eq!(renderer.overlay_textures.entries.len(), 6);
+        renderer.overlay_textures.begin_frame();
+        let _ = renderer
+            .prepare_overlay_draws(Some(&overlay(vec![plane(28, 2, 2)])))
+            .unwrap();
+
+        // 驱逐之后：同一份静态字幕再回来，**必须重新上传**（新纹理 + 初始数据），
+        // 而不是命中"内容已知"的假象。否则用户看到的就是字幕消失。
+        let creates_before = renderer.stats.overlay_plane_texture_creates;
+        let skips_before = renderer.stats.overlay_plane_upload_skips;
+        renderer.overlay_textures.begin_frame();
+        let draws = renderer
+            .prepare_overlay_draws(Some(&overlay(vec![plane(4, 2, 9)])))
+            .unwrap();
+        assert!(
+            renderer.stats.overlay_plane_texture_creates > creates_before,
+            "被驱逐的尺寸必须重新创建纹理并重传内容"
+        );
+        assert_eq!(
+            renderer.stats.overlay_plane_upload_skips, skips_before,
+            "驱逐后不允许再判成「内容未变」"
+        );
+        let restored = draws[0].texture._texture.clone();
+        assert_eq!(
+            read(&renderer, &restored),
+            [9, 9, 9, 9],
+            "驱逐后重新上传必须把静态字幕的像素找回来"
+        );
+
+        // 稳态恢复：新条目记下了内容，下一拍同样的内容重新命中跳过。
+        renderer.overlay_textures.begin_frame();
+        let _ = renderer
+            .prepare_overlay_draws(Some(&overlay(vec![plane(4, 2, 9)])))
+            .unwrap();
+        assert_eq!(renderer.stats.overlay_plane_upload_skips, skips_before + 1);
+    }
+
+    /// 真设备契约：视频帧交接栅栏（`wait_for_gpu`）**复用同一个 `ID3D11Query`**，
+    /// 不再每个上屏视频帧 `CreateQuery` 一次；设备重建后复用槽必须丢弃重建。
+    ///
+    /// 锁定方式与 `overlay_texture_cache_reuses_across_frames_and_resets_on_device_swap`
+    /// 同构：直接看 `CreateQuery` 计数，而不是"感觉更快了"。真机 30fps 稳态播放每秒
+    /// 进这个栅栏 30 次，这里用 120 次等待逼近"2 秒 60fps"。
+    ///
+    /// 重复 `End` 的合法性依据写在 `wait_for_gpu` 的文档里（`D3D11_QUERY` 枚举与
+    /// `GetData` 的原文引用）；本测试补的是**行为证据**：在真实 D3D11 设备（WARP）
+    /// 上连续 120 次复用同一个 query，每次 `GetData` 都等到事件完成并返回成功。
+    #[test]
+    fn gpu_fence_reuses_one_query_across_waits_and_rebuilds_on_device_swap() {
+        let (device, context) = warp_device();
+        let mut renderer = D3d11Renderer::new().unwrap();
+        renderer.set_device(device, context).unwrap();
+
+        // 第 1 次：槽为空，必须新建。
+        renderer.wait_for_gpu().unwrap();
+        assert_eq!(renderer.stats.gpu_fence_query_creates, 1);
+        assert_eq!(renderer.stats.gpu_fence_query_reuses, 0);
+        // 旧 query 必须一直被持有：下面要断言"换设备后拿到的是新对象"，而裸指针
+        // 只在对象存活期间唯一 —— 旧对象一旦被释放，地址会被分配器复用，断言就
+        // 变成随机数（同 `overlay_texture_cache_reuses_...` 里那条注释）。
+        let first_held = renderer.gpu_fence_query.as_ref().unwrap().clone();
+        let first = first_held.as_raw();
+
+        // 稳态 120 次：同一个 query 反复 End/GetData。
+        for call in 2..=120u64 {
+            renderer.wait_for_gpu().unwrap();
+            assert_eq!(
+                renderer.stats.gpu_fence_query_creates, 1,
+                "call {call}: 复用生效时不应再 CreateQuery"
+            );
+            assert_eq!(
+                renderer.stats.gpu_fence_query_reuses,
+                call - 1,
+                "call {call}"
+            );
+            assert_eq!(
+                renderer.gpu_fence_query.as_ref().unwrap().as_raw(),
+                first,
+                "call {call}: 复用的必须是同一个 query 对象"
+            );
+        }
+        assert_eq!(renderer.stats.gpu_fence_query_reuses, 119);
+
+        // 设备重建（TDR 自愈 / 切到解码器设备）：query 属于创建它的设备，必须丢弃。
+        let (next_device, next_context) = warp_device();
+        renderer.set_device(next_device, next_context).unwrap();
+        assert!(renderer.gpu_fence_query.is_none(), "换设备后复用槽必须清空");
+        renderer.wait_for_gpu().unwrap();
+        assert_eq!(renderer.stats.gpu_fence_query_creates, 2);
+        assert_eq!(renderer.stats.gpu_fence_query_reuses, 119);
+        assert_ne!(
+            renderer.gpu_fence_query.as_ref().unwrap().as_raw(),
+            first_held.as_raw(),
+            "新设备上的栅栏 query 必须是新对象（旧对象此处仍被持有，指针比较可靠）"
+        );
     }
 }

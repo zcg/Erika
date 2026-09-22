@@ -376,8 +376,22 @@ pub mod wasapi {
     impl Drop for WasapiRenderThread {
         fn drop(&mut self) {
             let _ = self.commands.send(WasapiRenderCommand::Shutdown);
+            // **有限超时 join，绝不能在 UI 线程上无限等**（与
+            // `AsyncDemuxer::drop` 同一套做法）。WASAPI 渲染线程可能正卡在
+            // 一次设备调用/背压等待里（实测日志里出现过
+            // `playback_audio_output … backpressure_pending timeoutSeconds=10`），
+            // 而无界 `join()` 会把调用方——也就是**播放窗口的 UI 线程**——
+            // 一起挂住：窗口不再泵消息 → Windows 判定 AppHang 并终止进程
+            // （实测 2026-09-14 22:07 的一次 `AppHangB1`，`bili-rs.exe`）。
+            // 2s 内没退就 detach：线程随后自然结束时自行释放资源，只是不再
+            // 阻塞调用方。
             if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = worker.join();
+                    let _ = done_tx.send(());
+                });
+                let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
             }
         }
     }

@@ -54,6 +54,16 @@ pub enum PlayerError {
 
 pub type Result<T> = std::result::Result<T, PlayerError>;
 
+/// 视频帧 handoff 队列（`subscribe_video_frames` 的 channel）的默认容量。
+///
+/// 它同时是 D3D11VA 硬件帧池"消费端预留"的输入：池下界 =
+/// 工作面 + 参考帧 + (本容量 + 渲染器常驻 1 片)。两个数字必须来自同一个值，
+/// 否则要么 `get_buffer failed`（队列大、池小），要么白占显存（队列小、池大）。
+/// `Player` 创建解码器时传的是 `PlayerConfig::video_frame_queue_capacity` 的
+/// 实际取值，本常量只是"没有 Player 层队列"时的兜底
+/// （`PlaybackSession` / `VideoPlaybackEngine::open` 直接调用）。
+pub const DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerConfig {
     pub name: String,
@@ -72,7 +82,7 @@ impl Default for PlayerConfig {
             event_channel_capacity: 1024,
             playback: PlaybackSessionConfig::default(),
             renderer: RendererBackendPreference::default(),
-            video_frame_queue_capacity: 3,
+            video_frame_queue_capacity: DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY,
             audio_frame_queue_capacity: 192,
             subtitle_frame_queue_capacity: 16,
         }
@@ -980,6 +990,76 @@ pub struct RendererRuntimeStats {
     pub upscaled_frames: u64,
     pub last_upscaler_encode_duration: Duration,
     pub last_gpu_duration: Duration,
+    // ===== UI 线程（宿主渲染回调）分段耗时 =====
+    //
+    // 宿主把 `render_tick` 挂在显示合成回调（WinUI `CompositionTarget::Rendering`）
+    // 上，那个回调与窗口消息 `WM_MOVING`/`WM_SIZING` **共用同一个线程**。所以
+    // 下面每一项都是「窗口交互被推迟多久」的直接构成项。
+    //
+    // 这些是 CPU/提交侧耗时，不是 GPU 执行耗时。注意 `last_gpu_duration` 在
+    // **D3D11(Windows) 后端恒为 0**（只有 Metal 后端赋值），诊断里不要用它。
+    pub last_overlay_prepare_duration: Duration,
+    pub last_danmaku_prepare_duration: Duration,
+    pub last_draw_video_duration: Duration,
+    pub last_draw_overlay_duration: Duration,
+    pub last_present_duration: Duration,
+    /// `Present1` 提交 / 因队列满丢弃的累计次数。两者都增长 = `DO_NOT_WAIT`
+    /// 正常工作（UI 线程不被 vsync 卡住）；只有提交增长而 present 耗时又很高
+    /// 才是同步等待。
+    ///
+    /// **注意（真机实测修正）**：`丢弃` 恒为 0 **不能**推出"present 没等"。
+    /// 真机日志里存在整秒 `n=60、present=14~15.8ms、丢弃=0` 的段落 —— DXGI 的
+    /// `DXGI_PRESENT_DO_NOT_WAIT` 原文只承诺"if the calling thread is blocked
+    /// … fail the presentation with DXGI_ERROR_WAS_STILL_DRAWING"，它覆盖的是
+    /// 队列依赖那一种阻塞，不等于 Present 不会等。判断要看下面
+    /// [`Self::present_over_8ms`] 与 [`Self::display_refresh_hz_milli`]。
+    pub present_submitted: u64,
+    pub present_dropped: u64,
+    // ===== present 的真实分布（不只是一拍）=====
+    /// `Present1` 累计调用次数；均值 = [`Self::present_total`] / 本值。
+    ///
+    /// 为什么需要：此前诊断每秒只留 `last_present_duration` 一个采样，
+    /// 于是 0.52 / 1.88 / 0.32 这类单点被读成"平均 0.5ms"。真机 498 秒采样
+    /// 摊开后的分布是 p50=0.41ms、p90=1.11ms、p99=14.55ms。
+    pub present_calls: u64,
+    /// `Present1` 累计耗时。
+    pub present_total: Duration,
+    /// 单次 `Present1` 最长耗时。
+    pub present_max: Duration,
+    /// `Present1` 耗时超过 1ms 的次数。
+    pub present_over_1ms: u64,
+    /// `Present1` 耗时超过 8ms（120Hz 一帧）的次数：**等合成器一帧**的指纹。
+    ///
+    /// 该计数持续增长 = present 在等合成器，UI 线程被压住，此时"优化我们的
+    /// 计算"没有意义；不增长而 present 仍高 = 那是我们自己的提交成本。
+    pub present_over_8ms: u64,
+    /// `IDXGISwapChain::GetFrameStatistics` 当前是否可用。
+    ///
+    /// flip 模型的窗口化 swapchain 可用（本后端走 `FLIP_SEQUENTIAL`）；
+    /// 取不到时下面三个读数**保持上次值**，不要当成 0 判读。
+    pub frame_stats_available: bool,
+    /// 采样窗口内**显示器 vblank 速率**，单位毫赫兹（120000 = 120.000Hz）。
+    ///
+    /// 这是"面板现在跑在几 Hz"的直接读数。掉到 60000 附近说明面板/系统真的
+    /// 切到 60Hz；仍接近 120000 而 [`Self::presents_per_refresh_milli`] ≈ 500
+    /// 说明面板没变、是合成器按 60Hz 消费我们的帧。
+    pub display_refresh_hz_milli: u32,
+    /// 每个 vblank 提交了几帧，单位千分之一（1000 = 1.000 帧/vblank）。
+    pub presents_per_refresh_milli: u32,
+    /// 每个 vblank 真正上屏了几帧，单位千分之一。
+    pub shown_frames_per_refresh_milli: u32,
+    // ===== 叠加层平面上传（跳过内容未变的上传 = 省 present 里的时间）=====
+    /// 叠加层平面真正执行 `UpdateSubresource` 的次数。
+    pub overlay_plane_uploads: u64,
+    /// 上传的叠加层平面总字节数。
+    pub overlay_plane_upload_bytes: u64,
+    /// 因内容与上次逐字节相同而跳过上传的次数。
+    pub overlay_plane_upload_skips: u64,
+    /// 视频帧交接栅栏（`wait_for_gpu`）的等待时长。稳态应 <1ms；
+    /// 历史缺陷下 ≈15.5ms（`sleep` 轮询撞 15.625ms 系统时钟粒度）。
+    pub last_wait_gpu_duration: Duration,
+    pub wait_gpu_calls: u64,
+    pub slow_wait_gpu_count: u64,
     pub attached: bool,
     pub software_video_frames: u64,
     pub hardware_video_frames: u64,
@@ -1425,6 +1505,9 @@ impl Player {
         let mut engine = match VideoPlaybackEngine::open_with_decoder_resources(
             &media,
             self.config.playback,
+            // handoff 队列的实际容量：它同时是 D3D11VA 帧池下界里的消费端预留。
+            // 从这里传下去（而不是让解码器猜），队列与池深就不可能对不上。
+            self.config.video_frame_queue_capacity.max(1),
             self.decoder_resources.clone(),
         ) {
             Ok(engine) => engine,
@@ -2205,6 +2288,7 @@ fn run_playback_worker(
     let mut last_audio_observation = None;
     let mut audio_output_backpressure = AudioOutputBackpressureState::default();
     let mut buffering = PlaybackBufferingTracker::default();
+    let mut source_wait = SourceWaitBufferingTracker::default();
     let mut eof_published = false;
     let mut loop_count = 0u64;
     trace::log(format!(
@@ -2405,6 +2489,15 @@ fn run_playback_worker(
 
         if let Some(buffering) = buffering_event {
             emit_from_worker(&inner, PlayerEvent::BufferingChanged(buffering));
+        }
+
+        // 源侧「暂时读不到数据、正在等字节」（`HttpRangeSource` 的等待窗口）→
+        // 对外发缓冲态，让宿主控制条转圈而不是把这段静止当成"源已死"。
+        if let Some(waiting) = update_source_wait_buffering(
+            &mut source_wait,
+            engine.state() == PlaybackRunState::Playing,
+        ) {
+            emit_from_worker(&inner, PlayerEvent::BufferingChanged(waiting));
         }
 
         emit_video_decoder_events_from_worker(engine, &inner);
@@ -2625,6 +2718,66 @@ fn update_buffering_from_worker(
     }
     tracker.last_audio_underflow_frames = audio_snapshot.map(|snapshot| snapshot.underflow_frames);
     None
+}
+
+/// 源侧「等待字节」的轮询节流间隔。worker 在预载期以 2ms 轮询，逐轮读诊断槽
+/// （带锁 + 带宽结算）代价过高；200ms 足够让控制条的转圈提示及时出现。
+const SOURCE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 源侧等待窗口 → `BufferingChanged` 的跳变跟踪。
+#[derive(Default)]
+struct SourceWaitBufferingTracker {
+    active: bool,
+    last_poll_at: Option<Instant>,
+}
+
+/// 任一源诊断槽是否处于「读路径正在等字节」。
+///
+/// DASH 双流 video=0 / audio=1，两槽都属于本播放器；多窗口并存时槽是进程级
+/// 共享的（宿主用 `diag_trusted` 处理同一问题），最坏情况是短暂多发一次
+/// `BufferingChanged`——它只影响控制条的转圈显示，无副作用。
+fn source_transient_wait_active() -> bool {
+    (0..crate::source::SOURCE_DIAG_SLOTS)
+        .any(|slot| crate::source::source_diag_snapshot_slot(slot).transient_wait)
+}
+
+/// 把源侧「暂时读不到数据」的等待窗口转成 `BufferingChanged` 跳变
+/// （`Some(true/false)` = 跳变，`None` = 未变或未到轮询间隔）。
+///
+/// 与 [`update_buffering_from_worker`] 的 buffering **互不替代**，两者各管一段：
+/// · 那条是引擎内部饥饿（音频队列抽干 / 等首帧）驱动的：它 `clock.pause` 并把
+///   会话切进缓冲扫描，恢复要求"音频补够阈值 / 视频有可取帧"；
+/// · 这条是**源侧读失败后的等待**（`HttpRangeSource::read_range_with_transient_wait`）：
+///   数据还没回来，引擎内部那套恢复条件同样不成立，而这里要的只是"让宿主知道
+///   现在是在等数据、不是源已死"，所以只发事件、**不动时钟**（媒体位置会因音频
+///   供不上而自然停住，位置冻结由宿主策略层照常观察）。
+///
+/// `playing` 为 false（暂停/结束）时一律报"未等待"：用户主动暂停不该转圈。
+fn update_source_wait_buffering(
+    tracker: &mut SourceWaitBufferingTracker,
+    playing: bool,
+) -> Option<bool> {
+    let now = Instant::now();
+    if tracker
+        .last_poll_at
+        .is_some_and(|last| now.saturating_duration_since(last) < SOURCE_WAIT_POLL_INTERVAL)
+    {
+        return None;
+    }
+    tracker.last_poll_at = Some(now);
+    let waiting = playing && source_transient_wait_active();
+    if waiting == tracker.active {
+        return None;
+    }
+    tracker.active = waiting;
+    trace::diagnostic(
+        serde_json::json!({
+            "event": "playback_source_wait",
+            "stage": if waiting { "begin" } else { "end" },
+        })
+        .to_string(),
+    );
+    Some(waiting)
 }
 
 fn emit_video_decoder_events_from_worker(
@@ -4976,8 +5129,13 @@ mod tests {
         );
 
         // 对照：Ready + worker 就位 → 命令直发，不再排队
-        let commands =
-            install_fake_playback(&player, PlayerState::Ready, Duration::from_secs(3), 7, false);
+        let commands = install_fake_playback(
+            &player,
+            PlayerState::Ready,
+            Duration::from_secs(3),
+            7,
+            false,
+        );
         player
             .set_playback_rate(1.5)
             .expect("rate sends directly when Ready");

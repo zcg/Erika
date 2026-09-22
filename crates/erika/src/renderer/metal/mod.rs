@@ -1050,6 +1050,11 @@ impl RendererBackend for MetalRenderer {
             hdr10_metadata_failures: 0,
             hdr10_output_failures: 0,
             hdr10_output_active: false,
+            // UI 线程分段耗时（`last_present_duration` / `last_wait_gpu_duration` /
+            // 各项 `last_draw_*_duration`）是 D3D11(Windows) 后端专属观测点：
+            // Metal 的合成走 CAMetalLayer，present 语义与 WinUI 合成回调不同，
+            // 这里保持 0 而不是编造一个不同口径的数字。
+            ..Default::default()
         }
     }
 
