@@ -20,15 +20,17 @@ mod bindings {
 pub use bindings::*;
 
 pub const ERIKA_SWS_BILINEAR: std::os::raw::c_int = SwsFlags_SWS_BILINEAR as std::os::raw::c_int;
+pub const ERIKA_SWS_LANCZOS: std::os::raw::c_int = SwsFlags_SWS_LANCZOS as std::os::raw::c_int;
 pub const ERIKA_PROFILE_UNKNOWN: i32 = AV_PROFILE_UNKNOWN;
 
 #[cfg(test)]
 mod tests {
-    use super::{ERIKA_PROFILE_UNKNOWN, ERIKA_SWS_BILINEAR};
+    use super::{ERIKA_PROFILE_UNKNOWN, ERIKA_SWS_BILINEAR, ERIKA_SWS_LANCZOS};
 
     #[test]
     fn ffmpeg_812_compatibility_constants() {
         assert_eq!(ERIKA_SWS_BILINEAR, 2);
+        assert_eq!(ERIKA_SWS_LANCZOS, 512);
         assert_eq!(ERIKA_PROFILE_UNKNOWN, -99);
     }
 }
