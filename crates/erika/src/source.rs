@@ -2250,8 +2250,13 @@ fn seek_parallel_trust_nodes() -> bool {
 /// 判据（用户定的硬要求：宁慢不脏；每一条都对应一次可复核的实测）：
 ///   1. 每个节点都必须给出**文件总长**，且**全部相同** —— 否则多半不是同一个对象；
 ///   2. **`ETag` 全部存在且逐字相同**才放行。这是唯一被实测支持为"强证据"的
-///      凭据：同一 cid 的 `upos-sz-mirrorcoso1` 与 `upos-sz-mirrorcos` 给的是
-///      同一个 `"c3925abf0154d98095b824a712641d23"`，且重复请求稳定；
+///      凭据。**强在哪**：ETag 与内容的关系是**实测钉死的**——完整下载某 cid 的
+///      视频后算出的 MD5 为 `c3925abf0154d98095b824a712641d23`，与 upos 节点
+///      返回的 ETag **逐字相同**（另一代理实证；同一 cid 的
+///      `upos-sz-mirrorcoso1` 与 `upos-sz-mirrorcos` 也给出同一个
+///      `"c3925abf0154d98095b824a712641d23"`，且重复请求稳定）。因此对 B 站
+///      CDN 而言 **ETag 一致 ≈ 内容一致**：它在"下载之前"就把"几个节点是不是
+///      同一份数据"从推断升级成了可比的字节指纹；
 ///   3. `ETag` 缺失或各节点不同 → **默认作废、退回单节点**。只有用户显式设
 ///      `ERIKA_SEEK_PARALLEL_TRUST_NODES=1`（接受风险）才放行；
 ///   4. `Last-Modified`**不作为依据**（实测已证伪：同一内容在不同节点上不同）；
@@ -2259,6 +2264,11 @@ fn seek_parallel_trust_nodes() -> bool {
 ///      `dash.audio[]` 只有 `id/baseUrl/backupUrl/bandwidth/mimeType/codecs/
 ///      width/height/frameRate/sar/startWithSap/SegmentBase/codecid`，
 ///      **没有 md5/hash/checksum/size**。能用的凭据只有 HTTP 头部。
+///
+/// 注意这里的依据**止步于实测**：ETag==MD5 是 B 站 CDN 当前行为，不是 HTTP
+/// 规范承诺——所以"一致才并行"是硬门禁（宁可慢），而第 2 条之后的**下载后**
+/// 还有段间重叠逐字节比对兜底（`run_seek_fill` 的 `overlap_mismatch`），
+/// 两道闸都过了才有字节进播放流。
 ///
 /// 返回 `(裁定, 可读理由)`——理由原样进日志与诊断，现场据此核对"为什么没并行"。
 fn seek_fill_gate(probes: &[SeekFillProbe], trust_nodes: bool) -> (SeekFillVerdict, String) {
@@ -4559,13 +4569,41 @@ impl FullPreloadInner {
         let covered_end = self.start + self.store.len();
         let previous = std::mem::replace(&mut self.store, PreloadStore::Memory(Vec::new()));
         self.store = match previous {
-            PreloadStore::Disk(disk) => match disk.into_memory() {
-                Some(recovered) => PreloadStore::Memory(recovered),
-                None => {
-                    self.start = covered_end;
-                    PreloadStore::Memory(Vec::new())
+            PreloadStore::Disk(disk) => {
+                // **退化到内存也要有上限**：冷区预算默认 256MB（`WINDOW_COLD_BUDGET_DEFAULT`），
+                // 落盘失败时把整扇窗读回 RAM 就等于"把 256MB 磁盘占用换成 256MB
+                // 常驻"——而且恰好发生在磁盘已经出问题的时刻，是最不该再叠内存的时候。
+                //
+                // 阈值用 `window_cold_budget(false)` = "落盘关闭时的预算"（钳到
+                // `WINDOW_COLD_MEMORY_ONLY_MAX`）：语义一致——既然已经退化成纯内存，
+                // 就按纯内存的额度办事，不假装自己还有磁盘层。
+                //
+                // 超限时**不读回、直接丢弃**（与"读不回来"同一条路径）：读路径看到的
+                // 是一个空窗口，会从当前位置继续下载。代价是重下这一段前缀，换来内存
+                // 有界；这正是本函数原本为"文件被外部删掉"准备的行为，不是新语义。
+                let memory_only_max = window_cold_budget(false);
+                let window_bytes = disk.len();
+                let recovered = if window_bytes > memory_only_max {
+                    trace::diagnostic(
+                        serde_json::json!({
+                            "event": "preload_disk_degrade_too_large",
+                            "windowBytes": window_bytes,
+                            "memoryOnlyMaxBytes": memory_only_max,
+                        })
+                        .to_string(),
+                    );
+                    None
+                } else {
+                    disk.into_memory()
+                };
+                match recovered {
+                    Some(bytes) => PreloadStore::Memory(bytes),
+                    None => {
+                        self.start = covered_end;
+                        PreloadStore::Memory(Vec::new())
+                    }
                 }
-            },
+            }
             memory => memory,
         };
         let _ = self.store.append(bytes);
@@ -6306,8 +6344,14 @@ impl HttpRangeSource {
             done: done_rx,
             handle: Some(handle),
             // 跨节点并行回填的计数与在飞配额（见 `SeekFillDiag`）。
-            seek_fill: Arc::new(SeekFillDiag::default()),
-            seek_fill_quota: Arc::new(AtomicUsize::new(0)),
+            // **必须复用上面 spawn 读线程时创建的那两个对象**（`seek_fill` /
+            // `seek_fill_quota`）：读线程记账、`stream_seek_hint` 读自适应闸门、
+            // `diag_snapshot` 读计数——三处必须看到**同一个** `SeekFillDiag`。
+            // 这里若再 `Arc::new` 一份，log 里并行明明成功、诊断快照却是全零
+            // （测试 `seek_fill_parallel_beats_single_connection_under_throttle_*`
+            // 当场抓住；自适应闸门 `note_gain` 也随之失效）。
+            seek_fill: Arc::clone(&seek_fill),
+            seek_fill_quota: Arc::clone(&seek_fill_quota),
         });
     }
 
@@ -12937,5 +12981,398 @@ mod tests {
             filled.fill_throughput_bps,
             after_backpressure.fill_throughput_bps
         );
+    }
+
+    // =====================================================================
+    // seek 出窗的跨 CDN 节点并行回填（`run_seek_fill` 侧）
+    //
+    // 前序代理已实现全部机制；这里的测试闭环用户验收的四条：
+    //   1. 限速对照：单连接慢、并行快 → 墙钟真实缩短；
+    //   2. 并行拼接结果与单连接结果**逐字节一致**；
+    //   3. ETag 不一致 → 下载前门禁否决、退回单连接（宁慢不脏）；
+    //   4. 测试本身能失败（故障注入后应先红后绿，见各用例注释）。
+    //
+    // mock 设计：与 `spawn_streaming_mock_http_server` 同构（任意连接数、
+    // body = offset%256），但**每条连接独立限速**并可注入 ETag —— 这才能在
+    // 本地复现"单连接被限速、多节点并行叠加"的 CDN 形态。
+    // =====================================================================
+
+    /// seek 并行测试专用 mock：每条连接独立限速 + 可注入 ETag。
+    /// 返回 `(uri, 请求计数, 请求头通道)`。
+    fn spawn_seek_parallel_mock_http_server(
+        total: u64,
+        etag: &str,
+        bytes_per_sec: Option<f64>,
+    ) -> (String, Arc<AtomicU64>, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.m4s", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicU64::new(0));
+        let (sender, receiver) = mpsc::channel();
+        let etag = etag.to_string();
+        // 闭包拿走计数器的所有权；这里另留一份句柄给调用方核对请求数。
+        let requests_handle = Arc::clone(&requests);
+        thread::spawn(move || {
+            loop {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let requests = Arc::clone(&requests);
+                let sender = sender.clone();
+                let etag = etag.clone();
+                thread::spawn(move || {
+                    serve_seek_parallel_connection(
+                        stream,
+                        total,
+                        &etag,
+                        bytes_per_sec,
+                        requests,
+                        sender,
+                    );
+                });
+            }
+        });
+        (uri, requests_handle, receiver)
+    }
+
+    /// 单条连接：解析 `Range: bytes=<start>[-<end>]` → 206 + ETag + body
+    /// （内容 = `offset % 256`，与既有流式 mock 同一模式 → 拼接结果可直接与
+    /// 单连接结果逐字节断言）。
+    fn serve_seek_parallel_connection(
+        mut stream: std::net::TcpStream,
+        total: u64,
+        etag: &str,
+        bytes_per_sec: Option<f64>,
+        requests: Arc<AtomicU64>,
+        heads: mpsc::Sender<String>,
+    ) {
+        let Some((start, requested_end)) = read_range_request(&mut stream, &requests, &heads)
+        else {
+            return;
+        };
+        if start >= total {
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            return;
+        }
+        let end = requested_end.unwrap_or(total - 1).min(total - 1);
+        let declared = end - start + 1;
+        let header = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {declared}\r\nETag: \"{etag}\"\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            return;
+        }
+        if write_stream_body_throttled(&mut stream, start, declared, bytes_per_sec).is_err() {
+            return;
+        }
+        let _ = stream.flush();
+    }
+
+    /// 按 `offset % 256` 生成 body，并**按本连接累计字节 ÷ 速率**节流
+    /// （每条连接独立计时 = "CDN 按单连接限速"的本地复现；`None` = 全速）。
+    fn write_stream_body_throttled(
+        stream: &mut std::net::TcpStream,
+        mut offset: u64,
+        mut remaining: u64,
+        bytes_per_sec: Option<f64>,
+    ) -> std::io::Result<()> {
+        let Some(bps) = bytes_per_sec else {
+            return write_stream_body(stream, offset, remaining);
+        };
+        if !(bps > 0.0) {
+            return write_stream_body(stream, offset, remaining);
+        }
+        let template: Vec<u8> = (0..256u32).map(|value| value as u8).collect();
+        let block = 64 * 1024u64;
+        let mut buf = vec![0u8; block as usize];
+        let started = Instant::now();
+        let mut written: u64 = 0;
+        while remaining > 0 {
+            let n = remaining.min(block) as usize;
+            let mut pos = 0usize;
+            let mut shift = (offset % 256) as usize;
+            while pos < n {
+                let take = (n - pos).min(256 - shift);
+                buf[pos..pos + take].copy_from_slice(&template[shift..shift + take]);
+                pos += take;
+                shift = 0;
+            }
+            stream.write_all(&buf[..n])?;
+            offset += n as u64;
+            remaining -= n as u64;
+            written += n as u64;
+            // 限速：把"已写字节 ÷ 速率"的应到时刻补足（与 `ThrottledSource`
+            // 同一个线性模型；64KB 块粒度下 640KB/s ≈ 100ms 一次 sleep）。
+            let due = Duration::from_secs_f64(written as f64 / bps);
+            let elapsed = started.elapsed();
+            if due > elapsed {
+                thread::sleep(due - elapsed);
+            }
+        }
+        Ok(())
+    }
+
+    /// seek 出窗拉回一个回填窗口并计墙钟。返回 `(墙钟, 读到的字节)`。
+    ///
+    /// 先顺序读 64KB 建窗，再 `prefetch_hint(target)` 触发出窗与并行计划，
+    /// 最后从 target 起顺序读 `bytes` 字节（`read_forward` 内部逐 32KB 断言
+    /// `offset % 256` 内容模式）。墙钟从 `prefetch_hint` 起算 = 用户体感的
+    /// "松手到画面跳过去"。
+    fn seek_out_of_window_and_read(
+        source: &mut HttpRangeSource,
+        target: u64,
+        bytes: u64,
+    ) -> (Duration, Vec<u8>) {
+        // 先顺序读一段（建窗、让读线程有货；首个 64KB 后窗口已非空）。
+        let seeded = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(64 * 1024),
+            })
+            .expect("seed read");
+        assert_eq!(seeded.len(), 64 * 1024, "seed 读应一次拿满");
+        let started = Instant::now();
+        source.prefetch_hint(target);
+        let read = read_forward(source, target, bytes);
+        (started.elapsed(), read)
+    }
+
+    /// ① 限速对照 + 字节一致（端到端，真实 HTTP）：
+    /// 三个候选各限速 640KB/s，seek 出窗并行拉一个回填窗口（≈1.5MiB）；
+    /// 对照组（单候选 → 不并行）拉同一窗口。断言：
+    ///   - 并行明显更快（≈ 1/2~1/3 墙钟）；
+    ///   - 两者字节**逐字节一致**；
+    ///   - 诊断：并行批次发生、门禁放行、重叠比对通过、顺播路径零并行。
+    #[test]
+    fn seek_fill_parallel_beats_single_connection_under_throttle_and_matches_bytes() {
+        const TOTAL: u64 = 32 * 1024 * 1024;
+        const RATE_BPS: f64 = 640.0 * 1024.0; // 每连接限速（本地真机值 2 倍，比例关系不变）
+        const TARGET: u64 = 8 * 1024 * 1024;
+        const ETAG: &str = "c3925abf0154d98095b824a712641d23"; // 实测 ETag == 内容 MD5
+        let (uri_a, _, _) = spawn_seek_parallel_mock_http_server(TOTAL, ETAG, Some(RATE_BPS));
+        let (uri_b, _, _) = spawn_seek_parallel_mock_http_server(TOTAL, ETAG, Some(RATE_BPS));
+        let (uri_c, _, _) = spawn_seek_parallel_mock_http_server(TOTAL, ETAG, Some(RATE_BPS));
+
+        // ---- 并行组：3 个候选 ----
+        let mut parallel = HttpRangeSource::new(uri_a.clone()).enable_sequential_stream();
+        parallel.set_candidates(vec![
+            (uri_a.clone(), 1.0),
+            (uri_b.clone(), 0.9),
+            (uri_c.clone(), 0.8),
+        ]);
+        let (parallel_ms, parallel_bytes) =
+            seek_out_of_window_and_read(&mut parallel, TARGET, SEEK_PARALLEL_FILL_BYTES);
+        let parallel_diag = parallel.diag_snapshot();
+
+        // ---- 单连接组：同一个 mock（限速一致），但只有 1 个候选 → 不并行 ----
+        let (uri_d, _, _) = spawn_seek_parallel_mock_http_server(TOTAL, ETAG, Some(RATE_BPS));
+        let mut single = HttpRangeSource::new(uri_d.clone()).enable_sequential_stream();
+        let (single_ms, single_bytes) =
+            seek_out_of_window_and_read(&mut single, TARGET, SEEK_PARALLEL_FILL_BYTES);
+        let single_diag = single.diag_snapshot();
+
+        eprintln!(
+            "seek-fill 限速对照: 并行 3 段 = {:.0}ms，单连接 = {:.0}ms（回填 {}B @ {:.0}KB/s 每连接）",
+            parallel_ms.as_secs_f64() * 1000.0,
+            single_ms.as_secs_f64() * 1000.0,
+            SEEK_PARALLEL_FILL_BYTES,
+            RATE_BPS / 1024.0,
+        );
+
+        // ---- 断言 1：限速确实生效（单连接对照被拖慢）----
+        // 单连接应从 write_pos 起一条 open-ended Range：拉满整个回填窗口 ≈
+        // 1.5MiB ÷ 640KB/s ≈ 2.4s。低于期望的一半说明 mock 限速没生效，
+        // 整个对照实验失去意义（必须失败，不能让"并行"在假对照上自证）。
+        let single_expected = SEEK_PARALLEL_FILL_BYTES as f64 / RATE_BPS;
+        assert!(
+            single_ms.as_secs_f64() >= single_expected * 0.45,
+            "单连接对照应在限速下被拖慢（期望 ≈{single_expected:.1}s，实际 {:.1}s）—— mock 限速失效，对照实验无效",
+            single_ms.as_secs_f64()
+        );
+
+        // ---- 断言 2：并行显著缩短墙钟（目标：压到 1/2 以下）----
+        assert!(
+            parallel_ms < single_ms.mul_f64(0.55),
+            "跨节点并行应将回填墙钟明显压在单连接之下：并行 {:.0}ms vs 单连接 {:.0}ms",
+            parallel_ms.as_secs_f64() * 1000.0,
+            single_ms.as_secs_f64() * 1000.0,
+        );
+
+        // ---- 断言 3：拼接字节逐字节一致（并行结果 == 单连接结果）----
+        assert_eq!(
+            parallel_bytes.len(),
+            single_bytes.len(),
+            "两种路径拿到的字节数应相同"
+        );
+        assert_eq!(
+            parallel_bytes, single_bytes,
+            "并行分段拼接结果必须与单连接拉到的那一段逐字节一致（任一字节错位/重复/缺失都会暴露）"
+        );
+        // 双重校验：再独立对一次内容模式（read_forward 已做逐块断言，这里是全量）。
+        for (i, byte) in parallel_bytes.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                ((TARGET + i as u64) % 256) as u8,
+                "偏移 {} 字节与 offset%256 模式不符",
+                TARGET + i as u64
+            );
+        }
+
+        // ---- 断言 4：诊断口径区分三形态 ----
+        // 并行组：patch 发生、门禁放行、重叠比对通过、无回退。
+        assert!(
+            parallel_diag.seek_fill_batches >= 1,
+            "并行组应至少有一次 seek 并行批次"
+        );
+        assert!(
+            parallel_diag.seek_fill_connections >= 3,
+            "并行组应建立 ≥3 条分段连接（实际 {}）",
+            parallel_diag.seek_fill_connections
+        );
+        assert_eq!(
+            parallel_diag.seek_fill_gate_denied, 0,
+            "ETag 一致场景门禁不得否决：{}",
+            parallel_diag.seek_fill_last_gate_reason
+        );
+        assert!(
+            parallel_diag.seek_fill_overlap_ok >= 1,
+            "重叠比对应至少通过一批当次批次"
+        );
+        assert_eq!(
+            parallel_diag.seek_fill_fallbacks, 0,
+            "限速对照场景不应发生回退"
+        );
+        // 对照组：只 1 个候选 → 计划恒 None → 顺播路径零并行（诊断恒 0）。
+        assert_eq!(
+            single_diag.seek_fill_batches, 0,
+            "单候选源不应产生并行批次（它走的是既有单连接路径）"
+        );
+    }
+
+    /// ② ETag 不一致 → 下载前门禁否决、退回单连接（故障注入场景）。
+    ///
+    /// 两个候选 mock **内容一致**（同一 offset%256 模式、同一 total），但
+    /// ETag 不同（`"aaa"` vs `"bbb"`）——这正是"同一份数据的两个镜像"里
+    /// 凭据对不上的情形。门禁必须在 **body 下载之前**否决（预检只有 1 字节），
+    /// 读线程回退单连接。断言：
+    ///   - 读到的字节**仍然正确**（回退路径兜住了，seek 不失败、不花屏）；
+    ///   - `seek_fill_gate_denied` 与 `seek_fill_last_gate_reason` 可读；
+    ///   - 未发生跨节点并行（`seek_fill_connections == 0`）。
+    #[test]
+    fn seek_fill_etag_mismatch_denies_parallel_and_falls_back() {
+        const TOTAL: u64 = 32 * 1024 * 1024;
+        const TARGET: u64 = 8 * 1024 * 1024;
+        // 不限速：回退到单连接后本地全速，测试快；"拒绝并行"与限速无关。
+        let (uri_a, _, _) = spawn_seek_parallel_mock_http_server(TOTAL, "aaa", None);
+        let (uri_b, _, _) = spawn_seek_parallel_mock_http_server(TOTAL, "bbb", None);
+
+        let mut source = HttpRangeSource::new(uri_a.clone()).enable_sequential_stream();
+        source.set_candidates(vec![(uri_a.clone(), 1.0), (uri_b.clone(), 0.9)]);
+        let (_elapsed, bytes) =
+            seek_out_of_window_and_read(&mut source, TARGET, SEEK_PARALLEL_FILL_BYTES);
+        let diag = source.diag_snapshot();
+
+        // 回退路径兜底：字节必须仍然正确（一个字节都不能少/错/花屏）。
+        for (i, byte) in bytes.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                ((TARGET + i as u64) % 256) as u8,
+                "ETag 不一致回退后字节错位（偏移 {}）",
+                TARGET + i as u64
+            );
+        }
+        assert_eq!(bytes.len() as u64, SEEK_PARALLEL_FILL_BYTES);
+
+        // 门禁必须否决：这正是"宁可慢，不冒险"的判据落点。
+        assert!(
+            diag.seek_fill_gate_denied >= 1,
+            "ETag 不一致必须触发下载前门禁否决（gate_denied），实际 {}",
+            diag.seek_fill_gate_denied
+        );
+        assert!(
+            diag.seek_fill_last_gate_reason.contains("ETag"),
+            "否决理由必须点名 ETag（用户要读懂「为什么没并行」）：{}",
+            diag.seek_fill_last_gate_reason
+        );
+        assert!(
+            diag.seek_fill_fallbacks >= 1,
+            "门禁否决后应记录一次回退到单连接"
+        );
+        // 未放行的批次不得建立分段连接（预检可发，但 body 分段一行都不该有）。
+        assert_eq!(
+            diag.seek_fill_connections, 0,
+            "门禁否决后不得有分段连接（body 下载前被拦截）"
+        );
+    }
+
+    /// ③ 纯函数：`seek_fill_gate` 的门禁语义（不依赖网络，最快最稳）。
+    #[test]
+    fn seek_fill_gate_requires_matching_etag_and_total() {
+        let probe = |total: Option<u64>, etag: Option<&str>| SeekFillProbe {
+            total,
+            etag: etag.map(str::to_string),
+            last_modified: None,
+            elapsed: Duration::ZERO,
+        };
+        // 全一致 → 放行。
+        let (verdict, reason) = seek_fill_gate(
+            &[probe(Some(100), Some("aaa")), probe(Some(100), Some("aaa"))],
+            false,
+        );
+        assert_eq!(verdict, SeekFillVerdict::Allow, "{reason}");
+        // ETag 不一致 → 默认否决（宁慢不脏）。
+        let (verdict, reason) = seek_fill_gate(
+            &[probe(Some(100), Some("aaa")), probe(Some(100), Some("bbb"))],
+            false,
+        );
+        assert_eq!(verdict, SeekFillVerdict::Deny, "{reason}");
+        assert!(reason.contains("ETag"), "否决理由应点名 ETag：{reason}");
+        // ETag 缺失 → 默认否决（证据不足 = 缺证据，不是"看起来像"）。
+        let (verdict, reason) = seek_fill_gate(
+            &[probe(Some(100), Some("aaa")), probe(Some(100), None)],
+            false,
+        );
+        assert_eq!(verdict, SeekFillVerdict::Deny, "{reason}");
+        // 显式 trust_nodes → 允许（用户接受风险，重叠比对兜底）。
+        let (verdict, reason) = seek_fill_gate(
+            &[probe(Some(100), Some("aaa")), probe(Some(100), Some("bbb"))],
+            true,
+        );
+        assert_eq!(verdict, SeekFillVerdict::Allow, "{reason}");
+        // 文件总长缺失 → 否决。
+        let (verdict, _) = seek_fill_gate(
+            &[probe(Some(100), Some("aaa")), probe(None, Some("aaa"))],
+            false,
+        );
+        assert_eq!(verdict, SeekFillVerdict::Deny);
+        // 总长不一致 → 否决（不是同一个对象）。
+        let (verdict, reason) = seek_fill_gate(
+            &[probe(Some(100), Some("aaa")), probe(Some(101), Some("aaa"))],
+            false,
+        );
+        assert_eq!(verdict, SeekFillVerdict::Deny, "{reason}");
+        assert!(reason.contains("总长"), "{reason}");
+        // 空 probes → 否决。
+        let (verdict, _) = seek_fill_gate(&[], false);
+        assert_eq!(verdict, SeekFillVerdict::Deny);
+    }
+
+    /// ④ 纯函数：`seek_parallel_connections` 的条数推导语义。
+    #[test]
+    fn seek_parallel_connections_derives_conn_count_from_link_rate() {
+        // 快链路（单流已够目标吞吐）→ 1（不并行，白开连接只涨请求数）。
+        assert_eq!(seek_parallel_connections(1536 * 1024, 2_000_000.0), 1);
+        // 单流 320KB/s + 1.5MiB 窗口 + 1.6s 目标 → 3 条。
+        assert_eq!(seek_parallel_connections(1536 * 1024, 320.0 * 1024.0), 3);
+        // 单流估算未知 → 默认档（SEEK_PARALLEL_DEFAULT_CONNECTIONS = 3）。
+        assert_eq!(seek_parallel_connections(1536 * 1024, 0.0), 3);
+        // 窗口太小（放不下 ≥2 个达标段）→ 1（不并行）。
+        assert_eq!(seek_parallel_connections(300 * 1024, 320_000.0), 1);
+        // 上限 4：极慢链路也不会开爆（真机教训：8 并发触发 CDN 限流惩罚）。
+        assert_eq!(seek_parallel_connections(1536 * 1024, 10_000.0), 4);
     }
 }

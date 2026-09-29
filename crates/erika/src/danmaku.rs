@@ -200,7 +200,24 @@ impl DanmakuItem {
         if self.id == 0 {
             self.id = fallback_id;
         }
-        self.font_size = sanitize_f32(self.font_size, DEFAULT_SOURCE_FONT_SIZE).max(1.0);
+        // A non-positive source font size is the **"use the app's configured
+        // size" sentinel**, and the only place that policy lives is
+        // `typography::effective_font_size` (`if source > 0.0 { scale relative to
+        // DEFAULT_SOURCE_FONT_SIZE } else { configured size }`).
+        //
+        // It used to be clamped with `.max(1.0)` here, which silently destroyed
+        // that sentinel: `sanitize_f32(0.0, …)` returns 0.0 (0 is finite), so
+        // every "use the configured size" item arrived downstream as **1.0** —
+        // and 1.0 is *positive*, so `effective_font_size` read it as a relative
+        // size and computed `configured × (1.0 / 25.0)`, i.e. 1/25 of the
+        // configured size. Self-sent danmaku (bili-rs sends `font_size: 0.0`
+        // precisely to mean "follow the user's setting") therefore rendered at
+        // **1 pixel**: the glyphs were real, but a 1px box is all you see.
+        //
+        // Keep the sentinel intact here; `effective_font_size` resolves it.
+        // NaN and negatives both land on 0.0 = the same sentinel, which is
+        // also what they resolved to before (NaN → 25 → ×1.0 → configured).
+        self.font_size = sanitize_f32(self.font_size, 0.0).max(0.0);
         self.opacity = sanitize_f32(self.opacity, 1.0).clamp(0.0, 1.0);
         Ok(self)
     }
@@ -2307,6 +2324,7 @@ impl DanmakuTextRasterizer {
         };
         let atlas_w = atlas_snapshot.width.max(1) as f32;
         let atlas_h = atlas_snapshot.height.max(1) as f32;
+
         let capacity = layout
             .items
             .iter()
@@ -2681,7 +2699,17 @@ impl PersistentGlyphAtlas {
         let glyph_width = glyph.width.min(self.width);
         let glyph_height = glyph.height;
         if self.cursor_x + glyph_width > self.width {
-            self.cursor_x = 0;
+            // 换行必须回到**预留区之后**，不是 0。
+            //
+            // `[0, SELF_BG_ATLAS_RESERVE)` 是自发言弹幕背景框的纯白像素来源
+            // （`reserve_self_bg_pixel` 填充、`append_self_background` 以
+            // `tex_rect = [0, 0, reserve/w, 1/h]` 采样）。`new()` 里
+            // `cursor_x` 从预留区之后起排就是为了"纯白像素区永远不被字形覆盖"
+            // （见本字段初始化处的注释），而这里原来写的是 `cursor_x = 0`
+            // —— 图集一旦换行，字形就从 x=0 开始排，**直接把预留区覆盖掉**。
+            // 后果：自发言弹幕的背景框采样到的不是纯白条带，而是字形像素，
+            // 框渲染成一块半透明、脏兮兮的矩形（实测现象）。
+            self.cursor_x = SELF_BG_ATLAS_RESERVE;
             self.cursor_y += self.row_height;
             self.row_height = 0;
         }
@@ -4738,6 +4766,66 @@ mod tests {
         let prepared = engine.prepare(DanmakuViewport::new(1920, 1080), 1);
 
         assert_close(prepared.items()[0].font_size, 60.0);
+    }
+
+    /// 回归：`font_size: 0.0` 是"跟随应用设置字号"的哨兵值，必须能活着到达
+    /// `effective_font_size`。
+    ///
+    /// 曾经 `DanmakuItem::normalized` 在入口 `.max(1.0)`，把 0 变成 1。而 1.0 是
+    /// **正数**，`effective_font_size` 于是把它当成"相对字号"而不是"未指定"，
+    /// 算出 `配置字号 × (1.0 / 25.0)` —— 自己发的弹幕因此以 **1 像素**渲染，
+    /// 画面上只剩一个 1px 字形撑起来的小方块。普通弹幕因为 `source = 25.0`
+    /// 恰好落在基准值上，所以一直是好的，这个 bug 才只打在自发弹幕身上。
+    ///
+    /// 断言两件事：哨兵解析出的是**配置字号本身**；且与"显式给出默认基准字号"
+    /// 的普通弹幕**完全一致**（不是接近，是一致——差一个系数就是回归）。
+    #[test]
+    fn zero_source_font_size_follows_configured_size_instead_of_collapsing() {
+        let viewport = DanmakuViewport::new(1920, 1080);
+        let config = DanmakuLayoutConfig {
+            font_size: 30.0,
+            ..DanmakuLayoutConfig::default()
+        };
+
+        let sentinel_timeline = DanmakuTimeline::new(vec![DanmakuItem {
+            font_size: 0.0,
+            is_self: true,
+            ..item(0.0, "self", DanmakuMode::Scroll)
+        }])
+        .unwrap();
+        let reference_timeline = DanmakuTimeline::new(vec![DanmakuItem {
+            font_size: DEFAULT_SOURCE_FONT_SIZE,
+            is_self: true,
+            ..item(0.0, "self", DanmakuMode::Scroll)
+        }])
+        .unwrap();
+
+        let mut sentinel_engine = DfmLayoutEngine::new(sentinel_timeline, config.clone());
+        let mut reference_engine = DfmLayoutEngine::new(reference_timeline, config);
+        let sentinel = sentinel_engine.prepare(viewport, 1);
+        let reference = reference_engine.prepare(viewport, 1);
+
+        assert_close(sentinel.items()[0].font_size, 30.0);
+        assert_close(
+            sentinel.items()[0].font_size,
+            reference.items()[0].font_size,
+        );
+    }
+
+    /// 回归：`0.0` 必须在 `DanmakuTimeline::new` 之后**仍然是 0.0**。
+    ///
+    /// 这是上面那条测试的因——`normalized()` 里的钳制一旦改回去，这条会先红。
+    /// 单独钉住入口行为，是为了让失败时能一眼看出是"哨兵被入口吃掉"还是
+    /// "下游解析策略变了"。
+    #[test]
+    fn zero_source_font_size_survives_timeline_normalization() {
+        let timeline = DanmakuTimeline::new(vec![DanmakuItem {
+            font_size: 0.0,
+            ..item(0.0, "self", DanmakuMode::Scroll)
+        }])
+        .unwrap();
+
+        assert_eq!(timeline.items()[0].font_size, 0.0);
     }
 
     #[test]
