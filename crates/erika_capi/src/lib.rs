@@ -107,7 +107,7 @@ pub struct ErikaHttpHeader {
 
 /// Extended open parameters mirroring the C header's `ErikaOpenOptions`.
 /// `http_read_ahead_bytes` of 0 uses the environment override when set,
-/// otherwise the 2 MiB default. `http_back_buffer_bytes` of 0 uses the
+/// otherwise the 4 MiB default. `http_back_buffer_bytes` of 0 uses the
 /// 16 MiB rewind-budget default.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

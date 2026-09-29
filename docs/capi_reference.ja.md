@@ -158,7 +158,7 @@ GET、prefetch request に使用されます。
 `options` に NULL を指定するとすべて既定値になります。`http_read_ahead_bytes` は
 このリクエストの HTTP(S) 先読みウィンドウ（バイト）を上書きします。`0` は
 プロセス全体の環境変数 `ERIKA_HTTP_READAHEAD_BYTES` があればその値を使い、
-なければ 2 MiB の既定値を使います。明示的な非ゼロ値は環境変数より優先されます。
+なければ 4 MiB の既定値を使います。明示的な非ゼロ値は環境変数より優先されます。
 `http_back_buffer_bytes` は HTTP(S) のリワインドバジェット（バイト）を上書きします。
 これは再生位置より後に保持される既読データ量で、この範囲内の巻き戻しはネットワーク
 要求なしに処理されます。`0` は 16 MiB の既定値。高ビットレートのメディアでは
@@ -172,7 +172,7 @@ GET、prefetch request に使用されます。
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
-  uint64_t http_read_ahead_bytes;   /* 0 = 環境変数、なければ 2 MiB */
+  uint64_t http_read_ahead_bytes;   /* 0 = 環境変数、なければ 4 MiB */
   uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB のリワインドバジェット */
   uint64_t reserved[2];             /* ゼロでなければなりません */
 } ErikaOpenOptions;

@@ -5744,19 +5744,31 @@ fn host_of(uri: &str) -> &str {
 
 impl HttpRangeSource {
     /// 视频/单流默认 read-ahead 窗口。**2MB → 4MB（2026-09-03）**：对齐
-    /// PiliPlus 的 mpv `demuxer-max-bytes` 默认 4 MiB
-    /// （`lib/utils/storage_pref.dart:825-841`，`Pref.bufferSize = 4.0`）。
+    /// PiliPlus **设置的** mpv `demuxer-max-bytes`（`lib/utils/storage_pref.dart:829-838`，
+    /// `Pref.bufferSize` 默认 4.0——那是 PiliPlus 主动写入的取值，不是 mpv
+    /// 自身的默认值，`initBuffer()` 里前后向都设成它）。
     /// 2MB 对 1080P（约 3 Mbps）只有约 5.3 秒缓冲，PiliPlus 有约 11 秒
     /// ——**缓冲深度差一倍是它比我们能扛抖动的直接原因**（对照研究见
     /// bili-rs `research_report_cdn_switch_vs_piliplus.md`）。4MB 让策略层
     /// 的 2 秒饥饿线不再被常规 CDN 抖动顶到；`spawn_prefetch_window` 的
     /// `window_cap` 会真正执行该上限，窗口不会无界增长。代价仅常驻 +2MB。
     /// 可用 `ERIKA_HTTP_READAHEAD_BYTES` 覆盖。
+    ///
+    /// ⚠️ **刻意与上游不同，合并时不要改回 2 MiB**：`origin/main` 的同名常量
+    /// 是 2 MiB（且上游没有一行注释说明它的来历）。回退到 2 MiB 等于把上面
+    /// 那条对照研究的结论丢掉——抗抖动能力砍一半。宿主若自行设
+    /// `ERIKA_HTTP_READAHEAD_BYTES` 或逐请求传 `http_read_ahead_bytes`，本值
+    /// 不会生效（bili-rs 两者都设）。
     const DEFAULT_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
-    /// 后向缓冲默认大小（对齐 mpv `--demuxer-max-back-bytes` 默认 4MB，
-    /// 与 PiliPlus `Pref.bufferSize` 默认一致）。可用环境变量
-    /// `ERIKA_HTTP_BACK_BYTES` 覆盖。
-    const DEFAULT_BACK_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
+    /// 后向缓冲默认大小。**4MB → 16MB（2026-09-29，对齐上游）**：mpv 默认保留
+    /// 50 MiB 后向缓冲（`--demuxer-max-back-bytes`），VLC 复用 3×4 MiB ring，
+    /// 16 MiB 取两者之间，覆盖 ~13 Mbps 下的 10 秒回退。本地原值 4 MiB 照抄的
+    /// 是 PiliPlus 的取值（它把前向/后向都设成 `Pref.bufferSize`=4.0，那是移动端
+    /// 省内存的取舍），并不是 mpv 自身的默认——桌面端内存不紧，16 MiB 让往回拖
+    /// 不再动辄走网络。代价是每个源常驻 +12 MiB。
+    /// 可用环境变量 `ERIKA_HTTP_BACK_BYTES` 覆盖；宿主也可按码率显式传
+    /// `http_back_buffer_bytes`（71 Mbps 下 -10 秒覆盖 ~89 MB）。
+    const DEFAULT_BACK_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
     /// 顺序预取/窗口外 seek 的目标预取统一用小段 256KB：慢网络（实测
     /// ~1MB/s 级，均摊到 N 段后单段吞吐更低）下大段（2MB+）join 必超时 →
     /// read 放弃预取段走同步 fetch → 缓存窗口退化成同步小步拉取（一顿一顿
@@ -11956,13 +11968,17 @@ mod tests {
         // 之后，回拖到很久以前的已缓冲区间：
         //   ① 必须 **0 个新网络请求**（字节来自磁盘冷区，而不是网络）；
         //   ② 读回的字节必须与原始字节**完全一致**（错位 = 静默数据损坏）。
-        const TOTAL: u64 = 24 * 1024 * 1024;
+        // 总长与前进量都按后向窗口推算，不写死 16MB：后向窗口默认值 4MB → 16MB
+        // 之后，"前进 16MB 就必然把早期区间淘汰出热区"这条前提不再成立
+        // （实测：冷区 0 字节）。
+        const TOTAL: u64 = HttpRangeSource::DEFAULT_BACK_BUFFER_BYTES * 4;
+        const FORWARD: u64 = HttpRangeSource::DEFAULT_BACK_BUFFER_BYTES * 2;
         let dir = preload_test_dir("cold-seek-back");
         let (uri, requests, _heads) = spawn_streaming_mock_http_server(TOTAL, None);
         let (mut source, state) = streaming_source_with_cold_tier(uri, &dir);
 
-        // 往前播 16MB：远超后向窗口（默认 4MB）→ 早期区间被淘汰进冷区。
-        read_forward(&mut source, 0, 16 * 1024 * 1024);
+        // 往前播 2 倍后向窗口：远超回看预算 → 早期区间被淘汰进冷区。
+        read_forward(&mut source, 0, FORWARD);
         // 冷区写入是异步的（归档线程），等它把交接块落完。
         let cold_ready = Instant::now();
         while state.cold_bytes() == 0 && cold_ready.elapsed() < Duration::from_secs(5) {
@@ -11970,8 +11986,14 @@ mod tests {
         }
         let cold_bytes = state.cold_bytes();
         let forward_requests = requests.load(Ordering::Relaxed);
-        println!("cold-tier: 前向 16MB 后 → 请求 {forward_requests} 个，冷区 {cold_bytes} 字节");
-        assert!(cold_bytes > 0, "16MB 前向播放必须把早期区间淘汰进冷区");
+        println!(
+            "cold-tier: 前向 {}MB 后 → 请求 {forward_requests} 个，冷区 {cold_bytes} 字节",
+            FORWARD / (1024 * 1024)
+        );
+        assert!(
+            cold_bytes > 0,
+            "前向播过 2 倍后向窗口后，早期区间必须被淘汰进冷区"
+        );
         assert!(
             state.covers(0, 64 * 1024),
             "最早期的那一块必须真的在冷区里（覆盖下界 = 0）"
@@ -12614,10 +12636,14 @@ mod tests {
         // **判决实验（假说 D）的仪器自检**：请求起点序列必须能把
         // "断点续传"（服务端/传输侧断了我们）与"demux 跳读"（与 CDN 无关）
         // 分开。判据：Contiguous = 断点续；Backward/ForwardJump = 在 seek。
-        const TOTAL: u64 = 16 * 1024 * 1024;
+        // 总长必须显著大于后向窗口，否则"回拖到窗口之外"这个前提会失效：
+        // 后向窗口默认值 4MB → 16MB 后，原来"前进 9MB 再回拖到 0"已落在窗口内，
+        // backward_jump 不再被计数（实测 backward=0）。
+        const TOTAL: u64 = HttpRangeSource::DEFAULT_BACK_BUFFER_BYTES * 4;
+        const FORWARD: u64 = HttpRangeSource::DEFAULT_BACK_BUFFER_BYTES * 2;
         let (uri, requests, _heads) = spawn_cutting_mock_http_server(TOTAL, 1024 * 1024);
         let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
-        read_forward(&mut source, 0, 9 * 1024 * 1024);
+        read_forward(&mut source, 0, FORWARD);
         let snapshot = source.diag_snapshot();
         println!(
             "journal: contiguous={} forward={} backward={} last_start={} last_conn={}KB max_conn={}KB requests={}",

@@ -976,7 +976,7 @@ class ErikaPlayer {
   ///
   /// [httpReadAheadBytes] overrides the HTTP(S) read-ahead window for this
   /// open. Null or zero uses `ERIKA_HTTP_READAHEAD_BYTES` when set, otherwise
-  /// the native 2 MiB default. Local files ignore the value.
+  /// the native 4 MiB default. Local files ignore the value.
   Future<void> open(
     String uri, {
     Map<String, String>? httpHeaders,

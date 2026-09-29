@@ -608,7 +608,7 @@ fn required_u64(args: &Map<String, Value>, name: &str) -> Result<u64, String> {
 }
 
 /// Parses the optional `httpReadAheadBytes` open argument. 0 / missing keeps
-/// the default resolution (environment override, then 2 MiB); negative or
+/// the default resolution (environment override, then 4 MiB); negative or
 /// fractional values are rejected because they cannot be a byte count.
 fn optional_read_ahead_bytes(args: &Map<String, Value>) -> Result<u64, String> {
     let Some(value) = args.get("httpReadAheadBytes") else {

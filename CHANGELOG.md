@@ -17,6 +17,12 @@
   16 MiB default). Hosts playing high-bitrate media should size it from the
   bitrate: a -10 s skip at 71 Mbps covers ~89 MB, which the fixed default
   could not hold.
+- The video/single-stream read-ahead default is 4 MiB in this repository
+  (upstream uses 2 MiB). 4 MiB matches the value PiliPlus writes for mpv's
+  `demuxer-max-bytes`; a 2 MiB window holds only ~5.3 s of 1080P, and the
+  measured two-fold buffer-depth gap is why this core rides out CDN jitter
+  where a shallower window does not. Hosts that set
+  `ERIKA_HTTP_READAHEAD_BYTES` or pass `http_read_ahead_bytes` are unaffected.
 - Capped synchronous HTTP(S) range requests at 4 MiB so a large window no longer demands
   unrealistic sustained bandwidth (a single 32 MiB request needed ~18 Mbps to
   survive ureq's 15 s body deadline); failed background work degrades to

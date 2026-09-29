@@ -134,7 +134,7 @@ this.player.open('https://example.com/video.mp4', {
 
 Headers are used for HEAD, Range GET, and prefetch requests. A positive
 `httpReadAheadBytes` overrides `ERIKA_HTTP_READAHEAD_BYTES`; zero or omission
-uses that environment variable when set, otherwise the 2 MiB default. These
+uses that environment variable when set, otherwise the 4 MiB default. These
 options are ignored for local files.
 
 The package is licensed under MPL-2.0. See `THIRD_PARTY_NOTICES.md` for the

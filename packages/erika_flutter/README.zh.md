@@ -239,7 +239,7 @@ await player.open(
 ```
 
 正数会覆盖 `ERIKA_HTTP_READAHEAD_BYTES`；null 或 0 会优先采用该环境变量，未设置时使用
-native 的 2 MiB 默认值。本地文件忽略此参数。0.1.7 或更早的 native library 不包含新的
+native 的 4 MiB 默认值。本地文件忽略此参数。0.1.7 或更早的 native library 不包含新的
 options 入口，因此请求预读调参时会抛出明确错误，而不会静默丢弃设置。
 
 ## Output Mode

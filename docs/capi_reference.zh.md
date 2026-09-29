@@ -178,7 +178,7 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 `erika_open_with_options` 是 `erika_open_with_headers` 的超集：通过 `ErikaOpenOptions`
 结构体把请求头数组与逐请求调参打包在一起。`options` 传 NULL 表示全部使用默认值。
 `http_read_ahead_bytes` 覆盖本次请求的 HTTP(S) 预读窗口（字节）。`0` 会优先采用进程级
-环境变量 `ERIKA_HTTP_READAHEAD_BYTES`，未设置时使用 2 MiB 默认值；显式非零值优先于
+环境变量 `ERIKA_HTTP_READAHEAD_BYTES`，未设置时使用 4 MiB 默认值；显式非零值优先于
 该环境变量。
 `http_back_buffer_bytes` 覆盖 HTTP(S) 回看预算（字节）——即播放位置之后保留多少已播
 数据，落在这个范围内的回退不需要发起网络请求。`0` 使用 16 MiB 默认值；播放高码率
@@ -190,7 +190,7 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
-  uint64_t http_read_ahead_bytes;   /* 0 = 环境变量，否则 2 MiB */
+  uint64_t http_read_ahead_bytes;   /* 0 = 环境变量，否则 4 MiB */
   uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB 回看预算 */
   uint64_t reserved[2];             /* 必须为零 */
 } ErikaOpenOptions;

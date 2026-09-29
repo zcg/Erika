@@ -251,7 +251,7 @@ await player.open(
 ```
 
 正の値は `ERIKA_HTTP_READAHEAD_BYTES` を上書きします。null または 0 の場合は、環境変数が
-あればその値を、なければ native の 2 MiB 既定値を使います。local file では無視されます。
+あればその値を、なければ native の 4 MiB 既定値を使います。local file では無視されます。
 0.1.7 以前の native library には options entry point がないため、この設定を指定すると
 黙って破棄せず、説明付きの error を throw します。
 

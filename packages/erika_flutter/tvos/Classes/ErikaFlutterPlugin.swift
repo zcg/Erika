@@ -222,7 +222,7 @@ private struct ErikaHttpHeader {
 }
 
 /// Mirrors the C `ErikaOpenOptions`: headers plus per-request tuning.
-/// `httpReadAheadBytes` of 0 uses the environment override, then 2 MiB.
+/// `httpReadAheadBytes` of 0 uses the environment override, then 4 MiB.
 private struct ErikaOpenOptions {
   var headers: UnsafeRawPointer?
   var headerCount: UInt = 0

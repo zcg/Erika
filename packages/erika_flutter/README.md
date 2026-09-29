@@ -332,7 +332,7 @@ await player.open(
 ```
 
 A positive value overrides `ERIKA_HTTP_READAHEAD_BYTES`. Null or zero uses that
-environment variable when set, otherwise the native 2 MiB default. Local files
+environment variable when set, otherwise the native 4 MiB default. Local files
 ignore this option. A native library from 0.1.7 or earlier does not export the
 options entry point, so requesting read-ahead with one throws a descriptive
 error instead of silently dropping the setting.

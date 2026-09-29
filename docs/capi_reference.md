@@ -198,7 +198,7 @@ takes microseconds.
 tuning. A `NULL` `options` pointer means defaults. `http_read_ahead_bytes`
 overrides the HTTP(S) read-ahead window in bytes for this request. `0` uses the
 process-wide `ERIKA_HTTP_READAHEAD_BYTES` override when it is set, otherwise
-the 2 MiB default; an explicit non-zero value supersedes the environment.
+the 4 MiB default; an explicit non-zero value supersedes the environment.
 `http_back_buffer_bytes` overrides the HTTP(S) rewind budget in bytes — how
 much already-played data stays cached so a rewind inside it is served without
 a network request. `0` uses the 16 MiB default; hosts playing high-bitrate
@@ -212,7 +212,7 @@ HTTP(S) playback; local files ignore them.
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
-  uint64_t http_read_ahead_bytes;   /* 0 = environment override, then 2 MiB */
+  uint64_t http_read_ahead_bytes;   /* 0 = environment override, then 4 MiB */
   uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB rewind budget */
   uint64_t reserved[2];             /* must be zero */
 } ErikaOpenOptions;
