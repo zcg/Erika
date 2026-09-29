@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.0
+
+- Added headless GIF export through the native Erika runtime.
+- Added Dolby Vision RPU mapping and a libplacebo-style HDR tone/gamut pipeline.
+- Improved HTTP(S) streaming with persistent prefetch, resumable range reads,
+  and a host-tunable rewind cache.
+- Updated the native artifacts and checksums for the matching v0.2.0 release.
+
 ## 0.1.9
 
 - Published the Flutter package with the matching v0.1.9 native artifacts.

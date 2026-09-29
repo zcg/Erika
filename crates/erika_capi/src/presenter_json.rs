@@ -117,7 +117,8 @@ unsafe fn invoke(
                 headers: headers.headers.as_ptr(),
                 header_count: headers.headers.len(),
                 http_read_ahead_bytes: optional_read_ahead_bytes(args)?,
-                reserved: [0; 3],
+                http_back_buffer_bytes: 0,
+                reserved: [0; 2],
             };
             call_status(unsafe {
                 erika_presenter_open_with_options(handle, uri.as_ptr(), &options)

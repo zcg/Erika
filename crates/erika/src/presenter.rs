@@ -42,6 +42,7 @@ use crate::danmaku::{
 };
 use crate::debug_hud::{DebugHud, DebugHudSnapshot};
 use crate::ffmpeg::DecoderBackend;
+use crate::luma_stats::LumaSmoother;
 #[cfg(target_env = "ohos")]
 use crate::ohos::ohaudio::{OHAudioOutput, OHAudioOutputConfig};
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
@@ -452,6 +453,11 @@ pub struct PresenterRuntime {
     current_danmaku_prepared: Option<CurrentDanmakuPrepared>,
     danmaku_plan_replacement_pending: bool,
     rejected_video_import_route: Option<RejectedVideoImportRoute>,
+    /// Rolling scene-average luminance (HDR10 without DoVi L1), injected
+    /// into each software frame's `scene_avg_nits` to drive the tone-map
+    /// pivot like Dolby Vision L1 would.
+    scene_luma_smoother: LumaSmoother,
+    last_scene_luma_generation: u64,
     current_media_time: Duration,
     current_generation: u64,
     current_surface_metrics: Option<SurfaceMetrics>,
@@ -540,6 +546,33 @@ fn should_reject_video_import(
     candidate: RejectedVideoImportRoute,
 ) -> bool {
     rejected == Some(candidate)
+}
+
+/// Measure the scene-average luminance of an HDR10 (PQ, no Dolby Vision L1)
+/// software-decoded frame and fold it into `smoother`, returning the smoothed
+/// average in nits. Hardware frames (no CPU plane) and non-HDR10 sources keep
+/// the previous estimate (`None` when nothing is known yet). The luma plane is
+/// sampled in place with its native stride — no frame repack happens here.
+fn measure_frame_scene_avg(frame: &PlayerVideoFrame, smoother: &mut LumaSmoother) -> Option<f32> {
+    use crate::core::TransferFunction;
+    use crate::luma_stats::{measure_luma_plane_view, pq_code_to_nits};
+    use crate::renderer::pipeline::ColorRange;
+    // Hardware payloads have no CPU plane to sample.
+    let decoded = frame.frame.decoded_frame()?;
+    // Only PQ (HDR10) sources. When the RPU already carries L1 brightness,
+    // prefer that over measuring the base layer.
+    if decoded.transfer_function() != TransferFunction::Pq {
+        return None;
+    }
+    if decoded.dovi_metadata().and_then(|dovi| dovi.l1).is_some() {
+        return None;
+    }
+    let full_range = matches!(decoded.color_range(), ColorRange::Full);
+    let plane = decoded.luma_plane_view()?;
+    let measured = measure_luma_plane_view(&plane, full_range)?;
+    let (avg_pq, _max_pq) = smoother.push(measured);
+    let nits = pq_code_to_nits(avg_pq);
+    (nits.is_finite() && nits > 0.0).then_some(nits)
 }
 
 fn should_report_video_frame_backpressure(drop_count: u64) -> bool {
@@ -915,6 +948,8 @@ impl PresenterRuntime {
             current_danmaku_prepared: None,
             danmaku_plan_replacement_pending: false,
             rejected_video_import_route: None,
+            scene_luma_smoother: LumaSmoother::new(),
+            last_scene_luma_generation: 0,
             current_media_time: Duration::ZERO,
             current_generation: 1,
             current_surface_metrics: None,
@@ -1621,6 +1656,25 @@ impl PresenterRuntime {
     }
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
+        self.render_tick_with_presentation_time(time_seconds, None)
+    }
+
+    /// Render using the display's target instant, independent of queue/pump
+    /// latency. This only samples the shared playback clock; it never advances
+    /// or re-anchors that clock, including while paused or after a seek.
+    pub fn render_tick_at(
+        &mut self,
+        time_seconds: f64,
+        presentation_time: Instant,
+    ) -> Result<PresenterStats> {
+        self.render_tick_with_presentation_time(time_seconds, Some(presentation_time))
+    }
+
+    fn render_tick_with_presentation_time(
+        &mut self,
+        time_seconds: f64,
+        presentation_time: Option<Instant>,
+    ) -> Result<PresenterStats> {
         if self.audio_only_tick_active {
             if self.resume_pending {
                 self.try_resume_video_decode();
@@ -1675,7 +1729,7 @@ impl PresenterRuntime {
         self.last_audio_pump_duration = audio_started.elapsed();
 
         let sync_started = Instant::now();
-        let _snapshot = self.sync_media_time_from_player();
+        let _snapshot = self.sync_media_time_from_player_at(presentation_time);
         self.last_clock_sync_duration = sync_started.elapsed();
 
         let plan_started = Instant::now();
@@ -2482,9 +2536,20 @@ impl PresenterRuntime {
                 break;
             }
             match self.video_frames.try_recv() {
-                Ok(frame) => {
+                Ok(mut frame) => {
                     if frame.generation != self.player.playback_generation() {
                         continue;
+                    }
+                    if frame.generation != self.last_scene_luma_generation {
+                        // New playback: start the smoothing state fresh so a
+                        // seek cannot carry the old scene's brightness over.
+                        self.scene_luma_smoother.reset();
+                        self.last_scene_luma_generation = frame.generation;
+                    }
+                    if let Some(scene_avg) =
+                        measure_frame_scene_avg(&frame, &mut self.scene_luma_smoother)
+                    {
+                        frame.scene_avg_nits = Some(scene_avg);
                     }
                     #[cfg(target_os = "android")]
                     let mediacodec_surface = frame.frame.is_mediacodec();
@@ -2582,66 +2647,56 @@ impl PresenterRuntime {
                                 reason: error.to_string(),
                             };
                             trace::diagnostic(failure.structured_message());
-                            if matches!(
-                                frame.decode_backend,
-                                DecoderBackend::MediaCodec
-                                    | DecoderBackend::Software
-                                    | DecoderBackend::VideoToolbox
-                                    | DecoderBackend::AvCodec
-                            ) {
-                                self.rejected_video_import_route = Some(import_route);
-                                // The decoder transition must not race a local
-                                // frame, queued frames, or the Android recovery
-                                // renderer's retained current payload.
-                                drop(frame);
-                                let quiesced =
-                                    match self.quiesce_frame_output("video_import_failure") {
-                                        Ok(quiesced) => quiesced,
-                                        Err(error) => {
-                                            trace::diagnostic(
-                                                serde_json::json!({
-                                                    "event": "video_frame_import_feedback_failed",
-                                                    "backend": import_route.backend.as_str(),
-                                                    "stage": "quiesce",
-                                                    "reason": error.to_string(),
-                                                })
-                                                .to_string(),
-                                            );
-                                            break;
-                                        }
-                                    };
-                                self.release_current_video_frame();
-                                self.drain_pending_video_frames();
-                                if let Err(report_error) =
-                                    self.player.report_video_frame_import_failure(failure)
-                                {
+                            self.rejected_video_import_route = Some(import_route);
+                            // The decoder transition must not race a local
+                            // frame, queued frames, or the Android recovery
+                            // renderer's retained current payload.
+                            drop(frame);
+                            let quiesced = match self.quiesce_frame_output("video_import_failure") {
+                                Ok(quiesced) => quiesced,
+                                Err(error) => {
                                     trace::diagnostic(
                                         serde_json::json!({
                                             "event": "video_frame_import_feedback_failed",
                                             "backend": import_route.backend.as_str(),
-                                            "reason": report_error.to_string(),
-                                        })
-                                        .to_string(),
-                                    );
-                                }
-                                if let Err(error) = self.finish_frame_output_transition(
-                                    "video_import_failure",
-                                    quiesced,
-                                    false,
-                                ) {
-                                    trace::diagnostic(
-                                        serde_json::json!({
-                                            "event": "video_frame_import_feedback_failed",
-                                            "backend": import_route.backend.as_str(),
-                                            "stage": "transition_finish",
+                                            "stage": "quiesce",
                                             "reason": error.to_string(),
                                         })
                                         .to_string(),
                                     );
+                                    break;
                                 }
-                                break;
+                            };
+                            self.release_current_video_frame();
+                            self.drain_pending_video_frames();
+                            if let Err(report_error) =
+                                self.player.report_video_frame_import_failure(failure)
+                            {
+                                trace::diagnostic(
+                                    serde_json::json!({
+                                        "event": "video_frame_import_feedback_failed",
+                                        "backend": import_route.backend.as_str(),
+                                        "reason": report_error.to_string(),
+                                    })
+                                    .to_string(),
+                                );
                             }
-                            eprintln!("Erika presenter video import failed: {error}");
+                            if let Err(error) = self.finish_frame_output_transition(
+                                "video_import_failure",
+                                quiesced,
+                                false,
+                            ) {
+                                trace::diagnostic(
+                                    serde_json::json!({
+                                        "event": "video_frame_import_feedback_failed",
+                                        "backend": import_route.backend.as_str(),
+                                        "stage": "transition_finish",
+                                        "reason": error.to_string(),
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                            break;
                         }
                     }
                 }
@@ -2831,11 +2886,27 @@ impl PresenterRuntime {
     }
 
     fn sync_media_time_from_player(&mut self) -> PlaybackSnapshot {
+        self.sync_media_time_from_player_at(None)
+    }
+
+    fn sync_media_time_from_player_at(
+        &mut self,
+        presentation_time: Option<Instant>,
+    ) -> PlaybackSnapshot {
         // One lock for time + generation + state. Danmaku, subtitles and the
         // render context all derive from this single sample, so a frame can
         // never mix a stale media time with a newer play state.
         let snapshot = self.player.playback_snapshot();
-        let player_time = snapshot.media_time();
+        self.apply_playback_snapshot(&snapshot, presentation_time);
+        snapshot
+    }
+
+    fn apply_playback_snapshot(
+        &mut self,
+        snapshot: &PlaybackSnapshot,
+        presentation_time: Option<Instant>,
+    ) {
+        let player_time = snapshot.media_time_at(presentation_time.unwrap_or_else(Instant::now));
         self.current_generation = self
             .current_generation
             .max(snapshot.generation)
@@ -2878,7 +2949,6 @@ impl PresenterRuntime {
             None,
             0,
         );
-        snapshot
     }
 
     fn refresh_current_overlay(&mut self) {
@@ -4601,6 +4671,71 @@ fn append_text_subtitles_debug(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "ios")]
+    #[test]
+    fn ios_display_target_samples_one_clock_for_visuals_and_preserves_commands() {
+        use crate::core::PlayerState;
+        use crate::playback::PlaybackClock;
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let origin = Instant::now();
+        let mut snapshot = PlaybackSnapshot {
+            clock: PlaybackClock::running_at(Duration::from_secs(10), origin),
+            generation: 2,
+            state: PlayerState::Playing,
+        };
+        presenter.current_overlay = Some(OverlayFrame {
+            pts: Duration::ZERO,
+            viewport: OverlayViewport::new(640, 360),
+            subtitle_planes: vec![],
+            subtitle_alpha_planes: vec![],
+            subtitle_changed: false,
+        });
+        // Replaying the same display target after other work must not move it.
+        for hz in [60.0, 120.0] {
+            for frame in 1..=6 {
+                let elapsed = Duration::from_secs_f64(frame as f64 / hz);
+                let target = origin + elapsed;
+                presenter.apply_playback_snapshot(&snapshot, Some(target));
+                assert_eq!(
+                    presenter.current_media_time,
+                    Duration::from_secs(10) + elapsed
+                );
+                let before = presenter.current_media_time;
+                presenter.apply_playback_snapshot(&snapshot, Some(target));
+                assert_eq!(presenter.current_media_time, before);
+                assert_eq!(presenter.current_overlay.as_ref().unwrap().pts, before);
+                assert_eq!(presenter.current_generation, 2);
+            }
+        }
+        // Pause and both long and short seeks retain the authoritative epoch.
+        snapshot.clock.pause(origin + Duration::from_millis(100));
+        snapshot.state = PlayerState::Paused;
+        for (generation, position_ms) in [(3, 20000), (4, 8000), (5, 8100), (6, 8000)] {
+            snapshot
+                .clock
+                .seek(Duration::from_millis(position_ms), origin);
+            snapshot.generation = generation;
+            presenter.apply_playback_snapshot(&snapshot, Some(origin + Duration::from_secs(2)));
+            assert_eq!(
+                presenter.current_media_time,
+                Duration::from_millis(position_ms)
+            );
+            assert_eq!(presenter.current_generation, generation);
+        }
+        for rate in [0.5, 1.0, 2.0] {
+            snapshot.clock = PlaybackClock::running_at(Duration::from_secs(8), origin);
+            snapshot.clock.set_rate(rate, origin);
+            snapshot.state = PlayerState::Playing;
+            presenter.apply_playback_snapshot(&snapshot, Some(origin + Duration::from_secs(1)));
+            assert_eq!(
+                presenter.current_media_time,
+                Duration::from_secs_f64(8.0 + rate)
+            );
+            assert_eq!(snapshot.clock.media_time_at(origin), Duration::from_secs(8));
+        }
+    }
 
     #[cfg(feature = "wgpu")]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

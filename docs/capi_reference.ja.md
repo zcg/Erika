@@ -159,16 +159,22 @@ GET、prefetch request に使用されます。
 このリクエストの HTTP(S) 先読みウィンドウ（バイト）を上書きします。`0` は
 プロセス全体の環境変数 `ERIKA_HTTP_READAHEAD_BYTES` があればその値を使い、
 なければ 2 MiB の既定値を使います。明示的な非ゼロ値は環境変数より優先されます。
+`http_back_buffer_bytes` は HTTP(S) のリワインドバジェット（バイト）を上書きします。
+これは再生位置より後に保持される既読データ量で、この範囲内の巻き戻しはネットワーク
+要求なしに処理されます。`0` は 16 MiB の既定値。高ビットレートのメディアでは
+ビットレートから値を決めるのが推奨です（約 15 秒 × ビットレート。71 Mbps での
+-10 秒は約 89 MB に相当）。
 `reserved` の非ゼロ値は拒否され、
 将来のフィールド追加が古いホストの動作を黙って変えないようになっています。
-先読みウィンドウは HTTP(S) 再生にのみ影響し、ローカルファイルには無効です。
+これらのパラメータは HTTP(S) 再生にのみ影響し、ローカルファイルには無効です。
 
 ```c
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;   /* 0 = 環境変数、なければ 2 MiB */
-  uint64_t reserved[3];             /* ゼロでなければなりません */
+  uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB のリワインドバジェット */
+  uint64_t reserved[2];             /* ゼロでなければなりません */
 } ErikaOpenOptions;
 ```
 
@@ -283,7 +289,7 @@ ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float he
 
 `set_playback_rate(1.0)` が通常速度。`erika_presenter_open_with_options` は
 `erika_open_with_options` の push モデル版で、同じ `ErikaOpenOptions`
-（header と `http_read_ahead_bytes`）を受け付けます
+（header と `http_read_ahead_bytes` / `http_back_buffer_bytes`）を受け付けます
 （[`erika_open_with_options`](#erikahandle--pull-モデル) 参照）。`set_upscaler` はランタイムで神経輝度アップ
 スケーラを切り替えます（[`erika_presenter_get_upscaler_status`](#診断とスクリーンショット)
 参照）。Metal、feature level 11.0+ の D3D11、compute-capable な wgpu renderer は ArtCNN を実行し、

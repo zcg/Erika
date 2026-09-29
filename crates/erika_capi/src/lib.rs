@@ -107,14 +107,16 @@ pub struct ErikaHttpHeader {
 
 /// Extended open parameters mirroring the C header's `ErikaOpenOptions`.
 /// `http_read_ahead_bytes` of 0 uses the environment override when set,
-/// otherwise the 2 MiB default.
+/// otherwise the 2 MiB default. `http_back_buffer_bytes` of 0 uses the
+/// 16 MiB rewind-budget default.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ErikaOpenOptions {
     pub headers: *const ErikaHttpHeader,
     pub header_count: usize,
     pub http_read_ahead_bytes: u64,
-    pub reserved: [u64; 3],
+    pub http_back_buffer_bytes: u64,
+    pub reserved: [u64; 2],
 }
 
 /// Headless GIF export request. All time values are milliseconds. The call is
@@ -948,13 +950,15 @@ pub unsafe extern "C" fn erika_open_with_options(
             "fn=erika_open handle={handle:p} uri={}",
             redacted_uri(&uri)
         ));
-        let (headers, http_read_ahead_bytes) = match c_open_options(options) {
+        let (headers, http_read_ahead_bytes, http_back_buffer_bytes) = match c_open_options(options)
+        {
             Ok(parsed) => parsed,
             Err(status) => return status,
         };
         let request = MediaRequest::new(uri)
             .with_http_headers(headers)
-            .map_http_read_ahead_bytes(http_read_ahead_bytes);
+            .map_http_read_ahead_bytes(http_read_ahead_bytes)
+            .map_http_back_buffer_bytes(http_back_buffer_bytes);
         let status = status_from_player_result(handle.player.open(request));
         capi_trace(format!(
             "fn=erika_open.done handle={handle:p} status={status:?}"
@@ -1947,13 +1951,15 @@ pub unsafe extern "C" fn erika_presenter_open_with_options(
             "fn=erika_presenter_open handle={handle:p} uri={}",
             redacted_uri(&uri)
         ));
-        let (headers, http_read_ahead_bytes) = match c_open_options(options) {
+        let (headers, http_read_ahead_bytes, http_back_buffer_bytes) = match c_open_options(options)
+        {
             Ok(parsed) => parsed,
             Err(status) => return status,
         };
         let request = MediaRequest::new(uri)
             .with_http_headers(headers)
-            .map_http_read_ahead_bytes(http_read_ahead_bytes);
+            .map_http_read_ahead_bytes(http_read_ahead_bytes)
+            .map_http_back_buffer_bytes(http_back_buffer_bytes);
         let status = status_from_player_result(handle.presenter.open(request));
         retain_presenter_events_from_latest_open(handle);
         capi_trace(format!(
@@ -3789,8 +3795,51 @@ pub unsafe extern "C" fn erika_presenter_render_tick(
     time_seconds: f64,
     out_stats: *mut ErikaPresenterStats,
 ) -> ErikaStatus {
+    unsafe {
+        erika_presenter_render_tick_with_timing(handle, time_seconds, std::ptr::null(), out_stats)
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+// The legacy entry point calls this symbol even without a target. Keep that
+// reference through LTO so Apple static linking retains the optional dlsym API.
+#[inline(never)]
+pub unsafe extern "C" fn erika_presenter_render_tick_with_timing(
+    handle: *mut ErikaPresenterHandle,
+    time_seconds: f64,
+    presentation_delay_seconds: *const f64,
+    out_stats: *mut ErikaPresenterStats,
+) -> ErikaStatus {
+    // Translate the caller's relative monotonic target before taking any
+    // presenter lock or pumping audio/video, so work duration cannot move it.
+    let presentation_time = if presentation_delay_seconds.is_null() {
+        None
+    } else {
+        let delay = unsafe { *presentation_delay_seconds };
+        if !delay.is_finite() || delay.abs() > 0.25 {
+            return player_error("presentation delay must be finite and within +/-0.25 seconds");
+        }
+        let now = std::time::Instant::now();
+        let delta = std::time::Duration::from_secs_f64(delay.abs());
+        if delay >= 0.0 {
+            now.checked_add(delta)
+        } else {
+            now.checked_sub(delta)
+        }
+    };
     with_presenter_mut(handle, |handle| {
-        match handle.presenter.render_tick(time_seconds) {
+        let result = match presentation_time {
+            Some(target) => handle.presenter.render_tick_at(time_seconds, target),
+            None => handle.presenter.render_tick(time_seconds),
+        };
+        match result {
             Ok(_stats) => {
                 if !out_stats.is_null() {
                     let snapshot = handle.presenter.runtime_snapshot();
@@ -4102,19 +4151,20 @@ fn open_options_raw(headers: *const ErikaHttpHeader, header_count: usize) -> Eri
         headers,
         header_count,
         http_read_ahead_bytes: 0,
-        reserved: [0; 3],
+        http_back_buffer_bytes: 0,
+        reserved: [0; 2],
     }
 }
 
 /// Validates an `ErikaOpenOptions` at the ABI boundary. A NULL options pointer
 /// means "defaults" (no headers, default read-ahead). `http_read_ahead_bytes`
-/// of 0 also means default; reserved fields must stay zero for forward
-/// compatibility.
+/// and `http_back_buffer_bytes` of 0 also mean default; reserved fields must
+/// stay zero for forward compatibility.
 fn c_open_options(
     options: *const ErikaOpenOptions,
-) -> Result<(Vec<(String, String)>, Option<u64>), ErikaStatus> {
+) -> Result<(Vec<(String, String)>, Option<u64>, Option<u64>), ErikaStatus> {
     if options.is_null() {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, None));
     }
     let options = unsafe { &*options };
     for field in options.reserved {
@@ -4125,7 +4175,9 @@ fn c_open_options(
     }
     let headers = c_http_headers(options.headers, options.header_count)?;
     let read_ahead = (options.http_read_ahead_bytes > 0).then_some(options.http_read_ahead_bytes);
-    Ok((headers, read_ahead))
+    let back_buffer =
+        (options.http_back_buffer_bytes > 0).then_some(options.http_back_buffer_bytes);
+    Ok((headers, read_ahead, back_buffer))
 }
 
 /// Headers Erika derives itself for every request. Accepting a caller override
@@ -4961,7 +5013,10 @@ mod tests {
 
     #[test]
     fn c_open_options_accepts_null_and_defaults() {
-        assert_eq!(c_open_options(std::ptr::null()), Ok((Vec::new(), None)));
+        assert_eq!(
+            c_open_options(std::ptr::null()),
+            Ok((Vec::new(), None, None))
+        );
     }
 
     #[test]
@@ -4976,13 +5031,15 @@ mod tests {
             headers: headers.as_ptr(),
             header_count: headers.len(),
             http_read_ahead_bytes: 16 * 1024 * 1024,
-            reserved: [0; 3],
+            http_back_buffer_bytes: 0,
+            reserved: [0; 2],
         };
         assert_eq!(
             c_open_options(&options),
             Ok((
                 vec![("Accept".to_string(), "video/mp4".to_string())],
-                Some(16 * 1024 * 1024)
+                Some(16 * 1024 * 1024),
+                None
             ))
         );
 
@@ -4990,9 +5047,13 @@ mod tests {
             headers: std::ptr::null(),
             header_count: 0,
             http_read_ahead_bytes: 0,
-            reserved: [0; 3],
+            http_back_buffer_bytes: 0,
+            reserved: [0; 2],
         };
-        assert_eq!(c_open_options(&default_read_ahead), Ok((Vec::new(), None)));
+        assert_eq!(
+            c_open_options(&default_read_ahead),
+            Ok((Vec::new(), None, None))
+        );
     }
 
     #[test]
@@ -5001,7 +5062,8 @@ mod tests {
             headers: std::ptr::null(),
             header_count: 0,
             http_read_ahead_bytes: 0,
-            reserved: [1, 0, 0],
+            http_back_buffer_bytes: 0,
+            reserved: [1, 0],
         };
         assert_eq!(c_open_options(&options), Err(ErikaStatus::PlayerError));
         assert!(
@@ -5097,10 +5159,15 @@ mod tests {
         assert_eq!(options.headers, headers.as_ptr());
         assert_eq!(options.header_count, headers.len());
         assert_eq!(options.http_read_ahead_bytes, 0);
-        assert_eq!(options.reserved, [0; 3]);
+        assert_eq!(options.http_back_buffer_bytes, 0);
+        assert_eq!(options.reserved, [0; 2]);
         assert_eq!(
             c_open_options(&options),
-            Ok((vec![("Accept".to_string(), "video/mp4".to_string())], None))
+            Ok((
+                vec![("Accept".to_string(), "video/mp4".to_string())],
+                None,
+                None
+            ))
         );
     }
 

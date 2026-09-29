@@ -199,16 +199,22 @@ tuning. A `NULL` `options` pointer means defaults. `http_read_ahead_bytes`
 overrides the HTTP(S) read-ahead window in bytes for this request. `0` uses the
 process-wide `ERIKA_HTTP_READAHEAD_BYTES` override when it is set, otherwise
 the 2 MiB default; an explicit non-zero value supersedes the environment.
+`http_back_buffer_bytes` overrides the HTTP(S) rewind budget in bytes — how
+much already-played data stays cached so a rewind inside it is served without
+a network request. `0` uses the 16 MiB default; hosts playing high-bitrate
+media should size it from the bitrate (~15 s × bitrate, e.g. a -10 s skip at
+71 Mbps covers ~89 MB).
 Non-zero values in `reserved` are rejected so future fields can be added
-without silently changing behavior for older hosts. Read-ahead only affects
-HTTP(S) playback; local files ignore it.
+without silently changing behavior for older hosts. Both knobs only affect
+HTTP(S) playback; local files ignore them.
 
 ```c
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;   /* 0 = environment override, then 2 MiB */
-  uint64_t reserved[3];             /* must be zero */
+  uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB rewind budget */
+  uint64_t reserved[2];             /* must be zero */
 } ErikaOpenOptions;
 ```
 
@@ -336,7 +342,8 @@ ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float he
 
 `set_playback_rate(1.0)` is normal speed. `erika_presenter_open_with_options`
 is the push-model counterpart of `erika_open_with_options` and accepts the same
-`ErikaOpenOptions` (headers plus `http_read_ahead_bytes`; see
+`ErikaOpenOptions` (headers plus `http_read_ahead_bytes` /
+`http_back_buffer_bytes`; see
 [`erika_open_with_options`](#erikahandle--pull-model)). `set_upscaler` switches the neural
 luma upscaler at runtime (see [`erika_presenter_get_upscaler_status`](#diagnostics-and-capture));
 Metal, D3D11 feature level 11+, and compute-capable wgpu renderers execute

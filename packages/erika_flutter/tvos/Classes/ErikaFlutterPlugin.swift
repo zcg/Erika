@@ -2656,6 +2656,14 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   }
 
   private func presenterConfigForNewPlayer(arguments: Any?, hdrDebug: Bool) -> ErikaPresenterConfigC {
+    // An explicit disable must become SDR, not `auto(headroom: 1.0)`: under
+    // the per-presenting-display Auto negotiation a headroom of 1.0 means "no
+    // embedder cap, defer to the display", so an EDR display would promote
+    // again and ignore ERIKA_DISABLE_EDR.
+    let edrDisabled = boolEnvironmentFlag(
+      "ERIKA_DISABLE_EDR",
+      environment: ProcessInfo.processInfo.environment
+    )
     if let args = arguments as? [String: Any], let explicitMode = int32Value(args["outputMode"]) {
       let headroom = floatValue(args["edrHeadroom"]) ?? 4.0
       let config: ErikaPresenterConfigC
@@ -2665,7 +2673,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       case 2:
         config = ErikaPresenterConfigC(outputMode: 2, edrHeadroom: max(1.0, headroom))
       case 3:
-        config = .auto(headroom: headroom)
+        config = edrDisabled ? .sdr : .auto(headroom: headroom)
       default:
         config = .sdr
       }
@@ -2675,7 +2683,10 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       )
       return config
     }
-    let headroom = resolvedEdrHeadroom(hdrDebug: hdrDebug)
+    guard let headroom = resolvedEdrHeadroom(hdrDebug: hdrDebug) else {
+      erikaHdrLog(hdrDebug, "ERIKA_DISABLE_EDR is set; using SDR output")
+      return .sdr
+    }
     let config = ErikaPresenterConfigC.auto(headroom: headroom)
     erikaHdrLog(
       hdrDebug,
@@ -2684,11 +2695,13 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     return config
   }
 
-  private func resolvedEdrHeadroom(hdrDebug: Bool) -> Float {
+  /// EDR headroom to request for a new player, or `nil` when
+  /// `ERIKA_DISABLE_EDR` disables EDR and the player must use SDR.
+  private func resolvedEdrHeadroom(hdrDebug: Bool) -> Float? {
     let environment = ProcessInfo.processInfo.environment
     if boolEnvironmentFlag("ERIKA_DISABLE_EDR", environment: environment) {
       erikaHdrLog(hdrDebug, "EDR disabled by ERIKA_DISABLE_EDR")
-      return 1.0
+      return nil
     }
     if let override = floatEnvironmentValue("ERIKA_EDR_HEADROOM", environment: environment), override > 1.0 {
       erikaHdrLog(hdrDebug, "EDR headroom override ERIKA_EDR_HEADROOM=\(String(format: "%.3f", override))")

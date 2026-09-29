@@ -187,6 +187,10 @@ pub struct MediaRequest {
     /// (see `HttpRangeSource::DEFAULT_READ_AHEAD_BYTES`; 4 MiB in this tree,
     /// aligned with PiliPlus mpv `demuxer-max-bytes`).
     pub http_read_ahead_bytes: Option<u64>,
+    /// HTTP rewind budget in bytes: how much already-played data the source
+    /// retains behind the reader. `None` uses the 16 MiB engine default
+    /// (`HTTP_CACHE_RETAIN_BYTES`).
+    pub http_back_buffer_bytes: Option<u64>,
 }
 
 /// Hand-written so that credentials carried by custom headers (`Authorization`,
@@ -207,6 +211,7 @@ impl std::fmt::Debug for MediaRequest {
                     .collect::<Vec<_>>(),
             )
             .field("http_read_ahead_bytes", &self.http_read_ahead_bytes)
+            .field("http_back_buffer_bytes", &self.http_back_buffer_bytes)
             .finish()
     }
 }
@@ -221,6 +226,7 @@ impl MediaRequest {
             video_candidates: Vec::new(),
             audio_candidates: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
         }
     }
 
@@ -264,6 +270,19 @@ impl MediaRequest {
     /// default resolution; `Some(0)` is normalized to `None`.
     pub fn map_http_read_ahead_bytes(mut self, read_ahead_bytes: Option<u64>) -> Self {
         self.http_read_ahead_bytes = read_ahead_bytes.filter(|bytes| *bytes > 0);
+        self
+    }
+
+    /// Overrides the HTTP rewind budget in bytes. Only meaningful for HTTP(S)
+    /// sources; other source kinds ignore it. `0` is treated as `None`.
+    pub fn with_http_back_buffer_bytes(self, back_buffer_bytes: u64) -> Self {
+        self.map_http_back_buffer_bytes(Some(back_buffer_bytes))
+    }
+
+    /// Same as [`Self::with_http_back_buffer_bytes`] but `None` keeps the
+    /// default budget; `Some(0)` is normalized to `None`.
+    pub fn map_http_back_buffer_bytes(mut self, back_buffer_bytes: Option<u64>) -> Self {
+        self.http_back_buffer_bytes = back_buffer_bytes.filter(|bytes| *bytes > 0);
         self
     }
 }
@@ -509,6 +528,10 @@ pub struct PlayerVideoFrame {
     pub media_time: Duration,
     pub late_by: Option<Duration>,
     pub generation: u64,
+    /// Measured scene-average luminance (nits) attached by the presenter for
+    /// HDR10 software frames without Dolby Vision L1 metadata. `None` for
+    /// every other source; renderers fold it into the tone-map pivot.
+    pub scene_avg_nits: Option<f32>,
 }
 
 impl PlayerVideoFrame {
@@ -527,6 +550,7 @@ impl PlayerVideoFrame {
             media_time,
             late_by,
             generation,
+            scene_avg_nits: None,
         })
     }
 }
@@ -3257,6 +3281,7 @@ fn handle_playback_command(
             match failure.decode_backend {
                 DecoderBackend::MediaCodec
                 | DecoderBackend::VideoToolbox
+                | DecoderBackend::D3d11va
                 | DecoderBackend::AvCodec => {
                     if let Err(error) = engine.handle_video_frame_import_failure(&failure) {
                         fail_video_import_from_worker(
@@ -3272,7 +3297,6 @@ fn handle_playback_command(
                 DecoderBackend::Software => {
                     fail_video_import_from_worker(engine, inner, failure.structured_message());
                 }
-                DecoderBackend::D3d11va => {}
             }
         }
         PlaybackCommand::AddExternalSubtitle { config, reply } => {
@@ -4877,6 +4901,7 @@ mod tests {
             video_candidates: Vec::new(),
             audio_candidates: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
         };
         let mut engine = VideoPlaybackEngine::open(
             &request,

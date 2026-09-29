@@ -124,6 +124,8 @@ pub fn export_gif(options: &GifExportOptions) -> Result<GifExportResult> {
         });
     }
 
+    // The export walks one bounded range forward, so it keeps the engine's
+    // default rewind budget: `ErikaGifExportOptions` exposes no knob for it.
     let source = source_from_uri_with_options(
         &options.input.uri,
         options.input.source_hint,

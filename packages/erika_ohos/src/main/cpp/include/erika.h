@@ -56,12 +56,17 @@ typedef struct ErikaHttpHeader {
  * erika_presenter_open_with_options. Pass zero for fields you do not use;
  * reserved must be zero. http_read_ahead_bytes overrides the HTTP(S)
  * read-ahead window (in bytes); 0 uses ERIKA_HTTP_READAHEAD_BYTES when set,
- * otherwise the 2 MiB default. */
+ * otherwise the 2 MiB default. http_back_buffer_bytes overrides the HTTP(S)
+ * rewind budget (in bytes): how much already-played data stays cached so a
+ * rewind inside it is served without a network request; 0 uses the 16 MiB
+ * default (a -10 s skip at 71 Mbps covers ~89 MB, so hosts playing
+ * high-bitrate media should size this from the bitrate). */
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;
-  uint64_t reserved[3];
+  uint64_t http_back_buffer_bytes;
+  uint64_t reserved[2];
 } ErikaOpenOptions;
 
 /* Headless GIF export. Times are milliseconds. The function is synchronous;
@@ -810,6 +815,19 @@ ErikaStatus erika_presenter_detach_surface(ErikaPresenterHandle *handle);
 ErikaStatus erika_presenter_render_tick(
     ErikaPresenterHandle *handle,
     double time_seconds,
+    ErikaPresenterStats *out_stats);
+/* Optional display-target sampling. A non-NULL presentation_delay_seconds
+ * points to the signed seconds from call entry to the display target (e.g.
+ * CADisplayLink.targetTimestamp - CACurrentMediaTime()). It must be finite and
+ * within +/-0.25 seconds. The value is copied before native work; no pointer is
+ * retained. Danmaku, subtitles and render context sample the same playback
+ * snapshot at that target without changing the playback clock. NULL preserves
+ * render_tick's legacy sampling. Older native binaries may lack this symbol;
+ * embedders should resolve it optionally and fall back to render_tick. */
+ErikaStatus erika_presenter_render_tick_with_timing(
+    ErikaPresenterHandle *handle,
+    double time_seconds,
+    const double *presentation_delay_seconds,
     ErikaPresenterStats *out_stats);
 ErikaStatus erika_presenter_audio_only_tick(
     ErikaPresenterHandle *handle,

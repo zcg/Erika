@@ -15,7 +15,8 @@ use crate::core::{
 };
 use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
-    Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat, StreamSelection, SubtitleDecoder,
+    DoviRejectReason, Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat, StreamSelection,
+    SubtitleDecoder,
 };
 use crate::source::{
     self, source_from_uri_with_hint, source_from_uri_with_hint_and_headers_slot,
@@ -377,14 +378,15 @@ impl Drop for AsyncDemuxer {
         // （最长 30s 的段 join 超时）时才 2s 超时 detach——detach 后 demuxer 仍
         // 自包含在 demux 线程栈上、最终会安全释放，只是不阻塞 UI 线程。
         if let Some(handle) = self.handle.take() {
-            let (done_tx, done_rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = handle.join();
-                let _ = done_tx.send(());
-            });
-            let joined = done_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .is_ok();
+            // 边等边把包取走：worker 若正阻塞在 `packet_sender.send()`（队列满），
+            // 不 drain 的话这段等待会白白耗满整个超时。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                let _ = self
+                    .packets
+                    .recv_timeout(std::time::Duration::from_millis(10));
+            }
+            let joined = handle.is_finished();
             // 打点：`joined=false` 就是"demux 线程 2s 内没退、已 detach"。
             // 这条是判断"关窗卡顿到底卡在 demux 线程还是别处"的直接依据。
             trace::diagnostic(
@@ -889,6 +891,8 @@ pub struct PlaybackSession {
     audio_invalid_packets: usize,
     mediacodec_surface_disabled: bool,
     video_decoder_fallbacks: u64,
+    dolby_vision_profile: Option<u8>,
+    dovi_rpu_diagnostics: DoviRpuDiagnostics,
     video_decoder_events: VecDeque<VideoDecoderEvent>,
     queue_limits: PlaybackQueueLimits,
     buffer_recovery_audio: Duration,
@@ -1118,14 +1122,18 @@ impl PlaybackSession {
         let mut video_decoder = None;
         let mut video_decoder_fallbacks = 0u64;
         let mut video_decoder_events = VecDeque::new();
+        let mut dolby_vision_profile = None;
         let mut selected_streams = Vec::new();
         if let Some(stream_index) = selected_video_track {
             selected_streams.push(stream_index);
             let parameters = codec_parameters_for(&codec_parameters, stream_index)?;
             let codec = parameters.codec_name();
-            let decoder_config = config
+            let requested_config = config
                 .video_decode
                 .decoder_config(video_frame_queue_capacity);
+            dolby_vision_profile = parameters.dolby_vision_profile();
+            let (decoder_config, decode_fallback_reason) =
+                dolby_vision_decode_fallback(dolby_vision_profile, requested_config);
             trace::log(format!(
                 "[erika-open-trace] stage=video_decoder_open_start codec={} backend={:?}",
                 codec.as_deref().unwrap_or("?"),
@@ -1136,25 +1144,20 @@ impl PlaybackSession {
                     Ok(decoder) => {
                         let event = VideoDecoderEvent {
                             stage: video_decoder_open_stage(decoder_config).to_string(),
-                            requested_backend: decoder_config.backend,
+                            requested_backend: requested_config.backend,
                             previous_backend: None,
                             active_backend: decoder.backend(),
                             fallback_count: 0,
                             codec: codec.clone(),
                             pixel_format: None,
                             line_sizes: None,
-                            reason: None,
+                            reason: decode_fallback_reason,
                         };
                         trace::diagnostic(event.structured_message());
                         video_decoder_events.push_back(event);
                         decoder
                     }
-                    Err(error)
-                        if should_fallback_video_decoder_open_error(
-                            decoder_config.backend,
-                            codec.as_deref(),
-                        ) =>
-                    {
+                    Err(error) if should_fallback_video_decoder_error(decoder_config.backend) => {
                         let surface_error = error.to_string();
                         if decoder_config.backend == DecoderBackend::MediaCodec
                             && decoder_config.mediacodec_surface
@@ -1552,6 +1555,8 @@ impl PlaybackSession {
             audio_invalid_packets: 0,
             mediacodec_surface_disabled,
             video_decoder_fallbacks,
+            dolby_vision_profile,
+            dovi_rpu_diagnostics: DoviRpuDiagnostics::default(),
             video_decoder_events,
             queue_limits,
             buffer_recovery_audio: buffer_recovery_audio_for_request(request),
@@ -1713,8 +1718,14 @@ impl PlaybackSession {
     fn decoder_fallback_requires_replay(&self) -> bool {
         self.demux_eof
             || self.eof
-            || self.active_video_decoder_backend() == Some(DecoderBackend::VideoToolbox)
-            || self.active_video_decoder_backend() == Some(DecoderBackend::AvCodec)
+            || matches!(
+                self.active_video_decoder_backend(),
+                Some(
+                    DecoderBackend::VideoToolbox
+                        | DecoderBackend::D3d11va
+                        | DecoderBackend::AvCodec
+                )
+            )
     }
 
     fn recover_from_video_input_stall(&mut self, reason: &str) -> Result<bool> {
@@ -2051,7 +2062,15 @@ impl PlaybackSession {
     }
 
     fn seek_for_stop(&mut self, position: Duration) -> Result<()> {
-        self.seek_with_decoder_flush_inner(position, true, true, false)
+        self.seek_with_decoder_flush_inner(position, true, true, false)?;
+        self.video_frames.shrink_to_fit();
+        self.audio_frames.shrink_to_fit();
+        self.subtitle_frames.shrink_to_fit();
+        self.pending_video_packets.shrink_to_fit();
+        for external in &mut self.external_subtitles {
+            external.frames.shrink_to_fit();
+        }
+        Ok(())
     }
 
     fn seek_with_decoder_flush(
@@ -3007,40 +3026,14 @@ impl PlaybackSession {
                 }
             }
             Err(error)
-                if self.active_video_decoder_backend() == Some(DecoderBackend::VideoToolbox)
-                    && self.active_video_codec_is_av1() =>
+                if self
+                    .active_video_decoder_backend()
+                    .is_some_and(should_fallback_video_decoder_error) =>
             {
+                let backend = self.active_video_decoder_backend().expect("active decoder");
                 let reason = error.to_string();
                 self.fallback_video_decoder_to_software(
-                    "decode_videotoolbox_to_software",
-                    reason.clone(),
-                    None,
-                )?;
-                if !packet.is_key() {
-                    self.video_fallback_waiting_for_keyframe = true;
-                    trace::diagnostic(
-                        serde_json::json!({
-                            "event": "video_decoder_recovery_waiting_for_keyframe",
-                            "backend": DecoderBackend::Software.as_str(),
-                            "stream": packet.stream_index(),
-                            "reason": reason,
-                        })
-                        .to_string(),
-                    );
-                    return Ok(true);
-                }
-                match self.route_video_packet_with_active_decoder(&packet, demand)? {
-                    Some(progress) => Ok(progress),
-                    None => {
-                        self.pending_video_packets.push_front(packet);
-                        Ok(self.video_frames.len() > before_frames)
-                    }
-                }
-            }
-            Err(error) if self.active_video_decoder_backend() == Some(DecoderBackend::AvCodec) => {
-                let reason = error.to_string();
-                self.fallback_video_decoder_to_software(
-                    "decode_avcodec_to_software",
+                    &format!("decode_{}_to_software", backend.as_str()),
                     reason.clone(),
                     None,
                 )?;
@@ -3161,6 +3154,8 @@ impl PlaybackSession {
         let status = drain_video_frames(
             self.video_decoder.as_mut().expect("video decoder exists"),
             &mut self.video_frames,
+            self.dolby_vision_profile,
+            &mut self.dovi_rpu_diagnostics,
         )?;
         let video_frame_limit = self.active_video_frame_queue_limit();
         if demand != PlaybackPumpDemand::BufferingAudio {
@@ -3429,24 +3424,11 @@ impl PlaybackSession {
         stage: &str,
         failure: &VideoFrameImportFailure,
     ) -> Result<bool> {
-        let is_mediacodec = failure.decode_backend == DecoderBackend::MediaCodec;
-        let is_avcodec = failure.decode_backend == DecoderBackend::AvCodec;
-        let is_videotoolbox_av1 = failure.decode_backend == DecoderBackend::VideoToolbox
-            && failure
-                .codec
-                .as_deref()
-                .is_some_and(|codec| codec.eq_ignore_ascii_case("av1"));
-        if !is_mediacodec && !is_avcodec && !is_videotoolbox_av1 {
+        if !should_fallback_video_decoder_error(failure.decode_backend) {
             return Ok(false);
         }
         let active_backend = self.active_video_decoder_backend();
-        let expected_backend = if is_videotoolbox_av1 {
-            DecoderBackend::VideoToolbox
-        } else if is_avcodec {
-            DecoderBackend::AvCodec
-        } else {
-            DecoderBackend::MediaCodec
-        };
+        let expected_backend = failure.decode_backend;
         if active_backend != Some(expected_backend) {
             trace::diagnostic(
                 serde_json::json!({
@@ -3461,12 +3443,8 @@ impl PlaybackSession {
             );
             return Ok(false);
         }
-        if is_videotoolbox_av1 || is_avcodec {
-            let fallback_stage = if is_avcodec {
-                format!("{stage}_avcodec_to_software")
-            } else {
-                format!("{stage}_videotoolbox_to_software")
-            };
+        if expected_backend != DecoderBackend::MediaCodec {
+            let fallback_stage = format!("{stage}_{}_to_software", expected_backend.as_str());
             self.fallback_video_decoder_to_software(
                 &fallback_stage,
                 failure.reason.clone(),
@@ -6369,12 +6347,20 @@ fn trace_clock_correction(
 fn drain_video_frames(
     decoder: &mut Decoder,
     frames: &mut VecDeque<DecodedVideoFrame>,
+    dolby_vision_profile: Option<u8>,
+    dovi_rpu_diagnostics: &mut DoviRpuDiagnostics,
 ) -> Result<DecoderDrainStatus> {
     let decode_backend = decoder.backend();
     let mut status = DecoderDrainStatus::default();
     loop {
         match decoder.receive_frame()? {
             DecoderOutputFrame::Frame(frame) => {
+                diagnose_dovi_frame(
+                    dolby_vision_profile,
+                    dovi_rpu_diagnostics,
+                    &frame,
+                    decode_backend,
+                );
                 frames.push_back(DecodedVideoFrame {
                     frame,
                     decode_backend,
@@ -6388,6 +6374,99 @@ fn drain_video_frames(
             }
         }
     }
+}
+
+/// Per-stream accounting for decoded frames whose Dolby Vision RPU cannot
+/// feed the mapping path, and for frames whose RPU asks for an enhancement
+/// layer this renderer never decodes.
+#[derive(Debug, Default)]
+struct DoviRpuDiagnostics {
+    unavailable_frames: u64,
+    el_frames: u64,
+}
+
+/// Re-report interval after the first diagnostic, so a broken stream stays
+/// visible over long playback without logging at frame rate.
+const DOVI_RPU_DIAGNOSTIC_INTERVAL: u64 = 1024;
+
+impl DoviRpuDiagnostics {
+    fn record_unavailable_frame(&mut self) -> u64 {
+        self.unavailable_frames = self.unavailable_frames.saturating_add(1);
+        self.unavailable_frames
+    }
+
+    fn record_el_frame(&mut self) -> u64 {
+        self.el_frames = self.el_frames.saturating_add(1);
+        self.el_frames
+    }
+
+    fn should_report(count: u64) -> bool {
+        count == 1 || count % DOVI_RPU_DIAGNOSTIC_INTERVAL == 0
+    }
+}
+
+/// Decides whether a frame lacking usable RPU metadata warrants a diagnostic.
+/// A missing RPU is only fatal on Profile 5, whose base layer is not
+/// HDR10-compatible; other profiles either repeat RPUs across frames or fall
+/// back to a base layer that displays correctly. A *present but rejected*
+/// RPU always warrants one: the stream intended to carry Dolby Vision mapping
+/// and the frame will silently display unmapped.
+fn dovi_rpu_diagnostic_warranted(profile: Option<u8>, reason: DoviRejectReason) -> bool {
+    reason != DoviRejectReason::MissingSideData || profile == Some(5)
+}
+
+fn diagnose_dovi_frame(
+    profile: Option<u8>,
+    diagnostics: &mut DoviRpuDiagnostics,
+    frame: &Frame,
+    decode_backend: DecoderBackend,
+) {
+    // One parse: both the reject reason and the EL residual status come from
+    // the same `frame_dovi_metadata_result` result.
+    let el_status = match frame.dovi_mapping_probe() {
+        Ok(status) => status,
+        Err(reason) => {
+            if !dovi_rpu_diagnostic_warranted(profile, reason) {
+                return;
+            }
+            let count = diagnostics.record_unavailable_frame();
+            if !DoviRpuDiagnostics::should_report(count) {
+                return;
+            }
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "dovi_rpu_unavailable",
+                    "profile": profile,
+                    "decodeBackend": decode_backend.as_str(),
+                    "reason": reason.label(),
+                    "framesAffected": count,
+                })
+                .to_string(),
+            );
+            return;
+        }
+    };
+    // The RPU is usable, but it may ask for an enhancement layer this renderer
+    // never decodes (Profile 7 FEL/MEL). The base-layer mapping still applies,
+    // so report the gap instead of pretending the stream was composed.
+    if !el_status.is_active() {
+        return;
+    }
+    let count = diagnostics.record_el_frame();
+    if !DoviRpuDiagnostics::should_report(count) {
+        return;
+    }
+    trace::diagnostic(
+        serde_json::json!({
+            "event": "dovi_el_not_composed",
+            "profile": profile,
+            "decodeBackend": decode_backend.as_str(),
+            "residualRequested": el_status.residual_requested,
+            "nlqNontrivial": el_status.nlq_nontrivial,
+            "framesAffected": count,
+        })
+        .to_string(),
+    );
 }
 
 fn pop_matching_audio_frame(
@@ -6530,12 +6609,34 @@ fn sanitize_playback_rate(rate: f64) -> f64 {
     }
 }
 
-fn should_fallback_video_decoder_open_error(backend: DecoderBackend, codec: Option<&str>) -> bool {
-    matches!(
-        backend,
-        DecoderBackend::D3d11va | DecoderBackend::MediaCodec | DecoderBackend::AvCodec
-    ) || (backend == DecoderBackend::VideoToolbox
-        && codec.is_some_and(|codec| codec.eq_ignore_ascii_case("av1")))
+// A hardware preference must not make software-only codecs unplayable. This
+// policy also covers delayed hardware initialization and renderer import errors.
+fn should_fallback_video_decoder_error(backend: DecoderBackend) -> bool {
+    backend != DecoderBackend::Software
+}
+
+/// VideoToolbox and D3D11VA hardware decoders retain the Dolby Vision RPU
+/// metadata side data on the hardware AVFrame, allowing GPU textures + RPU
+/// reshaping via shaders without software decode.
+///
+/// Backends without GPU shader RPU mapping (e.g. Android MediaCodec with
+/// direct surface output, or OpenHarmony AVCodec) fall back to software
+/// decoding for Profile 5 streams to preserve color mapping.
+fn dolby_vision_decode_fallback(
+    profile: Option<u8>,
+    requested: DecoderConfig,
+) -> (DecoderConfig, Option<String>) {
+    let mobile_hardware_fallback = matches!(
+        requested.backend,
+        DecoderBackend::MediaCodec | DecoderBackend::AvCodec
+    );
+    if !mobile_hardware_fallback || profile != Some(5) {
+        return (requested, None);
+    }
+    (
+        DecoderConfig::software(),
+        Some("dolby vision profile 5 on mobile/embedded backend requires software decode for RPU mapping".to_string()),
+    )
 }
 
 fn video_decoder_open_stage(config: DecoderConfig) -> &'static str {
@@ -6629,6 +6730,66 @@ mod tests {
 
     const FIXTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+    #[test]
+    fn dropping_async_demuxer_waits_for_source_resources() {
+        struct TrackedSource {
+            source: source::LocalFileSource,
+            dropped: std::sync::mpsc::Sender<()>,
+        }
+        impl source::MediaSource for TrackedSource {
+            fn uri(&self) -> &str {
+                self.source.uri()
+            }
+            fn len(&mut self) -> source::Result<Option<u64>> {
+                self.source.len()
+            }
+            fn read_range(&mut self, range: source::ByteRange) -> source::Result<Vec<u8>> {
+                self.source.read_range(range)
+            }
+        }
+        impl Drop for TrackedSource {
+            fn drop(&mut self) {
+                thread::sleep(Duration::from_millis(50));
+                let _ = self.dropped.send(());
+            }
+        }
+
+        let (dropped, receiver) = std::sync::mpsc::channel();
+        let demuxer = Demuxer::open_source(Box::new(TrackedSource {
+            source: source::LocalFileSource::open(playback_fixture_path()).unwrap(),
+            dropped,
+        }))
+        .unwrap();
+        drop(AsyncDemuxer::spawn(demuxer));
+        assert!(
+            receiver.try_recv().is_ok(),
+            "demux drop returned with a live media source"
+        );
+    }
+
+    #[test]
+    fn dropping_async_demuxer_with_full_packet_queue_does_not_deadlock() {
+        let demuxer = AsyncDemuxer::spawn(Demuxer::open_path(playback_fixture_path()).unwrap());
+        for _ in 0..=demux_packet_queue_limit() {
+            demuxer
+                .commands
+                .send(DemuxCommand::SetSelection {
+                    generation: 1,
+                    selection: StreamSelection::only([i32::MAX]),
+                })
+                .unwrap();
+        }
+        let (done, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            drop(demuxer);
+            let _ = done.send(());
+        });
+        receiver
+            .recv_timeout(FIXTURE_WAIT_TIMEOUT)
+            .expect("demux teardown blocked on a full packet queue");
+        worker.join().unwrap();
+    }
+
     fn playback_fixture_path() -> PathBuf {
         std::env::var_os("ERIKA_PLAYBACK_FIXTURE")
             .map(PathBuf::from)
@@ -6649,6 +6810,7 @@ mod tests {
             video_candidates: Vec::new(),
             audio_candidates: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,
@@ -7039,30 +7201,86 @@ mod tests {
     }
 
     #[test]
+    fn software_only_wmv_plays_and_seeks_with_every_decoder_preference() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/software/wmv2-wmav2.asf");
+        for preference in [
+            VideoDecodePreference::Software,
+            VideoDecodePreference::VideoToolbox,
+            VideoDecodePreference::D3d11va,
+            VideoDecodePreference::MediaCodec,
+            VideoDecodePreference::MediaCodecByteBuffer,
+            VideoDecodePreference::AvCodec,
+        ] {
+            let mut engine = VideoPlaybackEngine::open(
+                &MediaRequest::new(path.to_string_lossy()),
+                PlaybackSessionConfig {
+                    video_decode: preference,
+                    ..PlaybackSessionConfig::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{preference:?}: {error}"));
+            assert_eq!(
+                engine.info().video_decode_backend,
+                Some(DecoderBackend::Software)
+            );
+            let events = engine.take_video_decoder_events();
+            let event = events.last().expect("decoder selection event");
+            assert_eq!(
+                event.requested_backend,
+                preference
+                    .decoder_config(crate::core::DEFAULT_VIDEO_FRAME_QUEUE_CAPACITY)
+                    .backend
+            );
+            assert_eq!(event.active_backend, DecoderBackend::Software);
+            assert_eq!(event.codec.as_deref(), Some("wmv2"));
+            assert_eq!(
+                event.fallback_count > 0,
+                preference != VideoDecodePreference::Software
+            );
+            let started = Instant::now();
+            engine.play_at(started);
+            let video = next_fixture_video_at(&mut engine, started);
+            assert_eq!(video.decode_backend, DecoderBackend::Software);
+            let planar = video
+                .frame
+                .to_planar_frame()
+                .expect("GPU-uploadable software frame");
+            assert_eq!((planar.width, planar.height), (160, 90));
+            assert!(planar.luma.iter().any(|value| *value != planar.luma[0]));
+            let audio = next_fixture_audio_at(&mut engine, started);
+            assert!(!audio.frame.samples.is_empty());
+
+            let target = Duration::from_secs(1);
+            let seek_at = started + target;
+            engine.seek_at(target, seek_at).unwrap();
+            let video = next_fixture_video_at(&mut engine, seek_at);
+            assert!(video.pts.unwrap() >= target);
+            assert!(video.frame.to_planar_frame().is_some());
+            assert_eq!(
+                engine.info().video_decode_backend,
+                Some(DecoderBackend::Software)
+            );
+
+            engine.stop_checked_at(seek_at).unwrap();
+            engine.play_at(seek_at);
+            let replay = next_fixture_video_at(&mut engine, seek_at);
+            assert_eq!(replay.pts, Some(Duration::from_millis(46)));
+        }
+    }
+
+    #[test]
     fn decoder_open_fallback_is_enabled_for_platform_hardware_backends() {
-        assert!(should_fallback_video_decoder_open_error(
+        for backend in [
+            DecoderBackend::VideoToolbox,
             DecoderBackend::D3d11va,
-            None
-        ));
-        assert!(should_fallback_video_decoder_open_error(
             DecoderBackend::MediaCodec,
-            None
-        ));
-        assert!(!should_fallback_video_decoder_open_error(
-            DecoderBackend::VideoToolbox,
-            Some("h264")
-        ));
-        assert!(should_fallback_video_decoder_open_error(
-            DecoderBackend::VideoToolbox,
-            Some("av1")
-        ));
-        assert!(should_fallback_video_decoder_open_error(
-            DecoderBackend::VideoToolbox,
-            Some("AV1")
-        ));
-        assert!(!should_fallback_video_decoder_open_error(
-            DecoderBackend::Software,
-            Some("av1")
+            DecoderBackend::AvCodec,
+        ] {
+            assert!(should_fallback_video_decoder_error(backend));
+        }
+        assert!(!should_fallback_video_decoder_error(
+            DecoderBackend::Software
         ));
     }
 
@@ -8713,6 +8931,7 @@ mod tests {
             video_candidates: Vec::new(),
             audio_candidates: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,
@@ -9177,5 +9396,119 @@ mod tests {
         assert_eq!(first.vsyncs + second.vsyncs, 5);
         assert_ne!(first.vsyncs, second.vsyncs);
         assert!(first.residual_error_nanos.signum() != second.residual_error_nanos.signum());
+    }
+
+    #[test]
+    fn dolby_vision_profile_5_stays_on_hardware_for_videotoolbox_and_d3d11va() {
+        let vt_config = DecoderConfig {
+            backend: DecoderBackend::VideoToolbox,
+            mediacodec_surface: false,
+            ..Default::default()
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), vt_config);
+        assert_eq!(config.backend, DecoderBackend::VideoToolbox);
+        assert_eq!(reason, None);
+
+        let d3d11_config = DecoderConfig {
+            backend: DecoderBackend::D3d11va,
+            mediacodec_surface: false,
+            ..Default::default()
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), d3d11_config);
+        assert_eq!(config.backend, DecoderBackend::D3d11va);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dolby_vision_profile_5_falls_back_to_software_decode_on_mobile_backends() {
+        let avcodec_config = DecoderConfig {
+            backend: DecoderBackend::AvCodec,
+            mediacodec_surface: false,
+            ..Default::default()
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), avcodec_config);
+        assert_eq!(config.backend, DecoderBackend::Software);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("profile 5"));
+
+        let mediacodec_config = DecoderConfig {
+            backend: DecoderBackend::MediaCodec,
+            mediacodec_surface: true,
+            ..Default::default()
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), mediacodec_config);
+        assert_eq!(config.backend, DecoderBackend::Software);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("profile 5"));
+    }
+
+    #[test]
+    fn dolby_vision_profile_8_stays_on_hardware_decode() {
+        let hardware_config = DecoderConfig {
+            backend: DecoderBackend::VideoToolbox,
+            mediacodec_surface: false,
+            ..Default::default()
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(8), hardware_config);
+
+        assert_eq!(config.backend, DecoderBackend::VideoToolbox);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dolby_vision_software_decode_stays_software() {
+        let software_config = DecoderConfig::software();
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), software_config);
+
+        assert_eq!(config.backend, DecoderBackend::Software);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dovi_rpu_missing_is_diagnostic_only_on_profile_5() {
+        assert!(dovi_rpu_diagnostic_warranted(
+            Some(5),
+            DoviRejectReason::MissingSideData
+        ));
+        assert!(!dovi_rpu_diagnostic_warranted(
+            Some(8),
+            DoviRejectReason::MissingSideData
+        ));
+        assert!(!dovi_rpu_diagnostic_warranted(
+            None,
+            DoviRejectReason::MissingSideData
+        ));
+        assert!(dovi_rpu_diagnostic_warranted(
+            None,
+            DoviRejectReason::UnsupportedCoefDenom
+        ));
+        assert!(dovi_rpu_diagnostic_warranted(
+            Some(8),
+            DoviRejectReason::InvalidCurves
+        ));
+    }
+
+    #[test]
+    fn dovi_rpu_diagnostics_report_first_then_spaced() {
+        assert!(DoviRpuDiagnostics::should_report(1));
+        assert!(!DoviRpuDiagnostics::should_report(2));
+        assert!(!DoviRpuDiagnostics::should_report(
+            DOVI_RPU_DIAGNOSTIC_INTERVAL - 1
+        ));
+        assert!(DoviRpuDiagnostics::should_report(
+            DOVI_RPU_DIAGNOSTIC_INTERVAL
+        ));
+        assert!(!DoviRpuDiagnostics::should_report(
+            DOVI_RPU_DIAGNOSTIC_INTERVAL + 1
+        ));
+
+        let mut diagnostics = DoviRpuDiagnostics::default();
+        assert_eq!(diagnostics.record_unavailable_frame(), 1);
+        assert_eq!(diagnostics.record_unavailable_frame(), 2);
+        // The enhancement-layer counter is independent, so a stream that both
+        // loses RPUs and carries FEL residual reports each at its own cadence.
+        assert_eq!(diagnostics.record_el_frame(), 1);
+        assert_eq!(diagnostics.record_unavailable_frame(), 3);
+        assert_eq!(diagnostics.record_el_frame(), 2);
     }
 }

@@ -180,7 +180,10 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 `http_read_ahead_bytes` 覆盖本次请求的 HTTP(S) 预读窗口（字节）。`0` 会优先采用进程级
 环境变量 `ERIKA_HTTP_READAHEAD_BYTES`，未设置时使用 2 MiB 默认值；显式非零值优先于
 该环境变量。
-`reserved` 中的非零值会被拒绝，以便未来增加字段时不改变旧宿主的行为。预读窗口只
+`http_back_buffer_bytes` 覆盖 HTTP(S) 回看预算（字节）——即播放位置之后保留多少已播
+数据，落在这个范围内的回退不需要发起网络请求。`0` 使用 16 MiB 默认值；播放高码率
+媒体的宿主应按码率取值（约 15 秒 × 码率，例如 71 Mbps 下 -10 秒回退覆盖 ~89 MB）。
+`reserved` 中的非零值会被拒绝，以便未来增加字段时不改变旧宿主的行为。这两个参数只
 影响 HTTP(S) 播放，本地文件不受影响。
 
 ```c
@@ -188,7 +191,8 @@ typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;   /* 0 = 环境变量，否则 2 MiB */
-  uint64_t reserved[3];             /* 必须为零 */
+  uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB 回看预算 */
+  uint64_t reserved[2];             /* 必须为零 */
 } ErikaOpenOptions;
 ```
 
@@ -307,7 +311,7 @@ ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float he
 
 `set_playback_rate(1.0)` 为正常速度。`erika_presenter_open_with_options` 是
 `erika_open_with_options` 的推送模型对应版本，接受同样的
-`ErikaOpenOptions`（请求头加 `http_read_ahead_bytes`；见
+`ErikaOpenOptions`（请求头加 `http_read_ahead_bytes` / `http_back_buffer_bytes`；见
 [`erika_open_with_options`](#erikahandle--拉取模型)）。`set_upscaler` 在运行时切换神经亮度超分（见
 [`erika_presenter_get_upscaler_status`](#诊断与截图)）。Metal 与具备 compute 能力的
 wgpu renderer，以及 feature level 11.0+ 的 D3D11 renderer 会执行 ArtCNN；其他后端保留原生 luma sampling，并明确报告
