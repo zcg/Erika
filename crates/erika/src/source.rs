@@ -16,6 +16,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
+mod http;
+
+use http::BodyReader;
+pub use http::SourceCancellation;
+
 use crate::core::MediaSourceHint;
 use crate::trace;
 
@@ -1015,6 +1020,18 @@ pub trait MediaSource: Send {
     /// 把目标窗口提前拉入后台多段预取，避免窗口外 seek 后 demux 线程同步阻塞
     /// 在单个慢 HTTP 请求上。
     fn prefetch_hint(&mut self, _target: u64) {}
+
+    /// 返回一个线程安全的取消句柄，用于中断阻塞中的源读取。
+    ///
+    /// 存在的理由（宿主拆除路径）：`ureq` 时代从外部中断在途请求是做不到的，关窗
+    /// 只能靠"2s 超时后 detach demux 线程"兜底，而 detach 出去的线程仍在读网络。
+    /// reqwest/Tokio 的原生能力是丢弃 future 即可中断 connect/TLS/headers/body，
+    /// 这条缝把它暴露给上层，让 join 不必依赖超时。
+    ///
+    /// 默认 `None`：本地文件、直播等源没有可取消的在途请求。
+    fn cancellation(&self) -> Option<SourceCancellation> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -1917,22 +1934,71 @@ fn parse_content_range_end(value: &str) -> Option<u64> {
     end.trim().parse::<u64>().ok()
 }
 
-/// 顺序长读专用 HTTP agent：**只保留连接超时，无 body 总时长限制**。
+/// 一次 HTTP 交换要用的客户端与逐请求 deadline。
 ///
-/// 与 `http_live_agent` 是同一个理由（那里的注释记录了根因）：ureq 3.x 的
-/// `timeout_recv_response` / `timeout_recv_body` 是**自响应头起算的总时长**
-/// deadline。顺序长读的 body 是"从当前位置到文件尾"的无限长响应，用
-/// `http_agent()`（60s body 总时长）会变成"播满 60s 必断流"。
-/// 短请求（长度探测 / 候选测速）继续用 `http_agent()`。
-fn http_stream_agent() -> ureq::Agent {
-    let tls = ureq::tls::TlsConfig::builder()
-        .disable_verification(true)
-        .build();
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .tls_config(tls)
-        .build()
-        .into()
+/// 拆成两件是因为生效范围不同：**连接超时是 client 级的**（本进程只有一个 data
+/// client，4s），而**整次请求（发出 → body 读完）的总时长是逐请求的**——顺序长读
+/// 的 body 是"到文件尾"的无限长响应，必须不限时；有界的段请求则必须限时，否则
+/// 挂死的分段会永久占着在飞配额。
+#[derive(Clone, Copy)]
+struct HttpFetch {
+    client: &'static reqwest::Client,
+    /// 整次请求（发出 → body 读完）的总时长上限；`None` = 不限。
+    timeout: Option<Duration>,
+}
+
+impl HttpFetch {
+    fn get(&self, uri: &str) -> reqwest::RequestBuilder {
+        self.with_timeout(self.client.get(uri))
+    }
+
+    /// HEAD 探测专用（`len()` 走这条路，拿不到 Content-Length 时才回退到
+    /// 一字节 Range 请求，见 `probe_http_total_length`）。
+    fn head(&self, uri: &str) -> reqwest::RequestBuilder {
+        self.with_timeout(self.client.head(uri))
+    }
+
+    fn with_timeout(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
+    }
+}
+
+/// 同步发出一次请求，并把失败归类成 [`HttpExchangeFailure`]。
+///
+/// 同步桥接见 [`http::block_on`]：读路径刻意是同步的（跑在 demux 线程上、自己
+/// 持有同步字节窗口），所以异步调用在这里被驱动到完成，而不是把调用方变异步。
+///
+/// **注意这里只覆盖发送阶段**：reqwest 不把 4xx/5xx 当错误，状态码由调用点
+/// 自己的 status 分支处理（并在 `>= 400` 时构造 [`HttpExchangeFailure::Status`]），
+/// 以保持与旧实现一致的重试口径——5xx 可重试、4xx 终局。
+fn send_http_request(
+    request: reqwest::RequestBuilder,
+) -> std::result::Result<reqwest::Response, HttpExchangeFailure> {
+    match http::block_on(async move {
+        request
+            .send()
+            .await
+            .map_err(|error| SourceError::Transient(error.to_string()))
+    }) {
+        Ok(response) => Ok(response),
+        Err(SourceError::Transient(message)) => Err(HttpExchangeFailure::Transport(message)),
+        Err(other) => Err(HttpExchangeFailure::Transport(other.to_string())),
+    }
+}
+
+/// 顺序长读专用：**只保留连接超时，无 body 总时长限制**。
+///
+/// 与 [`http_live_agent`] 是同一个理由（那里的注释记录了根因）：任何"整次请求"
+/// 的总时长上限，对"从当前位置到文件尾"的无限长响应都会变成"播满 N 秒必断流"。
+/// 短请求（长度探测 / 候选测速）用 [`http_agent`]。
+fn http_stream_agent() -> HttpFetch {
+    HttpFetch {
+        client: http::data_client(),
+        timeout: None,
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1943,24 +2009,22 @@ fn http_stream_agent() -> ureq::Agent {
 // 续传。所有分段都不写窗口，写窗口的只有读线程一个（既有单写者语义不变）。
 // ----------------------------------------------------------------------------
 
-/// 并行分段专用 HTTP agent：**有界段**（几百 KB），因此可以安全地设 body 总时长
-/// 上限——段跑不完就报错退出，而不是像长读那样必须无 body 超时（长读的 body 是
-/// "到文件尾"的无限长响应，见 `http_stream_agent` 注释）。
+/// 并行分段专用：**有界段**（几百 KB），因此可以安全地设总时长上限——段跑不完
+/// 就报错退出，而不是像长读那样必须不限时（长读的 body 是"到文件尾"的无限长
+/// 响应，见 [`http_stream_agent`]）。
 ///
 /// 上限取 [`SEEK_PARALLEL_SEGMENT_TIMEOUT`] + 2s：比读线程的等待窗口略长，
 /// 保证**先超时的是读线程**——回退决策统一由读线程做，worker 只负责如实报错。
 /// 没有这道上限，一个挂死的分段线程会永久占着在飞配额。
-fn http_seek_fill_agent() -> ureq::Agent {
-    let tls = ureq::tls::TlsConfig::builder()
-        .disable_verification(true)
-        .build();
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .timeout_recv_response(Some(Duration::from_secs(8)))
-        .timeout_recv_body(Some(SEEK_PARALLEL_SEGMENT_TIMEOUT + Duration::from_secs(2)))
-        .tls_config(tls)
-        .build()
-        .into()
+///
+/// **已知差异**：旧实现另有 `timeout_recv_response(8s)` 单独约束"发出到收到响应
+/// 头"。reqwest 只有整次请求一个粒度的 `timeout`，没有等价项，因此响应头挂死从
+/// 8s 失败变成 22s 失败。取舍同上：读线程仍会先超时并回退，结论不变。
+fn http_seek_fill_agent() -> HttpFetch {
+    HttpFetch {
+        client: http::data_client(),
+        timeout: Some(SEEK_PARALLEL_SEGMENT_TIMEOUT + Duration::from_secs(2)),
+    }
 }
 
 /// **并行回填的累计计数 + 最近一次批次明细**（诊断与日志的唯一数据源）。
@@ -2422,7 +2486,7 @@ fn wait_seek_fill_data(
 /// 按序做（见 `run_seek_fill`），所以既有"窗口只有一个写者"的语义没有被打破，
 /// 也就不存在两个写者乱序写入的竞态。
 ///
-/// 预检与下载用的是**同一个 `ureq::Agent`**（同一个连接池）→ 同一节点上实际只有
+/// 预检与下载用的是**同一个 HTTP 客户端**（同一个连接池）→ 同一节点上实际只有
 /// **一条 TCP 连接上的两个单次 Range 请求**（用完即断），形态与普通用户无异。
 fn spawn_seek_fill_worker(
     context: &SeekFillContext,
@@ -2809,11 +2873,12 @@ fn run_seek_fill(ctx: &SeekFillContext, plan: &SeekFillPlan) {
 ///   - 200：只在 `start == 0` 时接受（服务端忽略 Range 返回全片），
 ///     `start > 0` 直接判终局错误——把整片从头当续传字节拼接是静默数据损坏。
 fn open_sequential_response(
-    agent: &ureq::Agent,
+    agent: &HttpFetch,
     uri: &str,
     http_headers: &[(String, String)],
     start: u64,
     diag_slot: usize,
+    cancellation: SourceCancellation,
 ) -> Result<SequentialResponse> {
     let header = http_range_header(ByteRange {
         start,
@@ -2831,13 +2896,13 @@ fn open_sequential_response(
     if let Some(profile) = http_request_profile(diag_slot) {
         profile.record_request();
     }
-    let response = request.call().map_err(|error| {
+    let response = send_http_request(request).map_err(|failure| {
         http_trace_log(format!(
             "{{\"event\":\"http_stream_open_error\",\"phase\":\"request\",\"start\":{},\"error\":\"{}\"}}",
             start,
-            json_escape(&error.to_string()),
+            json_escape(&failure.message()),
         ));
-        http_failure_after_retries(&error)
+        http_failure_after_retries(&failure)
     })?;
     let status = response.status().as_u16();
     let content_range = response
@@ -2894,7 +2959,7 @@ fn open_sequential_response(
         total.map_or_else(|| "null".to_string(), |value| value.to_string()),
     ));
     Ok(SequentialResponse {
-        reader: Box::new(response.into_body().into_reader()),
+        reader: Box::new(BodyReader::new(cancellation, response)),
         end,
         total,
     })
@@ -2942,6 +3007,7 @@ fn sequential_reader_loop(
     done: mpsc::Sender<()>,
     seek_fill: Arc<SeekFillDiag>,
     seek_fill_quota: Arc<AtomicUsize>,
+    cancellation: SourceCancellation,
 ) {
     let agent = http_stream_agent();
     let mut backoff = Duration::from_millis(200);
@@ -3021,25 +3087,31 @@ fn sequential_reader_loop(
         let front_before = (requests_sent > 0).then_some(last_front);
         journal.note_request(start, front_before, diag_slot);
         requests_sent = requests_sent.saturating_add(1);
-        let opened =
-            match open_sequential_response(&agent, &uri_now, &http_headers, start, diag_slot) {
-                Ok(opened) => {
-                    backoff = Duration::ZERO; // 连接建立成功：后续若断，立即续传
-                    opened
+        let opened = match open_sequential_response(
+            &agent,
+            &uri_now,
+            &http_headers,
+            start,
+            diag_slot,
+            cancellation.child(),
+        ) {
+            Ok(opened) => {
+                backoff = Duration::ZERO; // 连接建立成功：后续若断，立即续传
+                opened
+            }
+            Err(error) => {
+                if let SourceError::Http(message) = error {
+                    // 终局（4xx / Range 被忽略 / Content-Range 违约）：写进窗口，
+                    // 读方取走即上报宿主换源。本线程继续退避重试——换 host 后
+                    // epoch 变化会让我们用新 uri 重来。
+                    lock_stream(&shared).error = Some(message);
+                    shared.data_cv.notify_all();
                 }
-                Err(error) => {
-                    if let SourceError::Http(message) = error {
-                        // 终局（4xx / Range 被忽略 / Content-Range 违约）：写进窗口，
-                        // 读方取走即上报宿主换源。本线程继续退避重试——换 host 后
-                        // epoch 变化会让我们用新 uri 重来。
-                        lock_stream(&shared).error = Some(message);
-                        shared.data_cv.notify_all();
-                    }
-                    reconnects.bump(ReconnectCause::Empty);
-                    backoff = stream_retry_backoff(backoff);
-                    continue;
-                }
-            };
+                reconnects.bump(ReconnectCause::Empty);
+                backoff = stream_retry_backoff(backoff);
+                continue;
+            }
+        };
         {
             let mut g = lock_stream(&shared);
             if g.total.is_none() {
@@ -3661,7 +3733,12 @@ pub struct HttpRangeSource {
     /// 打开时登记的主 URI（首候选）。多源换 host 时只变 `uri`（活跃 fetch
     /// 地址），此字段保持不变，作为源的稳定标识供 `uri()` / 日志使用。
     primary_uri: String,
-    agent: ureq::Agent,
+    agent: HttpFetch,
+    /// 本源的取消域：宿主拆除/关窗时置位，让卡在 socket 上的读立刻返回，而不是
+    /// 等 30s 的段超时（见 `http::BodyReader` 与 `SourceCancellation`）。
+    /// 每条流的 body 泵用它的**子 token**，所以取消一条流不会误伤同进程里另一个源
+    /// （DASH 双流的 video/audio 就是两个源）。
+    cancellation: SourceCancellation,
     http_headers: Vec<(String, String)>,
     content_length: Option<u64>,
     /// 诊断槽位：DASH 双流时 video=0 / audio=1，各源独立发布/清空诊断
@@ -4643,7 +4720,7 @@ impl FullPreloadInner {
 /// 流式循环直接复用它，避免两套前移语义（含落盘后端的截断/降级）。
 fn full_preload_step(
     state: &FullPreloadState,
-    agent: &ureq::Agent,
+    agent: &HttpFetch,
     uri: &str,
     http_headers: &[(String, String)],
     cap: u64,
@@ -4750,7 +4827,7 @@ fn full_preload_step(
 /// 1) stop 信号；2) 完成（end ≥ total/cap）；3) 致命错误（连续失败默认让循环
 /// 继续；Drop 时由 `HttpRangeSource::drop` 兜底终止）。
 fn full_preload_loop(
-    agent: &ureq::Agent,
+    agent: &HttpFetch,
     uri: Arc<Mutex<String>>,
     headers: &[(String, String)],
     state: &FullPreloadState,
@@ -4837,7 +4914,7 @@ fn report_audio_first_progress(state: &FullPreloadState) {
 ///
 /// `ERIKA_PRELOAD_STREAM=0` 回退到旧的分段实现（对照/排障用）。
 fn full_preload_stream_loop(
-    agent: &ureq::Agent,
+    agent: &HttpFetch,
     uri: Arc<Mutex<String>>,
     headers: &[(String, String)],
     state: &FullPreloadState,
@@ -4884,7 +4961,14 @@ fn full_preload_stream_loop(
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        let mut conn = match open_sequential_response(agent, &uri_now, headers, end, state.slot) {
+        let mut conn = match open_sequential_response(
+            agent,
+            &uri_now,
+            headers,
+            end,
+            state.slot,
+            SourceCancellation::default(),
+        ) {
             Ok(conn) => {
                 backoff = Duration::from_millis(200);
                 conn
@@ -5767,6 +5851,7 @@ impl HttpRangeSource {
             uri: Arc::new(Mutex::new(uri)),
             primary_uri: primary,
             agent,
+            cancellation: SourceCancellation::default(),
             http_headers,
             content_length: None,
             diag_slot,
@@ -6307,6 +6392,9 @@ impl HttpRangeSource {
             let stop_thread = Arc::clone(&stop);
             let seek_fill_thread = Arc::clone(&seek_fill);
             let quota_thread = Arc::clone(&seek_fill_quota);
+            // 本流的取消域：宿主拆除时置位，长读的 body 泵立刻退出，读线程不必
+            // 等到段超时（见 `SourceCancellation`）。
+            let cancellation_thread = self.cancellation.child();
             let diag_slot = self.diag_slot;
             thread::Builder::new()
                 .name(format!("erika-http-stream-{}", self.diag_slot))
@@ -6327,6 +6415,7 @@ impl HttpRangeSource {
                         done_tx,
                         seek_fill_thread,
                         quota_thread,
+                        cancellation_thread,
                     );
                 })
                 .expect("failed to spawn sequential stream thread")
@@ -7782,8 +7871,8 @@ impl Drop for HttpRangeSource {
 pub struct HttpLiveStreamSource {
     uri: String,
     /// GET 响应 body 的读取器（连接长驻、数据持续推送）。`None` 表示连接已关闭。
-    /// ureq 的 `Response` 类型是私有的，这里持 `Body::as_reader()` 返回的
-    /// `'static` reader（内部 Arc 共享读取位置，可脱离 Response 独立持有）。
+    /// 由 [`BodyReader`] 提供：它把异步 body 泵成同步 `Read`，读取位置自持，
+    /// 因此可以脱离 `Response` 独立持有。
     reader: Option<Box<dyn Read + Send + Sync>>,
     /// 已消费字节数。直播流不可 seek：`read_range` 校验请求起点 == 此值，
     /// 失配（AVIO seek 后）报错，防止把流当作可跳转文件读。
@@ -7804,12 +7893,12 @@ impl HttpLiveStreamSource {
         for (name, value) in &http_headers {
             request = request.header(name, value);
         }
-        let response = request.call().map_err(|error| {
+        let response = send_http_request(request).map_err(|failure| {
             http_trace_log(format!(
                 "{{\"event\":\"http_live_open_error\",\"error\":\"{}\"}}",
-                json_escape(&error.to_string()),
+                json_escape(&failure.message()),
             ));
-            SourceError::Http(error.to_string())
+            SourceError::Http(failure.message())
         })?;
         let status = response.status().as_u16();
         if status >= 400 {
@@ -7831,7 +7920,7 @@ impl HttpLiveStreamSource {
                 .map(str::to_string)
                 .unwrap_or_else(|| "null".to_string()),
         ));
-        let reader = response.into_body().into_reader();
+        let reader = BodyReader::new(SourceCancellation::default(), response);
         Ok(Self {
             uri: uri.to_string(),
             reader: Some(Box::new(reader)),
@@ -7993,40 +8082,33 @@ impl Drop for HttpLiveStreamSource {
     }
 }
 
-fn http_agent() -> ureq::Agent {
-    // bili-rs 宿主可能以 IP 直连（绕过 DNS 污染/IPv6 不可达），
-    // 证书按 IP 校验会失败——关闭证书校验（播放器场景可接受）
-    let tls = ureq::tls::TlsConfig::builder()
-        .disable_verification(true)
-        .build();
-    ureq::Agent::config_builder()
-        // 连接超时 4s：宿主在 UI 线程同步 open，超时太长会卡死界面
-        // （慢 CDN 快速失败 → bili-rs 回退官方源）
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .timeout_recv_response(Some(Duration::from_secs(15)))
-        .timeout_recv_body(Some(Duration::from_secs(60)))
-        .tls_config(tls)
-        .build()
-        .into()
+/// 短请求（长度探测 / 候选测速）专用：整次交换 60s 上限。
+///
+/// "连接超时 4s" 与 "忽略证书校验" 都在 [`http::data_client`] 里，理由记在那里。
+///
+/// **已知差异**：旧实现另有 `timeout_recv_response(15s)` 单独约束"发出到收到响应
+/// 头"。reqwest 的 `RequestBuilder::timeout` 只有整次请求一个粒度，没有等价项，
+/// 因此响应头挂死从 15s 失败变成 60s 失败。这里发起的都是 1 字节级探测请求，
+/// 连接超时 4s 也已覆盖 TCP 建连，实际影响面有限。
+fn http_agent() -> HttpFetch {
+    HttpFetch {
+        client: http::data_client(),
+        timeout: Some(Duration::from_secs(60)),
+    }
 }
 
-/// 直播流专用 HTTP agent。**不能复用 `http_agent()`**：ureq 3.x 的
-/// `timeout_recv_response`/`timeout_recv_body` 是**自响应头起算的总时长**
-/// deadline（`next_timeout(RecvBody)` 同时检查 RecvResponse 的剩余时间并取
-/// 更早者），直播流是无限长 body，读取超过 15s 后每次读都立即超时 →
-/// 直播必在播放约 15s 后断流（"播着播着就自动重连"的根因，与网络无关）。
-/// 直播源只保留连接超时（慢源快速失败）；body 读取无总时长限制，交由
-/// demuxer/播放层消费。CDN 主动断开（FIN/RST）时读返回 EOF/错误 → 宿主
-/// 断流检测触发自动重连（新 URL 换源）。
-fn http_live_agent() -> ureq::Agent {
-    let tls = ureq::tls::TlsConfig::builder()
-        .disable_verification(true)
-        .build();
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .tls_config(tls)
-        .build()
-        .into()
+/// 直播流专用。**不能复用 [`http_agent`]**：直播流是无限长 body，任何"整次请求"
+/// 的总时长上限都会让它播放约 N 秒后必断流。旧实现在 ureq 上踩过这个坑——
+/// `timeout_recv_body` 是自响应头起算的总时长，直播因此约 15s 断流，表现为
+/// "播着播着就自动重连"，与网络无关，根因就记在这里以免重犯。
+///
+/// 直播源只保留连接超时（慢源快速失败）；CDN 主动断开（FIN/RST）时读返回
+/// EOF/错误 → 宿主断流检测触发自动重连（新 URL 换源）。
+fn http_live_agent() -> HttpFetch {
+    HttpFetch {
+        client: http::data_client(),
+        timeout: None,
+    }
 }
 
 const HTTP_FETCH_MAX_ATTEMPTS: u32 = 3;
@@ -8057,25 +8139,49 @@ fn http_retry_fits_budget(deadline_started: Instant, backoff: Duration) -> bool 
         .lt(&HTTP_FETCH_TOTAL_BUDGET)
 }
 
-/// Whether a failed HTTP exchange is worth retrying: transport errors and 5xx
-/// responses are transient; 4xx responses are deterministic client errors.
-fn http_error_is_retryable(error: &ureq::Error) -> bool {
-    match error {
-        ureq::Error::StatusCode(status) => *status >= 500,
-        _ => true,
+/// 一次 HTTP 交换失败的分类依据。
+///
+/// 存在的理由是一次**真实的行为差异**：reqwest 不把 4xx/5xx 当错误（要显式
+/// `error_for_status()` 才转），而旧实现用的 ureq 默认就把它变成 `Err(StatusCode)`。
+/// 若照搬 reqwest 的默认行为，5xx 会从"可重试的暂时性失败"退化成终局错误——
+/// CDN 抖动一个 502 就会让宿主换源，而不是就地重试。所以分类口径必须显式搬过来，
+/// 由调用点在 `status >= 400` 时构造 [`Self::Status`]、在 `send()` 失败时构造
+/// [`Self::Transport`]。
+#[derive(Debug)]
+enum HttpExchangeFailure {
+    /// 服务端明确回了失败状态码。
+    Status(u16),
+    /// 传输层失败（连接复位 / 超时 / DNS-TLS 抖动 / body 中断），没有状态码。
+    Transport(String),
+}
+
+impl HttpExchangeFailure {
+    /// 传输层错误与 5xx 是链路问题，源很可能马上又能用；4xx 是确定性的。
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Status(status) => *status >= 500,
+            Self::Transport(_) => true,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Status(status) => format!("http status: {status}"),
+            Self::Transport(message) => message.clone(),
+        }
     }
 }
 
 /// 重试预算用尽后，把一次 HTTP 交换失败归类成「暂时性」还是「终局」。
 ///
-/// 分类沿用 [`http_error_is_retryable`]：传输层错误（连接被复位 / 半开连接超时 /
-/// DNS-TLS 抖动）与 5xx 属于链路问题，源很可能马上又能用 → [`SourceError::Transient`]，
-/// 由 [`HttpRangeSource::read_range_with_transient_wait`] 吸收并等待；
-/// 4xx（403 签名过期 / 404 分片不存在）是确定性的，重试无意义 → [`SourceError::Http`]，
-/// 立即上抛让宿主换源。
-fn http_failure_after_retries(error: &ureq::Error) -> SourceError {
-    let message = error.to_string();
-    if http_error_is_retryable(error) {
+/// 分类沿用 [`HttpExchangeFailure::is_retryable`]：传输层错误（连接被复位 / 半开
+/// 连接超时 / DNS-TLS 抖动）与 5xx 属于链路问题，源很可能马上又能用 →
+/// [`SourceError::Transient`]，由 [`HttpRangeSource::read_range_with_transient_wait`]
+/// 吸收并等待；4xx（403 签名过期 / 404 分片不存在）是确定性的，重试无意义 →
+/// [`SourceError::Http`]，立即上抛让宿主换源。
+fn http_failure_after_retries(error: &HttpExchangeFailure) -> SourceError {
+    let message = error.message();
+    if error.is_retryable() {
         SourceError::Transient(message)
     } else {
         SourceError::Http(message)
@@ -8152,7 +8258,7 @@ fn parse_content_range_start(value: &str) -> Option<u64> {
 
 /// The strongest entity validator the response offers, preferred in the order
 /// RFC 9110 recommends for `If-Range`.
-fn response_entity_validator<T>(response: &ureq::http::Response<T>) -> Option<String> {
+fn response_entity_validator(response: &reqwest::Response) -> Option<String> {
     ["etag", "last-modified"].into_iter().find_map(|name| {
         response
             .headers()
@@ -8168,7 +8274,7 @@ fn response_entity_validator<T>(response: &ureq::http::Response<T>) -> Option<St
 ///
 /// 只负责**如实回报**，不做任何解释——跨节点一致性怎么判由 `seek_fill_gate`
 /// 集中决定（内核里只允许有一处判据，避免"两套说法互相打架"）。
-fn response_header_value<T>(response: &ureq::http::Response<T>, name: &str) -> Option<String> {
+fn response_header_value(response: &reqwest::Response, name: &str) -> Option<String> {
     response
         .headers()
         .get(name)
@@ -8186,7 +8292,7 @@ fn response_header_value<T>(response: &ureq::http::Response<T>, name: &str) -> O
 /// into memory before playback, just to learn a number the headers already
 /// carry.
 fn probe_http_total_length(
-    agent: &ureq::Agent,
+    agent: &HttpFetch,
     uri: &str,
     http_headers: &[(String, String)],
 ) -> Result<Option<u64>> {
@@ -8198,18 +8304,17 @@ fn probe_http_total_length(
     for (name, value) in http_headers {
         request = request.header(name, value);
     }
-    let response = request
-        .config()
-        .http_status_as_error(false)
-        .build()
-        .call()
-        .map_err(|error| {
-            http_trace_log(format!(
-                "{{\"event\":\"http_length_probe_error\",\"phase\":\"request\",\"error\":\"{}\"}}",
-                json_escape(&error.to_string()),
-            ));
-            SourceError::Http(error.to_string())
-        })?;
+    // reqwest 默认**不**把状态码当错误（要显式 `error_for_status()` 才转），所以这里
+    // 不再需要旧实现那句 `http_status_as_error(false)`：4xx 同样能拿到响应头，而探测
+    // 必须看得到 416 的 `Content-Range`。失败也不走重试口径——探测是"问一次"，出错就
+    // 如实报错。
+    let response = send_http_request(request).map_err(|failure| {
+        http_trace_log(format!(
+            "{{\"event\":\"http_length_probe_error\",\"phase\":\"request\",\"error\":\"{}\"}}",
+            json_escape(&failure.message()),
+        ));
+        SourceError::Http(failure.message())
+    })?;
     let status = response.status().as_u16();
     let header = |name: &str| {
         response
@@ -8271,7 +8376,7 @@ const HTTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
 /// 三个调用点（顺序预取线程 / 同步 fetch / 整片预载桶）各自把 `diag_slot`
 /// 或桶的 `slot` 传进来：预取线程是独立 `std::thread`，捕获不到源实例。
 fn fetch_http_range(
-    agent: &ureq::Agent,
+    agent: &HttpFetch,
     uri: &str,
     http_headers: &[(String, String)],
     range: ByteRange,
@@ -8347,9 +8452,9 @@ fn fetch_http_range(
         if let Some(profile) = profile.as_ref() {
             profile.record_request();
         }
-        let mut response = match request.call() {
+        let response = match send_http_request(request) {
             Ok(response) => response,
-            Err(error) => {
+            Err(failure) => {
                 http_trace_log(format!(
                     "{{\"event\":\"{}_error\",\"phase\":\"request\",\"attempt\":{},\"start\":{},\"length\":{},\"elapsed_ms\":{:.3},\"error\":\"{}\"}}",
                     event,
@@ -8359,11 +8464,11 @@ fn fetch_http_range(
                         .length
                         .map_or_else(|| "null".to_string(), |length| length.to_string()),
                     started.elapsed().as_secs_f64() * 1000.0,
-                    json_escape(&error.to_string()),
+                    json_escape(&failure.message()),
                 ));
                 let backoff = http_retry_backoff(attempt);
                 if attempt < HTTP_FETCH_MAX_ATTEMPTS
-                    && http_error_is_retryable(&error)
+                    && failure.is_retryable()
                     && http_retry_fits_budget(deadline_started, backoff)
                 {
                     http_trace_log(format!(
@@ -8379,7 +8484,7 @@ fn fetch_http_range(
                 }
                 // 暂时性 or 终局由错误性质决定（见 `http_failure_after_retries`）；
                 // 暂时性错误后续由外层等待窗口吸收，不再直接判死整条流。
-                return Err(http_failure_after_retries(&error));
+                return Err(http_failure_after_retries(&failure));
             }
         };
         let status = response.status().as_u16();
@@ -8452,22 +8557,49 @@ fn fetch_http_range(
                     last_modified = response_header_value(&response, "last-modified");
                 }
             }
-            // ureq maps 4xx/5xx to Error::StatusCode before this point; any
-            // other status (204, 304, ...) carries no usable range payload.
             _ => {
+                // 4xx/5xx 必须走与旧实现一致的重试口径。旧实现用 ureq，它默认把
+                // 4xx/5xx 变成 `Err(StatusCode)`，于是 5xx 会被判为可重试的暂时性
+                // 失败。reqwest 把状态码原样交回，若不在这里显式补上，CDN 抖一个
+                // 502 就会直接判终局并让宿主换源，而不是就地重试。
+                let failure = if status >= 400 {
+                    Some(HttpExchangeFailure::Status(status))
+                } else {
+                    // 204/304 等"成功但没有可用区间载荷"：重试无意义，终局。
+                    None
+                };
                 http_trace_log(format!(
                     "{{\"event\":\"{}_error\",\"phase\":\"status\",\"attempt\":{},\"start\":{},\"status\":{}}}",
                     event, attempt, resume_range.start, status,
                 ));
-                return Err(SourceError::Http(format!(
-                    "unexpected HTTP status {status} for Range request"
-                )));
+                let Some(failure) = failure else {
+                    return Err(SourceError::Http(format!(
+                        "unexpected HTTP status {status} for Range request"
+                    )));
+                };
+                let backoff = http_retry_backoff(attempt);
+                if attempt < HTTP_FETCH_MAX_ATTEMPTS
+                    && failure.is_retryable()
+                    && http_retry_fits_budget(deadline_started, backoff)
+                {
+                    http_trace_log(format!(
+                        "{{\"event\":\"{}_retry\",\"phase\":\"status\",\"attempt\":{},\"start\":{},\"status\":{},\"backoff_ms\":{}}}",
+                        event,
+                        attempt,
+                        resume_range.start,
+                        status,
+                        backoff.as_millis(),
+                    ));
+                    thread::sleep(backoff);
+                    continue;
+                }
+                return Err(http_failure_after_retries(&failure));
             }
         }
         // 分块读替代 `read_to_end`：每块到达即累加实时进度（见 `progress` 参数
         // 注释）。读失败时保留已到达的字节——下面的重试按 `bytes.len()` 续传，
         // 已计入的字节不会被重复计数。
-        let mut reader = response.body_mut().as_reader();
+        let mut reader = BodyReader::new(SourceCancellation::default(), response);
         let mut chunk = [0u8; HTTP_RECV_CHUNK_BYTES];
         let mut read_error: Option<std::io::Error> = None;
         loop {
@@ -8565,6 +8697,12 @@ impl MediaSource for HttpRangeSource {
         &self.primary_uri
     }
 
+    /// 交出本源的取消域。宿主拆除时置位即可中断在途的 body 读，让 demux 线程
+    /// 不必等到段超时再退出（见 `SourceCancellation`）。
+    fn cancellation(&self) -> Option<SourceCancellation> {
+        Some(self.cancellation.clone())
+    }
+
     fn len(&mut self) -> Result<Option<u64>> {
         if self.content_length.is_some() {
             return Ok(self.content_length);
@@ -8593,9 +8731,36 @@ impl MediaSource for HttpRangeSource {
             for (name, value) in &self.http_headers {
                 request = request.header(name, value);
             }
-            match request.call() {
+            match send_http_request(request) {
                 Ok(response) => {
                     let status = response.status().as_u16();
+                    // reqwest 不把 4xx/5xx 当错误（要 `error_for_status()` 才转），而旧
+                    // 实现用的 ureq 默认就把它变成 `Err(StatusCode)`。这条口径必须补上：
+                    // 一次 500 若被当成"成功但长度为 0"，会掉进下面的 zero-length 回退、
+                    // 白白多发一次 GET，而不是就地重试（5xx 可重试、4xx 终局）。
+                    if status >= 400 {
+                        let failure = HttpExchangeFailure::Status(status);
+                        http_trace_log(format!(
+                            "[erika-http-trace] stage=head_error attempt={} elapsed_ms={:.3} error={}",
+                            attempt,
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            json_escape(&failure.message()),
+                        ));
+                        let backoff = http_retry_backoff(attempt);
+                        if attempt < HTTP_FETCH_MAX_ATTEMPTS
+                            && failure.is_retryable()
+                            && http_retry_fits_budget(started, backoff)
+                        {
+                            http_trace_log(format!(
+                                "[erika-http-trace] stage=head_retry attempt={} backoff_ms={}",
+                                attempt,
+                                backoff.as_millis(),
+                            ));
+                            thread::sleep(backoff);
+                            continue;
+                        }
+                        break failure;
+                    }
                     let length = response
                         .headers()
                         .get("content-length")
@@ -8634,16 +8799,16 @@ impl MediaSource for HttpRangeSource {
                     ));
                     return Ok(length);
                 }
-                Err(error) => {
+                Err(failure) => {
                     http_trace_log(format!(
                         "[erika-http-trace] stage=head_error attempt={} elapsed_ms={:.3} error={}",
                         attempt,
                         started.elapsed().as_secs_f64() * 1000.0,
-                        json_escape(&error.to_string()),
+                        json_escape(&failure.message()),
                     ));
                     let backoff = http_retry_backoff(attempt);
                     if attempt < HTTP_FETCH_MAX_ATTEMPTS
-                        && http_error_is_retryable(&error)
+                        && failure.is_retryable()
                         && http_retry_fits_budget(started, backoff)
                     {
                         http_trace_log(format!(
@@ -8654,7 +8819,7 @@ impl MediaSource for HttpRangeSource {
                         thread::sleep(backoff);
                         continue;
                     }
-                    break error;
+                    break failure;
                 }
             }
         };
@@ -8662,7 +8827,7 @@ impl MediaSource for HttpRangeSource {
         // with a one-byte GET and take the total from Content-Range.
         http_trace_log(format!(
             "[erika-http-trace] stage=head_fallback_range error={}",
-            json_escape(&head_error.to_string()),
+            json_escape(&head_error.message()),
         ));
         let uri = self.uri.lock().expect("uri poisoned").clone();
         match probe_http_total_length(&self.agent, &uri, &self.http_headers) {
@@ -8671,7 +8836,7 @@ impl MediaSource for HttpRangeSource {
                 self.publish_diag();
                 Ok(self.content_length)
             }
-            Err(_) => Err(SourceError::Http(head_error.to_string())),
+            Err(_) => Err(SourceError::Http(head_error.message())),
         }
     }
 
@@ -9371,16 +9536,16 @@ mod tests {
     fn http_fetch_failures_are_classified_by_retryability() {
         // 4xx（403 签名过期 / 404）重试无意义 → 终局错误，立即让宿主换源。
         assert!(matches!(
-            http_failure_after_retries(&ureq::Error::StatusCode(403)),
+            http_failure_after_retries(&HttpExchangeFailure::Status(403)),
             SourceError::Http(_)
         ));
         assert!(matches!(
-            http_failure_after_retries(&ureq::Error::StatusCode(404)),
+            http_failure_after_retries(&HttpExchangeFailure::Status(404)),
             SourceError::Http(_)
         ));
         // 5xx 是链路问题 → 暂时性，进等待窗口重试（而不是判死整条流）。
         assert!(matches!(
-            http_failure_after_retries(&ureq::Error::StatusCode(503)),
+            http_failure_after_retries(&HttpExchangeFailure::Status(503)),
             SourceError::Transient(_)
         ));
     }
@@ -11079,8 +11244,8 @@ mod tests {
 
     /// **「CDN 每 N 字节收线」mock**（用户真机形态的复现）：响应**声明**完整的
     /// `Content-Range`（`bytes <start>-<end>/<total>` + 完整 Content-Length），
-    /// 却只写 `cut` 字节就把连接关掉。ureq 的 body reader 因此报错（而不是干净
-    /// 的 EOF），内核走"服务端提前收线 → 从 write_pos 静默续传"这条路径——
+    /// 却只写 `cut` 字节就把连接关掉。HTTP 客户端的 body reader 因此报错（而不是
+    /// 干净的 EOF），内核走"服务端提前收线 → 从 write_pos 静默续传"这条路径——
     /// 用户实测的"每 ~1MB 重建一次、~0.5 次/秒"就是它。
     fn spawn_cutting_mock_http_server(
         total: u64,
@@ -11539,7 +11704,7 @@ mod tests {
     #[test]
     fn sequential_stream_resumes_silently_after_the_server_closes_early() {
         // CDN 主动掐断长连接的真实形态：声明了 Content-Length 却没发完就收线
-        // （ureq 的 body reader 会报错而不是 EOF）。读线程必须从 `write_pos`
+        // （HTTP 客户端的 body reader 会报错而不是 EOF）。读线程必须从 `write_pos`
         // **静默续传**：demux 侧看不到任何错误，请求数恰好 +1。
         const TOTAL: u64 = 8 * 1024 * 1024;
         let (uri, requests, heads) = spawn_streaming_mock_http_server(TOTAL, Some(16 * 1024));
@@ -12919,7 +13084,7 @@ mod tests {
                 .any(|(name, _)| name.eq_ignore_ascii_case("referer")),
             "非 B 站源不得被塞 Referer"
         );
-        // 顺带：我们发的是**自己实现的 HTTP 层**（ureq），不是 FFmpeg 的 HTTP——
+        // 顺带：我们发的是**自己实现的 HTTP 层**（reqwest），不是 FFmpeg 的 HTTP——
         // 调研里"FFmpeg 默认发 Connection: close"那条**不适用**于我们。这里真读
         // 一次、抓真实请求头，断言里面**没有** `connection: close`。
         let (local_uri, _requests, heads) = spawn_streaming_mock_http_server(TOTAL, None);
