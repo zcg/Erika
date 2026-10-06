@@ -357,6 +357,19 @@ pub mod iosaudio {
                 .map_err(|error| crate::audio::AudioError::Backend(error.to_string()))
         }
 
+        /// 上报队列水位，让默认闸门生效（2026-10-06）。
+        ///
+        /// Apple 与 Windows 是同一处漏编：`a07b54a` 把辅助函数 `#[cfg]` 圈到
+        /// Android/OHOS，这两个后端都落回 trait 默认的 `true` = 无闸。
+        /// 详见 `audio::audio_output_queue_has_capacity` 的文档。
+        fn output_queue_occupancy(&self) -> Option<(usize, u32)> {
+            let sample_rate = self.format.as_ref()?.sample_rate;
+            if sample_rate == 0 {
+                return None;
+            }
+            Some((self.stats().ok()?.queued_frames, sample_rate))
+        }
+
         fn start(&mut self) -> crate::audio::Result<()> {
             IosAudioQueueOutput::start(self)
                 .map_err(|error| crate::audio::AudioError::Backend(error.to_string()))

@@ -270,6 +270,22 @@ pub mod wasapi {
                 .map_err(|error| crate::audio::AudioError::Backend(error.to_string()))
         }
 
+        /// 上报队列水位，让默认的 `can_accept_audio_frame` 闸门生效。
+        ///
+        /// 2026-10-06：Windows 之前**没有**这个闸（`a07b54a` 的 `#[cfg]` 只编
+        /// Android/OHOS），实测 PCM 环形队列在 0.24~0.68s 之间锯齿、音频断续。
+        /// 细节与实测数据见 `audio::audio_output_queue_has_capacity` 的文档。
+        ///
+        /// `format` 未就绪时上报 `None`：那时采样率未知，闸门无从判断，而解码
+        /// 泵此时本来也还没开始灌。
+        fn output_queue_occupancy(&self) -> Option<(usize, u32)> {
+            let sample_rate = self.format.as_ref()?.sample_rate;
+            if sample_rate == 0 {
+                return None;
+            }
+            Some((self.stats().ok()?.queued_frames, sample_rate))
+        }
+
         fn start(&mut self) -> crate::audio::Result<()> {
             WasapiAudioOutput::start(self)
                 .map_err(|error| crate::audio::AudioError::Backend(error.to_string()))

@@ -39,7 +39,26 @@ pub type Result<T> = std::result::Result<T, AudioError>;
 
 /// Whether another decoded frame may enter an output queue without exceeding
 /// the bounded latency budget used for playback-rate transitions.
-#[cfg(any(test, target_os = "android", target_env = "ohos"))]
+///
+/// # 为什么取消 `#[cfg]`（2026-10-06）
+///
+/// 这个辅助函数原先被 `#[cfg(any(test, target_os = "android", target_env =
+/// "ohos"))]` 圈住，只有 Android / OHOS 编进去了。它来自 `a07b54a`
+/// （"smooth playback-rate transitions across native outputs"）—— 那次工作
+/// **只覆盖了 Android/OHOS，`windows.rs` 一行没改**，于是 Windows 侧
+/// [`AudioOutputBackend::can_accept_audio_frame`] 静默落回 trait 默认的
+/// `true`，**等于完全没有闸门**。
+///
+/// 实测后果（Windows，48kHz 立体声）：解码后的 PCM 环形队列在
+/// **0.24s ~ 0.68s** 之间大幅锯齿，而本该被 250ms 高水位闸住。队列涨到
+/// 0.68s 再被抽回 0.24s —— 解码尖峰一来就把浅水位抽穿，用户听到一顿一顿。
+/// 对照组：Android/OHOS 有闸，行为正常。
+///
+/// 关键是这个失败方向**恰好是"安全"的**（不会崩、不会溢出），所以从来没人
+/// 发现。因此修法不能是"给 Windows 补一个实现"（Apple 同样漏着，下次新增
+/// 平台还会漏），而是**在 trait 默认层堵**：默认就该有闸。
+///
+/// 注意本函数**只读不写**，不参与任何速率/时钟决策。
 pub(crate) fn audio_output_queue_has_capacity(queued_frames: usize, sample_rate: u32) -> bool {
     if sample_rate == 0 {
         return true;
@@ -779,11 +798,36 @@ pub trait AudioOutputBackend: Send {
     fn set_volume(&mut self, volume: f32);
     fn volume(&self) -> f32;
     fn set_playback_rate(&mut self, _rate: f64) {}
+    /// Reports this output's queue occupancy as `(queued_frames, sample_rate)`.
+    ///
+    /// Return `None` to opt out of the bounded-latency gate (the pre-2026-10
+    /// behaviour). Backends that keep decoded PCM in a ring **should** report,
+    /// otherwise the ring grows without bound and the level swings far enough
+    /// to starve the renderer on decode spikes.
+    fn output_queue_occupancy(&self) -> Option<(usize, u32)> {
+        None
+    }
     /// Returns false while the output owns enough queued PCM to preserve the
     /// bounded playback-rate transition latency. The presenter leaves decoded
     /// frames in the worker channel, which applies backpressure safely.
+    ///
+    /// # 默认实现带闸（2026-10-06）
+    ///
+    /// 原先这里是硬编码 `true`，只有 Android/OHOS 记得覆写 —— 于是 Windows 与
+    /// Apple **静默无闸**（`a07b54a` 的 `#[cfg]` 漏编，详见
+    /// [`audio_output_queue_has_capacity`] 的文档）。实测 Windows 队列在
+    /// 0.24~0.68s 锯齿、用户听到音频卡顿，而 Android 正常。
+    ///
+    /// 改成从默认层取闸门：后端只要上报 [`Self::output_queue_occupancy`] 就自动
+    /// 获得限流，**新增平台不会再漏**。没上报的仍返回 `true`（保持旧行为，
+    /// 不给无队列概念的后端强加语义）。
     fn can_accept_audio_frame(&self) -> bool {
-        true
+        match self.output_queue_occupancy() {
+            Some((queued_frames, sample_rate)) => {
+                audio_output_queue_has_capacity(queued_frames, sample_rate)
+            }
+            None => true,
+        }
     }
     fn push(&mut self, frame: PcmAudioFrame) -> Result<AudioPushResult>;
     fn state(&self) -> AudioOutputState;
