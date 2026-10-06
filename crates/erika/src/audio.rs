@@ -15,6 +15,30 @@ pub(crate) mod spsc;
 // Keep enough old-rate PCM to cover SoundTouch startup and one normal output
 // prefill. The presenter commits the media clock at the end of this bridge.
 pub(crate) const AUDIO_OUTPUT_QUEUE_HIGH_WATER: Duration = Duration::from_millis(250);
+
+/// **稳态进流闸位**：解码泵每解一帧前查一次，队列达到它就停拉（见
+/// `AudioOutputBackend::can_accept_audio_frame`）。
+///
+/// # 为什么要从 [`AUDIO_OUTPUT_QUEUE_HIGH_WATER`] 里拆出来（2026-10-06 审查）
+///
+/// 77d6db2 之前，`audio_output_queue_has_capacity` 直接读
+/// `AUDIO_OUTPUT_QUEUE_HIGH_WATER`。而那一个常量当时已经是**四样东西**的共同
+/// 来源：
+///
+/// | 用途 | 位置 | 语义 |
+/// |---|---|---|
+/// | 变速过渡桥接时长 | `RATE_CHANGE_AUDIO_BRIDGE` | 要桥接多少旧速率 PCM |
+/// | worker 预填低水位 | `AUDIO_PREFILL_LOW_WATER` | 低于它才触发预填 |
+/// | 启动门槛 | `AUDIO_START_BUFFER` | 到它才起播 |
+/// | **稳态进流闸**（77d6db2 新增） | `audio_output_queue_has_capacity` | 每秒多少帧可进 ring |
+///
+/// 前三者是「缓冲/时钟」语义，第四个是「流控」语义，**调节奏互不相干**。焊在
+/// 一起的后果：以后任何人为了调变速手感而改那个常量，会**静默**改掉所有平台的
+/// 稳态 intake 水位，而 CI 与真机都不会报。
+///
+/// 本次先与旧值**等值**（250ms，行为零变化），只为解耦。要加余量就改这里，
+/// 不会再动到变速过渡。
+pub(crate) const AUDIO_INTAKE_HIGH_WATER: Duration = Duration::from_millis(250);
 const RATE_CHANGE_AUDIO_BRIDGE: Duration = AUDIO_OUTPUT_QUEUE_HIGH_WATER;
 const SOUNDTOUCH_SEQUENCE_MS: i32 = 25;
 const SOUNDTOUCH_SEEK_WINDOW_MS: i32 = 12;
@@ -63,9 +87,11 @@ pub(crate) fn audio_output_queue_has_capacity(queued_frames: usize, sample_rate:
     if sample_rate == 0 {
         return true;
     }
+    // 用 `AUDIO_INTAKE_HIGH_WATER`（**流控**语义），不是
+    // `AUDIO_OUTPUT_QUEUE_HIGH_WATER`（**缓冲/时钟**语义，且是变速桥接时长）。
+    // 两者已解耦，理由与"以后调余量该改哪个"见该常量文档。
     let high_water_frames = usize::try_from(
-        (sample_rate as u64).saturating_mul(AUDIO_OUTPUT_QUEUE_HIGH_WATER.as_millis() as u64)
-            / 1_000,
+        (sample_rate as u64).saturating_mul(AUDIO_INTAKE_HIGH_WATER.as_millis() as u64) / 1_000,
     )
     .unwrap_or(usize::MAX)
     .max(1);
@@ -815,7 +841,7 @@ pub trait AudioOutputBackend: Send {
     ///
     /// 原先这里是硬编码 `true`，只有 Android/OHOS 记得覆写 —— 于是 Windows 与
     /// Apple **静默无闸**（`a07b54a` 的 `#[cfg]` 漏编，详见
-    /// [`audio_output_queue_has_capacity`] 的文档）。实测 Windows 队列在
+    /// `audio_output_queue_has_capacity` 的文档）。实测 Windows 队列在
     /// 0.24~0.68s 锯齿、用户听到音频卡顿，而 Android 正常。
     ///
     /// 改成从默认层取闸门：后端只要上报 [`Self::output_queue_occupancy`] 就自动
@@ -1027,6 +1053,82 @@ fn normalize_playback_rate(rate: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::ffmpeg::PcmSampleFormat;
+
+    // ---- 默认闸门契约（2026-10-06 审查补）----
+    //
+    // 钉死两件事：
+    //  1. **有上报就有闸** —— `output_queue_occupancy` 返回 `Some` 时，
+    //     `can_accept_audio_frame` 必须真的按 `AUDIO_INTAKE_HIGH_WATER` 判。
+    //  2. **没上报就不设闸** —— 返回 `None` 时必须恒 `true`，**不能**改成
+    //     "默认永远有闸"。否则将来有人收紧默认值时，会把 `BufferedAudioOutput`
+    //     这种没有独立输出队列的后端一起误伤（它只能靠自己的 `capacity_frames`）。
+
+    struct StubBackend(Option<(usize, u32)>);
+
+    impl AudioOutputBackend for StubBackend {
+        fn configure(&mut self, _format: PcmFormat) -> Result<()> {
+            Ok(())
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn pause(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn set_volume(&mut self, _volume: f32) {}
+        fn volume(&self) -> f32 {
+            1.0
+        }
+        fn push(&mut self, _frame: crate::ffmpeg::PcmAudioFrame) -> Result<AudioPushResult> {
+            Ok(AudioPushResult {
+                accepted_frames: 0,
+                dropped_frames: 0,
+            })
+        }
+        fn state(&self) -> AudioOutputState {
+            AudioOutputState::Playing
+        }
+        fn stats(&self) -> AudioRingBufferStats {
+            AudioRingBufferStats::default()
+        }
+        fn output_queue_occupancy(&self) -> Option<(usize, u32)> {
+            self.0
+        }
+    }
+
+    /// 48kHz 下 250ms = 12000 帧。取 11999 / 12000 卡在边界两侧。
+    #[test]
+    fn default_gate_uses_intake_high_water_when_reported() {
+        assert!(StubBackend(Some((11_999, 48_000))).can_accept_audio_frame());
+        assert!(!StubBackend(Some((12_000, 48_000))).can_accept_audio_frame());
+        assert!(!StubBackend(Some((50_000, 48_000))).can_accept_audio_frame());
+    }
+
+    /// 没上报队列的后端**恒放行**（保持 77d6db2 之前的行为，不给它强加语义）。
+    #[test]
+    fn backend_without_reported_queue_is_never_gated() {
+        assert!(StubBackend(None).can_accept_audio_frame());
+    }
+
+    /// 采样率未知（0）时不得把一切判成"满" —— 那会让音频永远不灌。
+    #[test]
+    fn unknown_sample_rate_never_blocks_intake() {
+        assert!(audio_output_queue_has_capacity(usize::MAX, 0));
+    }
+
+    /// 闸位常量与文档承诺一致：48kHz × 250ms = 12000 帧。
+    /// 改 `AUDIO_INTAKE_HIGH_WATER` 时这条会提醒你同步上面的边界值。
+    #[test]
+    fn intake_high_water_matches_its_documented_value() {
+        assert_eq!(AUDIO_INTAKE_HIGH_WATER, Duration::from_millis(250));
+        assert_eq!(
+            48_000u64 * AUDIO_INTAKE_HIGH_WATER.as_millis() as u64 / 1_000,
+            12_000
+        );
+    }
 
     #[test]
     fn playback_rate_supports_short_form_video_acceleration() {
