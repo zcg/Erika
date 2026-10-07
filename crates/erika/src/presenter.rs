@@ -1282,13 +1282,20 @@ impl PresenterRuntime {
         self.debug_hud.enabled()
     }
 
-    pub fn set_subtitle_scale(&mut self, scale: f64) {
+    /// 设置字幕字号全局缩放。**返回画面是否真的变了**（去重命中时为 `false`）。
+    ///
+    /// 返回值的用途与 [`Self::set_danmaku_config`] 同源：宿主的兜底对齐路径
+    /// 每 500ms 调一次，若拿不到"变了没有"的结论，就只能无条件续渲染窗口，
+    /// 而那会让宿主侧的"非播放态空闲跳过"判据永远为真（见 bili-rs
+    /// `Player::apply_subtitle_style`）。
+    pub fn set_subtitle_scale(&mut self, scale: f64) -> bool {
         let scale = normalize_subtitle_font_scale(scale);
         if (self.subtitle_font_scale - scale).abs() < 0.001 {
-            return;
+            return false;
         }
         self.subtitle_font_scale = scale;
         self.refresh_current_overlay();
+        true
     }
 
     /// Sets the fallback subtitle font. An empty family or path clears that
@@ -1303,8 +1310,15 @@ impl PresenterRuntime {
         self.apply_subtitle_style(style);
     }
 
-    pub fn set_subtitle_style(&mut self, style: SubtitleStyleConfig) {
-        self.apply_subtitle_style(style);
+    /// 下发字幕样式。**返回画面是否真的变了**（去重命中时为 `false`）。
+    ///
+    /// 返回值的用途与 [`Self::set_subtitle_scale`]、
+    /// [`Self::set_danmaku_config`] 同源：让宿主的兜底对齐路径能判断
+    /// "该续渲染窗口了吗"，而不必每 500ms 无条件续一次（那会让宿主自己的
+    /// "非播放态空闲跳过"判据永远为真，详见 bili-rs
+    /// `Player::apply_subtitle_style`）。
+    pub fn set_subtitle_style(&mut self, style: SubtitleStyleConfig) -> bool {
+        self.apply_subtitle_style(style)
     }
 
     pub fn subtitle_style(&self) -> &SubtitleStyleConfig {
@@ -1468,13 +1482,14 @@ impl PresenterRuntime {
         )
     }
 
-    fn apply_subtitle_style(&mut self, style: SubtitleStyleConfig) {
+    fn apply_subtitle_style(&mut self, style: SubtitleStyleConfig) -> bool {
         let style = style.normalized();
         if self.subtitle_style == style {
-            return;
+            return false;
         }
         self.subtitle_style = style;
         self.refresh_current_overlay();
+        true
     }
 
     pub fn set_danmaku_timeline(&mut self, timeline: DanmakuTimeline) {
@@ -1562,8 +1577,20 @@ impl PresenterRuntime {
         self.set_danmaku_config(config);
     }
 
-    pub fn set_danmaku_config(&mut self, config: DanmakuLayoutConfig) {
-        match self.danmaku.apply_config(config.clone()) {
+    /// 下发弹幕布局配置。**返回这次是否真的改变了配置。**
+    ///
+    /// 返回值给宿主的"兜底对齐"路径用（见 bili-rs `Player::apply_danmaku_style`）：
+    /// 它每 500ms 被轮询调一次，若宿主无法区分"配置没变"与"配置变了"，就只能
+    /// 无条件续一次渲染窗口 —— 而 500ms 续 1000ms 窗口会让宿主侧的
+    /// "非播放态空闲跳过"判据永远为真（详见那处注释）。内核本来就分得清
+    /// （`apply_config` 返回 `DanmakuConfigChange`），这里把结论透出去，
+    /// 省得宿主在**自己这边**复刻一遍 config 的逐字段等价判定。
+    ///
+    /// ⚠️ 这不是"优化调用开销"级别的返回值：调用方若忽略它，行为与改动前
+    /// 完全一致（配置照样生效），只是会多续渲染窗口。属于向后兼容的加法。
+    pub fn set_danmaku_config(&mut self, config: DanmakuLayoutConfig) -> DanmakuConfigChange {
+        let change = self.danmaku.apply_config(config.clone());
+        match change {
             DanmakuConfigChange::Unchanged => {}
             DanmakuConfigChange::PaintOnly => {
                 self.danmaku_planner.set_paint_config(config);
@@ -1594,6 +1621,7 @@ impl PresenterRuntime {
                 self.request_current_danmaku_plan_for_current_time();
             }
         }
+        change
     }
 
     pub fn danmaku_config(&self) -> Option<&DanmakuLayoutConfig> {

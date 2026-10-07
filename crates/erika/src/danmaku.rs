@@ -377,11 +377,28 @@ impl DanmakuLayoutConfig {
     }
 }
 
+/// 一次 [`DanmakuLayoutConfig`] 下发实际造成了什么级别的变化。
+///
+/// 公开（而非 `pub(crate)`）是因为它经由
+/// [`crate::presenter::PresenterRuntime::set_danmaku_config`] 流向宿主：
+/// 宿主的"每 500ms 兜底对齐"路径需要据此判断**画面是否真的变了**，
+/// 否则只能无条件续渲染窗口，而那会让宿主自己的"非播放态空闲跳过"
+/// 判据永远为真（详见 bili-rs `Player::apply_danmaku_style` 的注释）。
+///
+/// 宿主只需判 `!= Unchanged`；`PaintOnly` 与 `Layout` 的区别是内核内部的
+/// 优化粒度（只重画 vs 重排），对宿主是同一件事：画面变了，要重绘。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DanmakuConfigChange {
+pub enum DanmakuConfigChange {
     Unchanged,
     PaintOnly,
     Layout,
+}
+
+impl DanmakuConfigChange {
+    /// 画面是否真的变了（宿主侧的判据：`!= Unchanged`）。
+    pub fn is_changed(self) -> bool {
+        !matches!(self, DanmakuConfigChange::Unchanged)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
