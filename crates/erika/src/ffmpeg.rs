@@ -2308,7 +2308,7 @@ unsafe fn ensure_d3d11va_frames_for_context(
         frames_ctx.width = aligned_width;
         frames_ctx.height = aligned_height;
         frames_ctx.initial_pool_size = d3d11va_pool_size(
-            unsafe { (*context).codec_id },
+            context,
             aligned_width,
             aligned_height,
             sw_format,
@@ -2424,13 +2424,27 @@ const D3D11VA_RENDERER_RESIDENT_FRAMES: i32 = 1;
 #[cfg(target_os = "windows")]
 const D3D11VA_BASE_WORK_SURFACES: i32 = 1;
 
+/// 建池路径读 `AVCodecContext::codec_id` 的唯一入口（附 null 契约断言）。
+///
+/// 单独一个函数而不是散落三处 `unsafe { (*ctx).codec_id }`：这三个函数都
+/// 要求 `context` 非空（真实建池路径永远如此，单测也改传伪造 context 而不再
+/// 传 null——见 `d3d11va_pool_size` 的 `context` 参数文档）。把"绝不为 null"
+/// 这条契约和那个 `unsafe` 收在一处，将来要加检查只改这一行。
+#[cfg(target_os = "windows")]
+fn d3d11va_context_codec_id(context: *const sys::AVCodecContext) -> sys::AVCodecID {
+    debug_assert!(
+        !context.is_null(),
+        "建池路径的 AVCodecContext 绝不能为 null"
+    );
+    unsafe { (*context).codec_id }
+}
+
 /// 解码器 DPB（参考帧）需要预留的切片数，按 codec 取规范上限。
 ///
 /// 与 `dxva2.c:623-628` 完全一致：H264/HEVC 16，VP9/AV1 8，其它 2。
 ///
-/// 这里**不**按"B 站 1080P 通常 ref=4"去压这个数字：池在 open 时按 SPS 定容，
-/// 之后无法增长，低估一次就是一次 `get_buffer failed`。回归片源里只要出现
-/// 一个高参考帧的视频，压过的池就会当场失效。
+/// 这是**兜底值**，只在 [`d3d11va_sps_reference_surfaces`] 拿不到真实值时用
+/// （见那里的可用性判据）。
 #[cfg(target_os = "windows")]
 fn d3d11va_reference_surfaces(codec_id: sys::AVCodecID) -> i32 {
     if codec_id == sys::AVCodecID_AV_CODEC_ID_H264 || codec_id == sys::AVCodecID_AV_CODEC_ID_HEVC {
@@ -2442,6 +2456,102 @@ fn d3d11va_reference_surfaces(codec_id: sys::AVCodecID) -> i32 {
     } else {
         2
     }
+}
+
+/// `d3d11va_reference_surfaces` 允许的下限：低于它的"实测值"不可信。
+///
+/// DPB 里至少有当前正在解码的那一片（它也是一条参考链的起点），所以规范上
+/// 不存在 ref < 1 的合法片源。留 1 的下界而不是直接采信，是为了让"读到 0"
+/// 这类异常（解码器还没解 SPS）自然落回兜底分支，而不是建出池深 1+ 的池。
+#[cfg(target_os = "windows")]
+const D3D11VA_MIN_SPS_REFERENCE_FRAMES: i32 = 1;
+
+/// 从 `AVCodecContext::refs` 读该片源**真实**的参考帧数（H.264 专有）。
+///
+/// # 这个数为什么可信
+///
+/// FFmpeg 自己就把 SPS 解出来的 `num_ref_frames` 回填到 `avctx->refs`
+/// （`third_party/src/FFmpeg-n8.1.2/libavcodec/h264_slice.c:1101`：
+/// `h->avctx->refs = sps->ref_frame_count;`），而 `avctx->refs` 的字段文档就是
+/// "number of reference frames / decoding: Set by lavc"（`avcodec.h:692-697`）。
+///
+/// **时序上也来得及**：`select_hw_format` 由 `avctx->get_format` 回调触发，
+/// 它在 `h264_init_ps` 的第 1155 行（`get_pixel_format` → `ff_get_format`）
+/// 被调用，而 `avctx->refs` 的赋值在**同一个函数**的第 1101 行——赋值先于回调。
+/// 也就是说建池那一刻，SPS 早已解析完毕，不需要我们自己解 NAL。
+///
+/// # 为什么 H.264 之外一律返回 `None`
+///
+/// 全 FFmpeg 树里给 `avctx->refs` 赋值的只有两处：`h264_slice.c:1101` 和
+/// `apv_decode.c:116`（后者恒置 0）。**HEVC / VP9 / AV1 / VP8 的解码器都不
+/// 写这个字段**，它会停在 `options_table.h` 里 `refs` 选项的默认值 1。
+///
+/// 所以对非 H.264 调用本函数，读到的"真实值"其实是那个默认 1——按它建池会
+/// 少算 15 片参考帧，是必现的 `get_buffer failed`。必须返回 `None` 退回规范
+/// 上限，不能"看着像个数字就用"。
+///
+/// HEVC 其实也有等价信息（`sps->temporal_layer[].max_dec_pic_buffering`，
+/// 见 `hevc/hevcdec.c:3385-3386`），但它只存在于 `HEVCSPS` 私有结构里，
+/// `AVCodecContext` 上没有对应字段——要读只能改 FFmpeg 或自己解 SPS。当前
+/// 不做（见下）。
+///
+/// `context` 绝不能为 null（契约见 [`d3d11va_context_codec_id`]）。
+///
+/// 单测不再用 `ptr::null()` 表示"拿不到 SPS 实测值"，而是传一个**只填了
+/// `codec_id` 与 `refs` 的伪造 context**（refs 填 0，或 codec 非 H.264）——
+/// 那才是真实建池时"拿不到实测值"的两种成因，也顺带把 null 路径从测试里
+/// 彻底去掉，省得留一条只在测试里存在的分支。
+#[cfg(target_os = "windows")]
+fn d3d11va_sps_reference_surfaces(context: *const sys::AVCodecContext) -> Option<i32> {
+    if d3d11va_context_codec_id(context) != sys::AVCodecID_AV_CODEC_ID_H264 {
+        return None;
+    }
+    let refs = unsafe { (*context).refs };
+    (refs >= D3D11VA_MIN_SPS_REFERENCE_FRAMES).then_some(refs)
+}
+
+/// 实际用于建池的参考帧切片数：能用 SPS 实测值就用，否则用规范上限。
+///
+/// # 收益：**只在 1440P / 4K 上，1080P 及以下为 0**
+///
+/// `pool = clamp(预算 / 单片字节, 下界, 旧固定值)` —— 参考帧只影响**下界**，
+/// 而 64MiB 预算在低分辨率上折算出的片数**高于**旧下界，所以那一档根本不
+/// 受下界影响。下界只在预算折算值掉到它以下时（即单片够大）才成为约束。
+///
+/// 实测（队列 3、`num_ref_frames` 实测 4 vs 规范上限 16）：
+///
+/// | 档位 | 单片 | 预算折算 | 旧池(ref16) | 新池(ref4) | 旧内存 | 新内存 |
+/// |---|---|---|---|---|---|---|
+/// | 720P NV12 | 1.32MB | 48 | 48 | 48 | 63MB | 63MB |
+/// | 1080P NV12 | 2.99MB | 21 | 21 | **21** | 63MB | **63MB** |
+/// | 1440P NV12 | 5.27MB | 12 | 21 | **12** | 111MB | **63MB** |
+/// | 4K P010 | 23.91MB | 2 | 21 | **9** | 502MB | **215MB** |
+///
+/// **1080P 一格都没省** —— 预算折算 21 片恰好等于旧下界 21，两边都取 21。
+/// （本文档初稿曾按"21→9、省 38MB"估算，那是错的：漏了预算这一层的 clamp，
+/// 是单测实测把它打出来的。）真正省下的是 1440P（−48MB）与 4K（−287MB）。
+///
+/// 换句话说：这个优化救的是**高分辨率**。而 4K 那 502MB 恰好就是内存报告里
+/// "4K−1080P 差 254MB"的来源量级——高分辨率下帧池是唯一的大头。
+/// 要让 1080P 也降，得动 `D3D11VA_POOL_BUDGET_BYTES` 预算本身，那是另一个
+/// 更激进的旋钮（预算正是防止低分辨率池过小的护栏），本轮不碰。
+///
+/// # 为什么不能更激进
+///
+/// 池在 open 时定容、之后**无法增长**（D3D11VA 的帧数组用
+/// `ArraySize = initial_pool_size` 一次建好，见本文件 `d3d11va_init_hw_frames`
+/// 的注释），低估一次就是一次 `get_buffer failed` —— 表现是"有声音无画面、
+/// 宿主换源重开、进度归零"，正是当年把池从 20 加到 60 的那次故障。所以：
+///
+/// - 只在 `avctx->refs` 确定已被 lavc 填过时才采信（H.264，见上）；
+/// - 采信时**仍然保留消费端余量**（`d3d11va_consumer_headroom_frames` 不变），
+///   因为真正会打爆池的是"解码器 pin 住多少片"，参考帧只是其中一项；
+/// - 实测值只调 `d3d11va_reference_surfaces` 这一项，`D3D11VA_POOL_BUDGET_BYTES`
+///   的预算折算与旧固定上限都不动 —— 后两者是另外两条独立的保守约束。
+#[cfg(target_os = "windows")]
+fn d3d11va_effective_reference_surfaces(context: *const sys::AVCodecContext) -> i32 {
+    d3d11va_sps_reference_surfaces(context)
+        .unwrap_or_else(|| d3d11va_reference_surfaces(d3d11va_context_codec_id(context)))
 }
 
 /// 池深下界：低于它的池在某些播放路径上必然耗尽。
@@ -2474,10 +2584,17 @@ fn d3d11va_reference_surfaces(codec_id: sys::AVCodecID) -> i32 {
 /// 的片源就会撞 `get_buffer failed`（当年固定池 48 片崩溃是同一种故障）。
 /// 正因如此，这里不接受"魔法数字"而是由 `d3d11va_consumer_headroom_frames`
 /// 从队列容量推导——调用方把实际队列容量传进来，两者不可能对不上。
+/// 池深下界：低于它的池在某些播放路径上必然耗尽。
+///
+/// = DXVA 基线（1 工作面 + 参考帧）+ 消费端常驻（handoff 队列 + 渲染器 1 片）。
+///
+/// 参考帧那一项走 [`d3d11va_effective_reference_surfaces`]：H.264 能拿到 SPS
+/// 实测值就用实测值，其余 codec 落回规范上限。**只有这一项被 SPS 影响**——
+/// 工作面与消费端两项是本项目自己的并发模型，与片源无关。
 #[cfg(target_os = "windows")]
-fn d3d11va_pool_floor(codec_id: sys::AVCodecID, consumer_queue_frames: i32) -> i32 {
+fn d3d11va_pool_floor(context: *const sys::AVCodecContext, consumer_queue_frames: i32) -> i32 {
     D3D11VA_BASE_WORK_SURFACES
-        + d3d11va_reference_surfaces(codec_id)
+        + d3d11va_effective_reference_surfaces(context)
         + d3d11va_consumer_headroom_frames(consumer_queue_frames)
 }
 
@@ -2515,10 +2632,17 @@ fn d3d11va_pool_legacy_pool_size(codec_id: sys::AVCodecID) -> i32 {
 ///
 /// 下界由 `d3d11va_pool_floor` 决定，而它把 `consumer_queue_frames`（视频帧
 /// handoff 队列容量）算成消费端预留——队列容量与池深必须同源，理由见
-/// `d3d11va_pool_floor` 的推导。1080P H.264：
-/// - 队列 8 → 下界 26 片 ≈ 81MB（宿主 bili-rs 现状）；
-/// - 队列 3 → 下界 21 片 ≈ 66MB（Erika 默认值）；
-/// - 队列 4 → 下界 22 片 ≈ 69MB。
+/// `d3d11va_pool_floor` 的推导。1080P H.264（**按规范上限 16 参考帧**，即
+/// 拿不到 SPS 实测值的 codec 走这条）：
+/// - 队列 8 → 下界 26 片 ≈ 78MB；
+/// - 队列 3 → 下界 21 片 ≈ 63MB（Erika 默认值）；
+/// - 队列 4 → 下界 22 片 ≈ 66MB。
+///
+/// ⚠️ **上表是"下界"，不是最终池深**。1080P 的 64MiB 预算恰好折算出 21 片，
+/// 与队列 3 的下界相等，所以实际就是 21 片；队列 8 时预算 21 < 下界 26，
+/// 取 26。H.264 拿到 SPS 实测 `num_ref_frames` 后下界按实测走，但**只有在
+/// 预算折算值低于下界时才会改变池深** —— 即只有 1440P / 4K。收益与实测
+/// 数据见 [`d3d11va_effective_reference_surfaces`]。
 ///
 /// 历史结论（保留，别删）：这个池曾经是固定值，且是**从 20 加到 60/40** 的。
 /// 当时宿主在快 CDN 源下遇到 `get_buffer failed`（表现为有声音无画面，随后宿主
@@ -2537,12 +2661,18 @@ fn d3d11va_pool_legacy_pool_size(codec_id: sys::AVCodecID) -> i32 {
 /// 1. 硬解路径把 `thread_count` 收敛为 1（见 `configure_d3d11va`），把解码器
 ///    内部的池需求压回 DXVA 规范基线；
 /// 2. 池深按"内存预算 / 单片字节"折算，下界由 `d3d11va_pool_floor` 保证，
-///    而后者由消费端队列容量推导。
-/// 只有 1 和 2 同时成立时，小于 48 的池深才是安全的；单独调小池深就是复现
-/// 当年那次崩溃。
+///    而后者由消费端队列容量与**片源实测参考帧数**推导。
+///    只有 1 和 2 同时成立时，小于 48 的池深才是安全的；单独调小池深就是
+///    复现当年那次崩溃。
+///
+/// `context` 用于两件事：读 SPS 实测参考帧数，以及取 `codec_id` 决定参考帧
+/// 上限与旧固定池深。**绝不能为 null**（契约见 [`d3d11va_context_codec_id`]）；
+/// 过去 `codec_id` 是独立入参，那有两个问题：8 个参数触发 clippy 的
+/// `too_many_arguments`，且 `codec_id` 与 `context.codec_id` 理论上可以对不上
+/// ——现在两者同源，那个分歧从类型上就不存在了。
 #[cfg(target_os = "windows")]
 fn d3d11va_pool_size(
-    codec_id: sys::AVCodecID,
+    context: *const sys::AVCodecContext,
     width: i32,
     height: i32,
     sw_format: sys::AVPixelFormat,
@@ -2554,8 +2684,8 @@ fn d3d11va_pool_size(
     let by_budget = (budget_bytes / slice_bytes.max(1)) as i32;
     let floor = min_frames_override
         .map(|value| value.max(1))
-        .unwrap_or_else(|| d3d11va_pool_floor(codec_id, consumer_queue_frames));
-    let legacy = d3d11va_pool_legacy_pool_size(codec_id);
+        .unwrap_or_else(|| d3d11va_pool_floor(context, consumer_queue_frames));
+    let legacy = d3d11va_pool_legacy_pool_size(d3d11va_context_codec_id(context));
     by_budget.clamp(floor, legacy)
 }
 
@@ -6147,26 +6277,62 @@ unsafe extern "C" fn select_hw_format(
 mod tests {
     use super::*;
 
+    /// 池深单测共用的伪造 `AVCodecContext`：只填 `codec_id` 与 `refs`。
+    ///
+    /// 为什么不用 `avcodec_alloc_context3()`：那会真分配几百 KB，而这几个函数
+    /// 只读那两个字段，不碰其余任何东西。用 `MaybeUninit::zeroed()` 造一个
+    /// 最小可用实例即可（`refs = 0` 就是"lavc 还没解 SPS"的真实状态）。
+    ///
+    /// 顺带这也是 `d3d11va_pool_size` 的 `context` 参数**不允许为 null** 的
+    /// 由来——单测改传伪造实例后，`ptr::null()` 那条只在测试里存在的分支
+    /// 就没有调用者了。
+    #[cfg(target_os = "windows")]
+    fn fake_ctx(codec_id: sys::AVCodecID, refs: i32) -> *const sys::AVCodecContext {
+        use std::mem::MaybeUninit;
+        let mut raw = MaybeUninit::<sys::AVCodecContext>::zeroed();
+        let ptr = raw.as_mut_ptr();
+        unsafe {
+            (*ptr).codec_id = codec_id;
+            (*ptr).refs = refs;
+            ptr
+        }
+    }
+
+    /// "拿不到 SPS 实测值"的兜底实例：H.264 但 `refs = 0`。
+    ///
+    /// 覆盖的是 `d3d11va_sps_reference_surfaces` 里那条
+    /// `refs < D3D11VA_MIN_SPS_REFERENCE_FRAMES` 分支——也就是解码器还没解出
+    /// SPS（建池早于 SPS 解析）时的样子。
+    #[cfg(target_os = "windows")]
+    fn fallback_ctx_h264() -> *const sys::AVCodecContext {
+        fake_ctx(sys::AVCodecID_AV_CODEC_ID_H264, 0)
+    }
+
     #[test]
     fn linked_ffmpeg_reports_version() {
         assert!(!version().is_empty());
     }
 
     /// 池深按"预算 / 单片字节"折算，但不许击穿下界、也不许超过旧的固定值。
+    ///
+    /// **全部传 `fallback_ctx_h264()`** —— 即"拿不到 SPS 实测值"的保守情形，
+    /// 走规范上限。这让本测试锁定的仍是**兜底行为**（真实世界里等于
+    /// HEVC / VP9 / AV1，它们永远走这条），不受 H.264 实测路径影响。H.264 的
+    /// 实测路径由 `d3d11va_pool_size_uses_sps_reference_frames_for_h264` 覆盖。
     #[cfg(target_os = "windows")]
     #[test]
     fn d3d11va_pool_size_follows_budget_between_floor_and_legacy_ceiling() {
         use sys::{
-            AVCodecID_AV_CODEC_ID_AV1, AVCodecID_AV_CODEC_ID_H264, AVPixelFormat_AV_PIX_FMT_NV12,
+            AVCodecID_AV_CODEC_ID_AV1, AVPixelFormat_AV_PIX_FMT_NV12,
             AVPixelFormat_AV_PIX_FMT_P010LE,
         };
 
-        // 1080P H.264（coded 1920x1088，NV12 3.13MB/片）：64MiB 折算 21 片，
+        // 1080P H.264（coded 1920x1088，NV12 2.99MB/片）：64MiB 折算 21 片，
         // 低于队列 8 时的下界 26（1 工作面 + 16 参考帧 + 8 队列 + 1 渲染器）
-        // → 取 26，≈81MB。
+        // → 取 26，≈78MB。
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_H264,
+                fallback_ctx_h264(),
                 1920,
                 1088,
                 AVPixelFormat_AV_PIX_FMT_NV12,
@@ -6177,11 +6343,11 @@ mod tests {
             26
         );
 
-        // 4K 10bit（P010 25MB/片）：预算只折算得出 2 片，仍然不能击穿下界。
+        // 4K 10bit（P010 23.91MB/片）：预算只折算得出 2 片，仍然不能击穿下界。
         // 这是刻意的：高分辨率省内存靠的是"不再乘 60 片"，不是靠赌参考帧数。
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_H264,
+                fallback_ctx_h264(),
                 3840,
                 2176,
                 AVPixelFormat_AV_PIX_FMT_P010LE,
@@ -6196,7 +6362,7 @@ mod tests {
         // 池总内存仍被 64MiB 预算框住。
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_H264,
+                fallback_ctx_h264(),
                 1280,
                 720,
                 AVPixelFormat_AV_PIX_FMT_NV12,
@@ -6211,7 +6377,7 @@ mod tests {
         // 高于下界，所以取 21。
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_AV1,
+                fake_ctx(AVCodecID_AV_CODEC_ID_AV1, 0),
                 1920,
                 1088,
                 AVPixelFormat_AV_PIX_FMT_NV12,
@@ -6223,29 +6389,33 @@ mod tests {
         );
     }
 
-    /// 下界跟着 handoff 队列容量走：队列 8→3 时 1080P 池 26→21 片（≈81→66MB），
+    /// 下界跟着 handoff 队列容量走：队列 8→3 时 1080P 池 26→21 片（≈78→63MB），
     /// 两者留给参考帧的余量相同（见 `d3d11va_pool_floor` 的推导）。
     ///
     /// 这条测试就是"队列与池深必须同源"的回归线：谁把队列容量从
-    /// `DecoderConfig` 到建池的那条链路改断，这里立刻红。
+    /// `DecoderConfig` 到建池的那条链路改断，这里立刻红。全部传
+    /// `fallback_ctx_h264()` 固定在"无 SPS 实测值"的保守分支。
     #[cfg(target_os = "windows")]
     #[test]
     fn d3d11va_pool_floor_tracks_the_consumer_queue_capacity() {
-        use sys::{AVCodecID_AV_CODEC_ID_AV1, AVCodecID_AV_CODEC_ID_H264};
+        use sys::AVCodecID_AV_CODEC_ID_AV1;
 
         // 1080P H.264：下界 = 1 + 16 + (队列 + 1)。
         for (queue, expected) in [(3, 21), (4, 22), (8, 26), (16, 34)] {
             assert_eq!(
-                d3d11va_pool_floor(AVCodecID_AV_CODEC_ID_H264, queue),
+                d3d11va_pool_floor(fallback_ctx_h264(), queue),
                 expected,
                 "queue={queue}"
             );
         }
         // VP9/AV1 参考帧上限 8：1080P 折算 21 片，队列 3 时下界 13 < 21 → 取预算值。
-        assert_eq!(d3d11va_pool_floor(AVCodecID_AV_CODEC_ID_AV1, 3), 13);
+        assert_eq!(
+            d3d11va_pool_floor(fake_ctx(AVCodecID_AV_CODEC_ID_AV1, 0), 3),
+            13
+        );
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_AV1,
+                fake_ctx(AVCodecID_AV_CODEC_ID_AV1, 0),
                 1920,
                 1088,
                 sys::AVPixelFormat_AV_PIX_FMT_NV12,
@@ -6255,10 +6425,10 @@ mod tests {
             ),
             21
         );
-        // 1080P H.264 + 队列 3：预算折算 21 片 == 下界 21 → 21 片 ≈ 66MB。
+        // 1080P H.264 + 队列 3：预算折算 21 片 == 下界 21 → 21 片 ≈ 63MB。
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_H264,
+                fallback_ctx_h264(),
                 1920,
                 1088,
                 sys::AVPixelFormat_AV_PIX_FMT_NV12,
@@ -6268,6 +6438,120 @@ mod tests {
             ),
             21
         );
+    }
+
+    /// H.264 走 SPS 实测参考帧数：池深按实测 `num_ref_frames` 降下来。
+    ///
+    /// **实测值只影响"下界"，而下界只在预算折算值低于它时才决定池深** ——
+    /// 这是本测试最重要的一条断言（见下面 1080P 那一段）。B 站 1080P 的
+    /// `num_ref_frames` 多为 2~4，但 1080P 的池深**一点没变**；真正省下的是
+    /// 1440P 与 4K。
+    ///
+    /// 伪造 context 的做法与理由见同模块的 `fake_ctx` / `fallback_ctx_h264`。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn d3d11va_pool_size_uses_sps_reference_frames_for_h264() {
+        use sys::{AVCodecID_AV_CODEC_ID_AV1, AVCodecID_AV_CODEC_ID_H264};
+
+        // 1080P H.264 + SPS 实测 ref=4 + 队列 3：
+        // 下界 = 1 + 4 + (3 + 1) = 9 —— 实测值确实进了下界公式。
+        let h264 = fake_ctx(AVCodecID_AV_CODEC_ID_H264, 4);
+        assert_eq!(d3d11va_sps_reference_surfaces(h264), Some(4));
+        assert_eq!(d3d11va_pool_floor(h264, 3), 9);
+        // ⚠️ **1080P 的池深并没有因此变浅**：预算 64MiB / 2.99MB 折算出 21 片，
+        // 而旧下界也是 21（1+16+4）→ 两者都取 21，内存不变（63MB）。
+        //
+        // 这一点必须写死成断言，否则很容易像本文档初稿那样误以为"降参考帧 =
+        // 降池深"。真实结论：**1080P 的池深由 `D3D11VA_POOL_BUDGET_BYTES`
+        // 预算封顶，不是由参考帧下界封顶** —— 预算 21 片恰好等于旧下界 21。
+        // 收益只出现在预算折算值**低于**下界的分辨率上（1440P / 4K）。
+        assert_eq!(
+            d3d11va_pool_size(
+                h264,
+                1920,
+                1088,
+                sys::AVPixelFormat_AV_PIX_FMT_NV12,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None,
+                3
+            ),
+            21,
+            "1080P 由预算封顶，SPS 实测值在此不改变池深"
+        );
+
+        // 4K 10bit（P010 23.91MB/片）：预算只折算出 2 片，**下界是唯一约束**，
+        // 于是实测参考帧直接决定池深 —— 这才是本项优化的真实收益面。
+        // ref=16（旧）→ 下界 26 → 622MB；ref=4（实测）→ 下界 14 → 335MB。
+        assert_eq!(
+            D3D11VA_POOL_BUDGET_BYTES
+                / d3d11va_slice_bytes(3840, 2176, sys::AVPixelFormat_AV_PIX_FMT_P010LE),
+            2,
+            "4K 预算折算恒为 2 片（下界才是约束）"
+        );
+        assert_eq!(
+            d3d11va_pool_size(
+                fake_ctx(AVCodecID_AV_CODEC_ID_H264, 16),
+                3840,
+                2176,
+                sys::AVPixelFormat_AV_PIX_FMT_P010LE,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None,
+                8
+            ),
+            26,
+            "4K + 队列 8 + ref 16：下界 26（= 旧行为）"
+        );
+        assert_eq!(
+            d3d11va_pool_size(
+                fake_ctx(AVCodecID_AV_CODEC_ID_H264, 4),
+                3840,
+                2176,
+                sys::AVPixelFormat_AV_PIX_FMT_P010LE,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None,
+                8
+            ),
+            14,
+            "4K + 队列 8 + 实测 ref 4：下界 1+4+(8+1)=14（旧为 26）→ 省 12 片 ≈ 287MB"
+        );
+
+        // 实测 ref=16 必须与旧的规范上限路径完全一致（不回归）。
+        assert_eq!(
+            d3d11va_pool_size(
+                fake_ctx(AVCodecID_AV_CODEC_ID_H264, 16),
+                1920,
+                1088,
+                sys::AVPixelFormat_AV_PIX_FMT_NV12,
+                D3D11VA_POOL_BUDGET_BYTES,
+                None,
+                8
+            ),
+            26
+        );
+
+        // 非 H.264 一律忽略 avctx->refs（哪怕它是 16 这个"看起来很真"的值）——
+        // 因为 HEVC/VP9/AV1 的解码器根本不写该字段，写进去的是选项默认值 1。
+        // 误采信会少算 15 片参考帧 = 必现 get_buffer failed。
+        for codec in [
+            AVCodecID_AV_CODEC_ID_AV1,
+            sys::AVCodecID_AV_CODEC_ID_HEVC,
+            sys::AVCodecID_AV_CODEC_ID_VP9,
+        ] {
+            let fake = fake_ctx(codec, 16);
+            assert_eq!(
+                d3d11va_sps_reference_surfaces(fake),
+                None,
+                "codec={codec:?} 不该采信 avctx->refs"
+            );
+            assert_eq!(
+                d3d11va_effective_reference_surfaces(fake),
+                d3d11va_reference_surfaces(codec),
+                "非 H.264 必须落回规范上限"
+            );
+        }
+
+        // refs 还没被解码器填过（0）→ 不可信 → 落回规范上限。
+        assert_eq!(d3d11va_sps_reference_surfaces(fallback_ctx_h264()), None);
     }
 
     /// `DecoderConfig` 的兜底队列容量必须与 `PlayerConfig` 的默认值一致，
@@ -6284,12 +6568,12 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn d3d11va_pool_size_respects_overrides_and_legacy_ceiling() {
-        use sys::{AVCodecID_AV_CODEC_ID_H264, AVPixelFormat_AV_PIX_FMT_NV12};
+        use sys::AVPixelFormat_AV_PIX_FMT_NV12;
 
         // 下界覆盖值优先于队列推导值（逃生舱：救援/诊断时手工钉死池深）。
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_H264,
+                fallback_ctx_h264(),
                 1920,
                 1088,
                 AVPixelFormat_AV_PIX_FMT_NV12,
@@ -6303,7 +6587,7 @@ mod tests {
         // 预算再大也封顶在旧固定值 60/40/10，不会因为预算富裕而多占内存。
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_H264,
+                fallback_ctx_h264(),
                 1280,
                 720,
                 AVPixelFormat_AV_PIX_FMT_NV12,
@@ -6317,7 +6601,7 @@ mod tests {
         // 预算小到折算为 0 片时仍然保底在下界。
         assert_eq!(
             d3d11va_pool_size(
-                AVCodecID_AV_CODEC_ID_H264,
+                fallback_ctx_h264(),
                 1280,
                 720,
                 AVPixelFormat_AV_PIX_FMT_NV12,
