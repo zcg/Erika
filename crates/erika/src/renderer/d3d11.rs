@@ -2420,6 +2420,15 @@ impl D3d11Renderer {
 
     fn import_d3d11va_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
         trace("import_d3d11va_frame: enter");
+        // ── 首帧导入耗时拆解（前 3 帧一次性）──
+        // 宿主 bili-rs 实测首帧 `pump_video` 阻塞 ~450ms（"点开先黑一下"里占
+        // 比不小）。这里逐步计时，定位卡在哪一步：跨设备 OpenSharedResource
+        // 冷启动 / SRV 创建 / 退役上一帧。走 stderr（宿主已 SetStdHandle 把
+        // stderr 重定向到 %TEMP%\bili-rs-stderr.log）。
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static IMPORT_PROBE: AtomicU32 = AtomicU32::new(0);
+        let probe_n = IMPORT_PROBE.fetch_add(1, Ordering::Relaxed);
+        let t_enter = Instant::now();
         let Some(texture_ref) = frame.frame.d3d11va_texture() else {
             return Err(PlayerError::Renderer(
                 "d3d11: hardware frame is not a D3D11VA texture".to_string(),
@@ -2437,8 +2446,10 @@ impl D3d11Renderer {
             .map_err(|error| {
                 PlayerError::Renderer(format!("d3d11: av_frame_ref failed: {error}"))
             })?;
+        let t_ref = t_enter.elapsed();
         let source_texture = clone_d3d11_texture(texture_ref.raw_texture())?;
         let texture = self.import_texture_for_current_device(&source_texture)?;
+        let t_import = t_enter.elapsed();
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
@@ -2466,6 +2477,7 @@ impl D3d11Renderer {
             .map_err(|error| d3d11va_srv_error(error, &desc, array_index))?;
         let chroma = create_plane_srv(state, &texture, array_index, texture_format.chroma_srv())
             .map_err(|error| d3d11va_srv_error(error, &desc, array_index))?;
+        let t_srv = t_enter.elapsed();
         let frame_token = self.next_frame_token;
         self.next_frame_token = self.next_frame_token.wrapping_add(1);
         self.stats.hardware_video_frames += 1;
@@ -2491,6 +2503,24 @@ impl D3d11Renderer {
                 .packed_alpha_right(self.video_alpha_mode.has_alpha()),
         };
         self.retire_current_video()?;
+        // 只打「慢导入」（>5ms）：稳态每帧才几十 µs，全量打会把日志淹掉。
+        // 目的：判断 395ms 的跨设备 `OpenSharedResource` 冷启动是**进程一次**、
+        // 还是**每开一个新播放窗（=新建渲染设备）就重来**——后者意味着"复用
+        // 播放窗"能白赚 ~400ms。宿主把 stderr 重定向到
+        // %TEMP%\bili-rs-stderr.log，复盘按 `[erika-import]` 过滤。
+        {
+            let t_total = t_enter.elapsed();
+            if t_total > Duration::from_millis(5) {
+                eprintln!(
+                    "[erika-import] frame#{probe_n}: ref={:?} OpenSharedResource={:?} srv={:?} retire={:?} total={:?}",
+                    t_ref,
+                    t_import - t_ref,
+                    t_srv - t_import,
+                    t_total - t_srv,
+                    t_total
+                );
+            }
+        }
         self.current_video = Some(imported);
         Ok(())
     }
