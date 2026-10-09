@@ -14,14 +14,16 @@ provides an `XComponent` surface id through `attachSurface()` and drives
 ohpm install erika
 ```
 
+As of 2026-10-02, the public OHPM version is 0.1.9. The 0.2.1 package has been
+submitted for review; this checkout documents the 0.2.1 SDK.
+
 ## Player configuration
 
 `ErikaPlayerConfig` accepts `outputMode`, `edrHeadroom`, `upscaler`, and
 `videoAlphaMode`. The alpha mode defaults to `0` (opaque); `1` decodes a frame
 with color in the left half and alpha in the right half. The host surface must
 support transparent composition for the background to remain visible.
-The alpha option requires the updated ArkTS wrapper and N-API bridge together;
-the published 0.1.8 OHPM wrapper does not forward it.
+Use the ArkTS wrapper, N-API bridge, and native runtime from the same package version.
 
 ## Usage
 
@@ -119,8 +121,8 @@ surface.
 
 ## HTTP options
 
-For HTTP(S) playback, `open` accepts per-request headers and a read-ahead
-window:
+For HTTP(S) playback, `open` accepts per-request headers, a read-ahead window,
+and a rewind budget:
 
 ```ts
 this.player.open('https://example.com/video.mp4', {
@@ -129,13 +131,18 @@ this.player.open('https://example.com/video.mp4', {
     'Referer': 'https://example.com/',
   },
   httpReadAheadBytes: 16 * 1024 * 1024,
+  httpBackBufferBytes: 89 * 1024 * 1024,
 });
 ```
 
 Headers are used for HEAD, Range GET, and prefetch requests. A positive
 `httpReadAheadBytes` overrides `ERIKA_HTTP_READAHEAD_BYTES`; zero or omission
-uses that environment variable when set, otherwise the 4 MiB default. These
-options are ignored for local files.
+uses that environment variable when set, otherwise the 4 MiB default. A
+positive `httpBackBufferBytes` overrides the 16 MiB rewind-budget default, which
+is how much already-played data stays cached so a rewind inside it is served
+without a network request; size it from the bitrate for high-bitrate media (a
+-10 s skip at 71 Mbps covers ~89 MB). These options are ignored for local
+files.
 
 The package is licensed under MPL-2.0. See `THIRD_PARTY_NOTICES.md` for the
 licenses of the bundled native dependencies.

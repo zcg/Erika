@@ -9,6 +9,7 @@
 use erika::ffmpeg::Demuxer;
 
 #[test]
+#[ignore = "deps on %TEMP%/cur_video_1MB.bin (manually downloaded 206 capture); run: cargo test -- --ignored"]
 fn demux_local_fmp4_packet_sequence() {
     let path = std::env::temp_dir().join("cur_video_1MB.bin");
     let demuxer = Demuxer::open_path(&path).expect("open local fmp4");

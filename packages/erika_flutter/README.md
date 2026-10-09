@@ -5,12 +5,9 @@ Flutter plugin for the Erika media playback engine.
 The plugin keeps Dart out of the hot path:
 
 - Dart exposes low-frequency player commands and event streams.
-- The native plugins expose two surface strategies: `ErikaWindowOverlayVideoView`
-  for the recommended window-hosted overlay path (Metal on macOS/iOS/tvOS, a D3D11
-  swapchain on Windows), and `ErikaVideoView` for platform-view embedding. On
-  Android both widgets route through the same native-view selector: SDR uses a
-  real `TextureView`, while requested extended-linear output uses a
-  `SurfaceView` with Hybrid Composition.
+- The native plugins offer window overlays, platform views, and Flutter textures
+  through `ErikaWindowOverlayVideoView`, `ErikaVideoView`, and
+  `ErikaTextureVideoView`. Platform behavior is described below.
 - The macOS plugin loads the Erika dynamic library.
 - The iOS plugin links the Erika static library.
 - The tvOS plugin links the Erika static library and hosts its Metal layer in an
@@ -52,6 +49,22 @@ On Android the SDR video surface is a native `TextureView`. An
 texture-layer composition. The plugin forwards the borrowed `Surface` to Erika
 and handles creation, resize, destruction, audio focus, HDR eligibility, and
 vsync ticks.
+
+## Linux Setup
+
+Build the Linux C ABI library as described in [Linux setup](https://github.com/AimesSoft/Erika/blob/main/docs/linux.md),
+then set `ERIKA_LIBRARY_DIR` to the directory containing `liberika_capi.so` before
+running `flutter build linux`. The plugin bundles that library and uses a GTK
+Flutter texture. Use `ErikaTextureVideoView` (also selected by `ErikaVideoView`
+on Linux). GPU composition includes subtitles and danmaku; pixels are read back
+as RGBA for Flutter. Linux screenshots return tightly packed RGBA bytes.
+
+NVIDIA uses CUDA/NVDEC; Intel and AMD use VA-API. Set
+`ERIKA_REQUIRE_HARDWARE_DECODE=1` to fail explicitly if hardware decoding is
+unavailable. WSLg also needs `GALLIUM_DRIVER=d3d12 WGPU_BACKEND=gl` for hardware
+rendering. The texture path provides SDR output. On Wayland, `ErikaWindowOverlayVideoView`
+places a native video layer below transparent Flutter UI and avoids per-frame
+readback. This overlay path requires a Wayland session and does not run on X11.
 
 ## macOS Setup
 
@@ -206,8 +219,7 @@ system-media integration.
 ## tvOS Setup
 
 The tvOS CocoaPod script phase downloads the verified C ABI static library for
-Apple TV devices and simulators. An explicit source build uses Rust's tier-3
-tvOS targets and requires nightly with its source component:
+Apple TV devices and simulators. An explicit source build requires nightly with its source component:
 
 - `rustup toolchain install nightly --component rust-src`
 
@@ -320,7 +332,7 @@ than silently dropping them.
 Headers apply to the media source only — external subtitle tracks and danmaku
 sidecar files are still fetched without them.
 
-## HTTP read-ahead
+## HTTP read-ahead and rewind budget
 
 Use `httpReadAheadBytes` to tune the HTTP(S) read-ahead window for one open:
 
@@ -336,6 +348,22 @@ environment variable when set, otherwise the native 4 MiB default. Local files
 ignore this option. A native library from 0.1.7 or earlier does not export the
 options entry point, so requesting read-ahead with one throws a descriptive
 error instead of silently dropping the setting.
+
+Use `httpBackBufferBytes` to size the HTTP(S) rewind budget: how much
+already-played data stays cached so a rewind inside it is served without a
+network request.
+
+```dart
+await player.open(
+  'https://example.com/video.mp4',
+  httpBackBufferBytes: 89 * 1024 * 1024,
+);
+```
+
+A positive value overrides the native 16 MiB default; null or zero keeps it.
+Size it from the bitrate for high-bitrate media: a -10 s skip at 71 Mbps covers
+~89 MB, which the fixed default cannot hold, so every rewind past it re-anchors
+the stream instead of being served locally. Local files ignore this option.
 
 ## Output Mode
 

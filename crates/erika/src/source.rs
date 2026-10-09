@@ -2917,6 +2917,7 @@ fn open_sequential_response(
         .and_then(|value| value.trim().parse::<u64>().ok());
     let mut total = content_range.as_deref().and_then(parse_content_range_total);
     let mut end = content_range.as_deref().and_then(parse_content_range_end);
+    let mut reader = BodyReader::new(cancellation, response);
     match status {
         206 => {
             if let Some(served) = content_range.as_deref().and_then(parse_content_range_start)
@@ -2935,15 +2936,49 @@ fn open_sequential_response(
             }
         }
         200 => {
-            if start > 0 {
-                return Err(SourceError::Http(
-                    "server ignored Range request (status 200)".to_string(),
-                ));
-            }
             if total.is_none() {
                 total = content_length;
             }
             end = total.map(|total| total.saturating_sub(1));
+            if start > 0 {
+                // 服务端忽略 Range：从字节 0 发来整片。丢弃 `start` 之前的
+                // 前缀，让调用方拿到的字节流与 `write_pos` 对齐——把整片
+                // 直接当"从 start 开始的续传字节"写窗就是静默错位。
+                // 前缀可能很大（seek 到文件深处），这是服务端不支持 Range
+                // 的固有代价；丢到 EOF 说明起点已在文件尾。
+                let mut skipped = 0u64;
+                let mut discard = [0u8; HTTP_RECV_CHUNK_BYTES];
+                while skipped < start {
+                    // 只读到 `start` 为止：按整块读会多丢最多一块，续传字节流
+                    // 就从错误的位置开始（静默错位）。
+                    let remaining = (start - skipped).min(discard.len() as u64) as usize;
+                    match reader.read(&mut discard[..remaining]) {
+                        Ok(0) => break,
+                        Ok(n) => skipped = skipped.saturating_add(n as u64),
+                        Err(error) => {
+                            http_trace_log(format!(
+                                "{{\"event\":\"http_stream_open_error\",\"phase\":\"discard\",\"start\":{},\"skipped\":{},\"error\":\"{}\"}}",
+                                start,
+                                skipped,
+                                json_escape(&error.to_string()),
+                            ));
+                            return Err(SourceError::Transient(error.to_string()));
+                        }
+                    }
+                }
+                if skipped < start && total.is_none() {
+                    // 没有 Content-Length，丢了不到 start 就到 EOF：丢出去
+                    // 多少就是文件全长，据此标出终点。
+                    total = Some(skipped);
+                    end = total.map(|total| total.saturating_sub(1));
+                }
+                http_trace_log(format!(
+                    "{{\"event\":\"http_stream_open_200_skipped\",\"start\":{},\"skipped\":{},\"total\":{}}}",
+                    start,
+                    skipped,
+                    total.map_or_else(|| "null".to_string(), |value| value.to_string()),
+                ));
+            }
         }
         _ => {
             return Err(SourceError::Http(format!(
@@ -2959,7 +2994,7 @@ fn open_sequential_response(
         total.map_or_else(|| "null".to_string(), |value| value.to_string()),
     ));
     Ok(SequentialResponse {
-        reader: Box::new(BodyReader::new(cancellation, response)),
+        reader: Box::new(reader),
         end,
         total,
     })
@@ -3895,8 +3930,8 @@ struct PendingHttpFetch {
 
 /// Bytes fetched for one HTTP range request plus the resource total reported
 /// by the server (`Content-Range` on 206, `Content-Length` on a whole-file
-/// 200). The total lets callers backfill `content_length` when HEAD is
-/// unavailable (e.g. servers answering HEAD with 405).
+/// 200), or measured at EOF of a whole-file 200. The total lets callers
+/// backfill `content_length` when HEAD or length headers are unavailable.
 struct HttpRangeResponse {
     bytes: Vec<u8>,
     total_length: Option<u64>,
@@ -8282,6 +8317,18 @@ fn response_entity_validator(response: &reqwest::Response) -> Option<String> {
     })
 }
 
+/// 弱 ETag（`W/` 前缀）只表达"语义等价"、不保证字节一致，不能授权断点续传
+/// 的拼接，也不能放进 `If-Range`（RFC 9110 §13.1.5）。续传前用它做门禁：
+/// 拿弱 validator 去续传 = 拿"可能变了"的字节拼进已收前缀，宁可判终局。
+fn validate_resume_validator(validator: Option<&str>) -> Result<()> {
+    if validator.is_some_and(|value| value.starts_with("W/")) {
+        return Err(SourceError::Http(
+            "resource changed or cannot be safely validated during Range retry".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// 取响应头原文（`None` = 头不存在 / 空 / 非 UTF-8）。
 ///
 /// 只负责**如实回报**，不做任何解释——跨节点一致性怎么判由 `seek_fill_gate`
@@ -8427,6 +8474,9 @@ fn fetch_http_range(
                 last_modified,
             });
         }
+        if received > 0 {
+            validate_resume_validator(validator.as_deref())?;
+        }
         let resume_range = ByteRange {
             start: range.start.saturating_add(received),
             length: range.length.map(|length| length.saturating_sub(received)),
@@ -8500,6 +8550,9 @@ fn fetch_http_range(
             }
         };
         let status = response.status().as_u16();
+        // 200（服务端忽略 Range）时，body 从字节 0 开始：读循环要丢弃
+        // `resume_range.start` 之前的前缀，让保留下来的字节与请求区间对齐。
+        let mut skip_bytes = 0u64;
         match status {
             206 => {
                 let content_range = response
@@ -8539,18 +8592,31 @@ fn fetch_http_range(
                 }
             }
             200 => {
-                if resume_range.start > 0 {
-                    // The server sent the file from byte zero: treating that
-                    // payload as `resume_range.start` data would silently
-                    // corrupt the cache, so fail instead of retrying.
-                    http_trace_log(format!(
-                        "{{\"event\":\"{}_error\",\"phase\":\"status\",\"attempt\":{},\"start\":{},\"status\":200}}",
-                        event, attempt, resume_range.start,
-                    ));
-                    return Err(SourceError::Http(
-                        "server ignored Range request (status 200)".to_string(),
-                    ));
+                // 服务端忽略 Range（或被 If-Range 判定实体已变），从字节 0
+                // 发来整片。首包（received == 0）没有已收前缀：读循环按
+                // `skip_bytes` 逐块丢弃请求起点之前的前缀、只保留请求区间，
+                // 这就是"服务端不支持 Range"的兜底能力。
+                // 续传（received > 0）要把整片尾部拼到已收前缀上，**必须**
+                // 证明仍是同一实体：弱 ETag 不能授权拼接（RFC 9110 §13.1.5），
+                // 首包带过强 validator 而整片重放对不上/没带，都是换过实体，
+                // 一律判终局，绝不拼接。首包本来就没有 validator 时无从校验，
+                // 与 206 路径同一信任水平（只信起点契约）。
+                if received > 0 {
+                    validate_resume_validator(validator.as_deref())?;
+                    if validator.is_some()
+                        && response_entity_validator(&response).as_deref() != validator.as_deref()
+                    {
+                        http_trace_log(format!(
+                            "{{\"event\":\"{}_error\",\"phase\":\"entity\",\"attempt\":{},\"start\":{},\"status\":200}}",
+                            event, attempt, resume_range.start,
+                        ));
+                        return Err(SourceError::Http(
+                            "resource changed or cannot be safely validated during Range retry"
+                                .to_string(),
+                        ));
+                    }
                 }
+                skip_bytes = resume_range.start;
                 if total_length.is_none() {
                     total_length = response
                         .headers()
@@ -8614,11 +8680,19 @@ fn fetch_http_range(
         let mut reader = BodyReader::new(SourceCancellation::default(), response);
         let mut chunk = [0u8; HTTP_RECV_CHUNK_BYTES];
         let mut read_error: Option<std::io::Error> = None;
+        // 200 时 `skip_bytes` 是仍要丢弃的前缀；`response_bytes` 记这份 body
+        // **一共**收到多少（含被丢弃的前缀），`reached_eof` 区分"自然读完"
+        // 与"收满请求区间主动断开"——后者不能拿来推总长。
+        let mut response_bytes = 0u64;
+        let mut reached_eof = false;
         loop {
             match reader.read(&mut chunk) {
-                Ok(0) => break,
+                Ok(0) => {
+                    reached_eof = true;
+                    break;
+                }
                 Ok(n) => {
-                    bytes.extend_from_slice(&chunk[..n]);
+                    response_bytes = response_bytes.saturating_add(n as u64);
                     if let Some(counter) = progress {
                         counter.fetch_add(n as u64, Ordering::Relaxed);
                     }
@@ -8628,6 +8702,29 @@ fn fetch_http_range(
                     // 到达（已到达的在上一 attempt 里记过）。
                     if let Some(profile) = profile.as_ref() {
                         profile.record_bytes(n as u64);
+                    }
+                    let skip = skip_bytes.min(n as u64) as usize;
+                    skip_bytes -= skip as u64;
+                    let payload = &chunk[skip..n];
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    // 只保留请求区间还差的部分：整片响应（200）可能比请求区间
+                    // 大得多，多收的字节既不该进内存也不该进缓存。
+                    let take = match range.length {
+                        Some(length) => {
+                            let remaining = length.saturating_sub(bytes.len() as u64) as usize;
+                            remaining.min(payload.len())
+                        }
+                        None => payload.len(),
+                    };
+                    bytes.extend_from_slice(&payload[..take]);
+                    // 收满请求区间就断开，绝不为"服务端忽略 Range"读完整片。
+                    if range
+                        .length
+                        .is_some_and(|length| bytes.len() as u64 >= length)
+                    {
+                        break;
                     }
                 }
                 Err(error) => {
@@ -8669,6 +8766,11 @@ fn fetch_http_range(
             // 仍是**暂时性**失败：字节只是暂时拿不到，链路恢复后同一个 Range 请求
             // 还能续上（已到达的字节由上面的 `received` 续传，不会重复下载）。
             return Err(SourceError::Transient(error.to_string()));
+        }
+        if status == 200 && reached_eof && total_length.is_none() {
+            // Count the discarded prefix too. This also discovers EOF when
+            // the requested offset is beyond a lengthless response's body.
+            total_length = Some(response_bytes);
         }
         http_trace_log(format!(
             "{{\"event\":\"{}\",\"attempt\":{},\"start\":{},\"length\":{},\"status\":{},\"bytes\":{},\"elapsed_ms\":{:.3}}}",
@@ -10224,24 +10326,276 @@ mod tests {
     }
 
     #[test]
-    fn http_range_rejects_status_200_for_nonzero_offset() {
-        let body = vec![b'a'; 100];
+    fn http_range_accepts_status_200_for_nonzero_offset() {
+        let body: Vec<u8> = (0..100).collect();
         let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
             http_simple_response("200 OK", &body),
         )]);
         let mut source = HttpRangeSource::new(uri);
         source.content_length = Some(100);
-        let error = source
+        let bytes = source
             .read_range(ByteRange {
                 start: 10,
                 length: Some(10),
             })
-            .expect_err("a 200 answer to a mid-file Range request must fail");
-        assert!(matches!(
-            error,
-            SourceError::Http(message) if message.contains("ignored Range")
-        ));
+            .unwrap();
+        assert_eq!(bytes, body[10..20]);
+        assert_eq!(source.cache_bytes, body[10..]);
         assert!(recv_request_head(&requests).contains("range: bytes=10-99"));
+    }
+
+    fn http_200_without_length(body: &[u8], chunked: bool) -> Vec<u8> {
+        let mut raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n".to_vec();
+        if chunked {
+            raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+            for chunk in body.chunks(7) {
+                raw.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                raw.extend_from_slice(chunk);
+                raw.extend_from_slice(b"\r\n");
+            }
+            raw.extend_from_slice(b"0\r\n\r\n");
+        } else {
+            raw.extend_from_slice(b"\r\n");
+            raw.extend_from_slice(body);
+        }
+        raw
+    }
+
+    #[test]
+    fn http_range_200_without_length_skips_prefix_and_learns_eof() {
+        let body: Vec<u8> = (0..100).collect();
+        for chunked in [false, true] {
+            for start in [0, 10, 100, 120] {
+                let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+                    http_200_without_length(&body, chunked),
+                )]);
+                let response = fetch_http_range(
+                    &http_agent(),
+                    &uri,
+                    &[],
+                    ByteRange {
+                        start,
+                        length: Some(256),
+                    },
+                    "test_range",
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(response.bytes, body[(start as usize).min(body.len())..]);
+                assert_eq!(response.total_length, Some(body.len() as u64));
+                assert!(recv_request_head(&requests).contains(&format!("range: bytes={start}-")));
+            }
+        }
+    }
+
+    #[test]
+    fn http_range_200_buffers_only_the_requested_bytes() {
+        let body: Vec<u8> = (0..192 * 1024).map(|index| (index % 251) as u8).collect();
+        for raw in [
+            http_simple_response("200 OK", &body),
+            http_200_without_length(&body, false),
+        ] {
+            let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(raw)]);
+            let response = fetch_http_range(
+                &http_agent(),
+                &uri,
+                &[],
+                ByteRange {
+                    start: 100 * 1024 + 3,
+                    length: Some(17),
+                },
+                "test_range",
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(response.bytes, body[100 * 1024 + 3..100 * 1024 + 20]);
+        }
+    }
+
+    #[test]
+    fn http_source_200_without_length_handles_reads_at_and_past_eof() {
+        for start in [0, 10, 100, 120] {
+            let body: Vec<u8> = (0..100).collect();
+            let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+                http_200_without_length(&body, true),
+            )]);
+            let mut source = HttpRangeSource::new(uri);
+            assert_eq!(
+                source.read_range(ByteRange::suffix_from(start)).unwrap(),
+                body[(start as usize).min(body.len())..],
+            );
+            assert_eq!(source.len().unwrap(), Some(100));
+            assert!(
+                source
+                    .read_range(ByteRange {
+                        start: 100,
+                        length: Some(64)
+                    })
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    fn http_200_with_validator(body: &[u8], validator: &str, declared_length: usize) -> Vec<u8> {
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nETag: {validator}\r\nConnection: close\r\n\r\n"
+        ).into_bytes();
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    #[test]
+    fn http_range_weak_etag_allows_reads_but_rejects_resuming_partial_bytes() {
+        for start in [0, 10] {
+            let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+                http_200_with_validator(&[b'a'; 100], "W/\"v1\"", 100),
+            )]);
+            let response = fetch_http_range(
+                &http_agent(),
+                &uri,
+                &[],
+                ByteRange {
+                    start,
+                    length: Some(40),
+                },
+                "test_range",
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(response.bytes, vec![b'a'; 40]);
+            assert!(!recv_request_head(&requests).contains("if-range:"));
+
+            // 续传时弱 ETag 不能授权拼接：body 只到 20 字节（声明 100）触发
+            // 续传，重发请求**发出之前**就该判终局，不会把可能已变的字节
+            // 拼进已收前缀。
+            let (uri, requests) = spawn_mock_http_server(vec![
+                MockResponse::immediate(http_200_with_validator(&[b'a'; 20], "W/\"v1\"", 100)),
+                MockResponse::immediate(http_200_with_validator(&[b'b'; 100], "W/\"v1\"", 100)),
+            ]);
+            let result = fetch_http_range(
+                &http_agent(),
+                &uri,
+                &[],
+                ByteRange {
+                    start,
+                    length: Some(40),
+                },
+                "test_range",
+                None,
+                None,
+            );
+            assert!(
+                matches!(result, Err(SourceError::Http(message)) if message.contains("resource changed")),
+                "weak validator must not authorize a resume"
+            );
+            let _ = recv_request_head(&requests);
+            assert!(
+                requests.try_recv().is_err(),
+                "weak ETags must not be sent in If-Range"
+            );
+        }
+    }
+
+    #[test]
+    fn http_range_200_retry_skips_prefix_and_preserves_received_bytes() {
+        let body: Vec<u8> = (0..100).collect();
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_200_with_validator(&body[..20], "\"v1\"", 100)),
+            MockResponse::immediate(http_200_with_validator(&body, "\"v1\"", 100)),
+        ]);
+        let response = fetch_http_range(
+            &http_agent(),
+            &uri,
+            &[],
+            ByteRange {
+                start: 10,
+                length: Some(40),
+            },
+            "test_range",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(response.bytes, body[10..50]);
+        assert_eq!(response.total_length, Some(100));
+        assert!(recv_request_head(&requests).contains("range: bytes=10-49"));
+        let resumed = recv_request_head(&requests);
+        assert!(resumed.contains("range: bytes=20-49"));
+        assert!(resumed.contains("if-range: \"v1\""));
+    }
+
+    #[test]
+    fn http_range_200_retry_rejects_a_changed_or_missing_validator() {
+        let body: Vec<u8> = (0..100).collect();
+        for raw in [
+            http_200_with_validator(&body, "\"v2\"", 100),
+            http_simple_response("200 OK", &body),
+        ] {
+            let (uri, _requests) = spawn_mock_http_server(vec![
+                MockResponse::immediate(http_200_with_validator(&body[..20], "\"v1\"", 100)),
+                MockResponse::immediate(raw),
+            ]);
+            let error = fetch_http_range(
+                &http_agent(),
+                &uri,
+                &[],
+                ByteRange {
+                    start: 10,
+                    length: Some(40),
+                },
+                "test_range",
+                None,
+                None,
+            )
+            .err()
+            .expect("changed entities must not be spliced");
+            assert!(error.to_string().contains("resource changed"));
+        }
+    }
+
+    #[test]
+    fn http_lengthless_200_supports_ffmpeg_custom_avio_reads_and_seek() {
+        let body = include_bytes!("../testdata/playback/playback-fixture.mkv");
+        let (uri, requests) = spawn_mock_http_server(
+            (0..32)
+                .map(|_| MockResponse::immediate(http_200_without_length(body, false)))
+                .collect(),
+        );
+        let source =
+            HttpRangeSource::with_http_headers_and_read_ahead(uri, Vec::new(), Some(64 * 1024));
+        let mut demuxer = crate::ffmpeg::Demuxer::open_source(Box::new(source)).unwrap();
+        assert_eq!(demuxer.probe().video.len(), 1);
+        let mut packets = 0;
+        while demuxer.read_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        assert!(packets >= 240);
+        demuxer.seek(Duration::from_secs(2)).unwrap();
+        assert!(demuxer.read_packet().unwrap().is_some());
+        // 断言意图：首个整片 200（无 Content-Length）最多只能覆盖它那一段
+        // 窗口，FFmpeg 读到段尾后**必须**继续发新的 Range 请求拿后续字节，
+        // 而不是靠"把整片响应读完"蒙混过去（本地的请求粒度是窗口段，
+        // 不是远端实现的任意偏移，所以按"起点递增的 GET ≥ 2"来断言）。
+        let heads: Vec<String> = requests.try_iter().collect();
+        let get_starts: Vec<u64> = heads
+            .iter()
+            .filter(|head| head.starts_with("GET"))
+            .filter_map(|head| {
+                head.to_lowercase()
+                    .split("range: bytes=")
+                    .nth(1)
+                    .and_then(|value| value.split('-').next())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+            })
+            .collect();
+        assert!(
+            get_starts.len() >= 2 && get_starts.windows(2).all(|pair| pair[0] < pair[1]),
+            "FFmpeg must read past the first whole-file 200 through further Range requests; heads={heads:?}"
+        );
     }
 
     #[test]
@@ -11749,6 +12103,46 @@ mod tests {
             resumed > 0 && resumed <= 16 * 1024,
             "续传必须从已收字节之后起（0 < {resumed} <= 16384）"
         );
+    }
+
+    #[test]
+    fn sequential_stream_skips_a_whole_file_200_prefix_after_reconnect() {
+        // 服务端忽略 Range：断线续传时它从字节 0 重发整片。读线程必须丢弃
+        // `write_pos` 之前的前缀再续上——把整片直接当"从 write_pos 开始的
+        // 续传字节"写窗就是静默错位（每个字节都会落到错误的绝对偏移上）。
+        const TOTAL: u64 = 512 * 1024;
+        let body: Vec<u8> = (0..TOTAL).map(|index| (index % 251) as u8).collect();
+        let (uri, heads) = spawn_mock_http_server(vec![
+            // 声明整片长度却只发 64KB 就收线：读线程从 write_pos 重连。
+            MockResponse::immediate(http_206_truncated_response(
+                0,
+                TOTAL,
+                TOTAL as usize,
+                &body[..64 * 1024],
+            )),
+            // 重连时服务端忽略 Range：200 又从字节 0 发整片。
+            MockResponse::immediate(http_200_without_length(&body, false)),
+            // 防御性第 3 份：实现若多发请求，下面的断言失败而不是把测试挂死。
+            MockResponse::immediate(http_200_without_length(&body, false)),
+        ]);
+        let mut source = HttpRangeSource::new(uri).enable_sequential_stream();
+        let bytes = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(256 * 1024),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 256 * 1024);
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == (index % 251) as u8),
+            "续传后每个字节都必须落在自己的绝对偏移上（前缀被正确丢弃）"
+        );
+        let heads: Vec<String> = heads.try_iter().collect();
+        assert_eq!(heads.len(), 2, "断线只需续传一次：{heads:?}");
+        assert_eq!(range_header_of(&heads[0]), "range: bytes=0-");
     }
 
     #[test]

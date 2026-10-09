@@ -22,6 +22,7 @@ use crate::apple::iosaudio::{IosAudioQueueOutput, IosAudioQueueOutputConfig};
     target_os = "macos",
     any(target_os = "ios", target_os = "tvos"),
     target_os = "windows",
+    target_os = "linux",
     target_env = "ohos"
 )))]
 use crate::audio::BufferedAudioOutput;
@@ -42,6 +43,8 @@ use crate::danmaku::{
 };
 use crate::debug_hud::{DebugHud, DebugHudSnapshot};
 use crate::ffmpeg::DecoderBackend;
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+use crate::linux::PulseAudioOutput;
 use crate::luma_stats::LumaSmoother;
 #[cfg(target_env = "ohos")]
 use crate::ohos::ohaudio::{OHAudioOutput, OHAudioOutputConfig};
@@ -1664,6 +1667,12 @@ impl PresenterRuntime {
     }
 
     pub fn select_subtitle_track(&mut self, track_id: Option<i64>) -> Result<()> {
+        // 同轨重选（宿主周期性回灌 UI 状态）直接短路：轻量路径虽不碰音视频
+        // 输出，但重选仍会无谓地 bump 弹幕代次。轨道表为空时不短路——那是
+        // "打开前先记下选择"的场景，选择必须落到 player。
+        if !self.player.tracks().is_empty() && self.player.track_selection().subtitle == track_id {
+            return Ok(());
+        }
         // 字幕轨切换与音视频渲染管线无关：字幕是独立 demuxer + 独立渲染帧
         // （pump_subtitles 从 worker channel 收帧显示）。切字幕只改轨道选择，
         // 不走音轨切换那套重型过渡（quiesce 帧输出 + 重启音频设备 + transition
@@ -2443,6 +2452,10 @@ impl PresenterRuntime {
         self.renderer
             .capture_current_frame(context, width, height)
             .map(|capture| capture.map(|capture| capture.rgba))
+    }
+
+    pub fn take_flutter_frame(&mut self) -> Option<crate::core::RendererFrameCapture> {
+        self.renderer.take_flutter_frame()
     }
 
     /// Selects the external Flutter texture written by the next render tick.
@@ -4223,6 +4236,10 @@ fn resolve_presenter_player_config(
 }
 
 fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBackend> {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        Box::new(PulseAudioOutput::new(config.ring_buffer))
+    }
     #[cfg(target_os = "macos")]
     {
         Box::new(CoreAudioOutput::new(CoreAudioOutputConfig {
@@ -4259,6 +4276,7 @@ fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBacken
         target_os = "macos",
         any(target_os = "ios", target_os = "tvos"),
         target_os = "windows",
+        target_os = "linux",
         target_env = "ohos"
     )))]
     {

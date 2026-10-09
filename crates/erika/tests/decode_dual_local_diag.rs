@@ -9,6 +9,7 @@ use erika::ffmpeg::{Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, 
 use erika::source::LocalFileSource;
 
 #[test]
+#[ignore = "deps on %TEMP%/cur_video_1MB.bin + %TEMP%/cur_audio_1MB.bin (manually downloaded 206 captures); run: cargo test -- --ignored"]
 fn decode_local_dash_streams_software() {
     let temp = std::env::temp_dir();
     let video = LocalFileSource::open(temp.join("cur_video_1MB.bin")).expect("video file");

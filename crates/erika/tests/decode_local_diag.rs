@@ -7,6 +7,7 @@
 use erika::ffmpeg::{Decoder, DecoderBackend, DecoderConfig, Demuxer};
 
 #[test]
+#[ignore = "deps on %TEMP%/cur_video_1MB.bin (manually downloaded 206 capture); run: cargo test -- --ignored"]
 fn decode_local_fmp4_with_software_decoder() {
     eprintln!("[diag] stage=open_path");
     let path = std::env::temp_dir().join("cur_video_1MB.bin");

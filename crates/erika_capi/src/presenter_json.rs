@@ -5,6 +5,35 @@ use serde_json::{Map, Value, json};
 
 use super::*;
 
+/// Copies and consumes the latest Linux Flutter frame produced by render_tick.
+/// Unlike a screenshot, it includes the normal subtitles, danmaku and debug HUD.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_copy_flutter_frame_rgba(
+    handle: *mut ErikaPresenterHandle,
+    out_rgba: *mut u8,
+    capacity: usize,
+    out_width: *mut u32,
+    out_height: *mut u32,
+) -> ErikaStatus {
+    if out_rgba.is_null() || out_width.is_null() || out_height.is_null() {
+        return ErikaStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        let Some(frame) = handle.presenter.take_flutter_frame() else {
+            return ErikaStatus::NoEvent;
+        };
+        if frame.rgba.len() > capacity {
+            return player_error("Flutter RGBA buffer too small");
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(frame.rgba.as_ptr(), out_rgba, frame.rgba.len());
+            *out_width = frame.width;
+            *out_height = frame.height;
+        }
+        ErikaStatus::Ok
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn erika_presenter_invoke_json(
     handle: *mut ErikaPresenterHandle,
@@ -116,8 +145,8 @@ unsafe fn invoke(
             let options = ErikaOpenOptions {
                 headers: headers.headers.as_ptr(),
                 header_count: headers.headers.len(),
-                http_read_ahead_bytes: optional_read_ahead_bytes(args)?,
-                http_back_buffer_bytes: 0,
+                http_read_ahead_bytes: optional_open_byte_count(args, "httpReadAheadBytes")?,
+                http_back_buffer_bytes: optional_open_byte_count(args, "httpBackBufferBytes")?,
                 reserved: [0; 2],
             };
             call_status(unsafe {
@@ -607,19 +636,20 @@ fn required_u64(args: &Map<String, Value>, name: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{name} must be non-negative"))
 }
 
-/// Parses the optional `httpReadAheadBytes` open argument. 0 / missing keeps
-/// the default resolution (environment override, then 4 MiB); negative or
-/// fractional values are rejected because they cannot be a byte count.
-fn optional_read_ahead_bytes(args: &Map<String, Value>) -> Result<u64, String> {
-    let Some(value) = args.get("httpReadAheadBytes") else {
+/// Parses an optional byte-count open argument (`httpReadAheadBytes`,
+/// `httpBackBufferBytes`). 0 / missing keeps the default resolution
+/// (environment override where one exists, then the engine default); negative
+/// or fractional values are rejected because they cannot be a byte count.
+fn optional_open_byte_count(args: &Map<String, Value>, name: &str) -> Result<u64, String> {
+    let Some(value) = args.get(name) else {
         return Ok(0);
     };
     match value {
         Value::Number(number) => number
             .as_u64()
-            .ok_or_else(|| "httpReadAheadBytes must be a non-negative integer".to_string()),
+            .ok_or_else(|| format!("{name} must be a non-negative integer")),
         Value::Null => Ok(0),
-        _ => Err("httpReadAheadBytes must be a non-negative integer".to_string()),
+        _ => Err(format!("{name} must be a non-negative integer")),
     }
 }
 
@@ -701,19 +731,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_bridge_parses_http_read_ahead_bytes() {
-        for (value, expected) in [
-            (Value::Null, 0),
-            (json!(0), 0),
-            (json!(2_097_152), 2_097_152),
-        ] {
-            let args = Map::from_iter([("httpReadAheadBytes".to_string(), value)]);
-            assert_eq!(optional_read_ahead_bytes(&args), Ok(expected));
-        }
+    fn json_bridge_parses_http_byte_count_options() {
+        for name in ["httpReadAheadBytes", "httpBackBufferBytes"] {
+            for (value, expected) in [
+                (Value::Null, 0),
+                (json!(0), 0),
+                (json!(2_097_152), 2_097_152),
+            ] {
+                let args = Map::from_iter([(name.to_string(), value)]);
+                assert_eq!(optional_open_byte_count(&args, name), Ok(expected));
+            }
 
-        for value in [json!(-1), json!(1.5), json!("2097152")] {
-            let args = Map::from_iter([("httpReadAheadBytes".to_string(), value)]);
-            assert!(optional_read_ahead_bytes(&args).is_err());
+            for value in [json!(-1), json!(1.5), json!("2097152")] {
+                let args = Map::from_iter([(name.to_string(), value)]);
+                assert!(optional_open_byte_count(&args, name).is_err());
+            }
         }
     }
 
