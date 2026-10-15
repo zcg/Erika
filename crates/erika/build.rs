@@ -116,7 +116,7 @@ fn main() {
         ] {
             println!("cargo:rustc-link-lib={lib}");
         }
-        // Erika always includes C++ code through bundled SoundTouch, and the
+        // liberika always includes C++ code through bundled SoundTouch, and the
         // libass/HarfBuzz path adds more C++ when that feature is enabled.
         // Keep the Android runtime dependency independent of Cargo features.
         println!("cargo:rustc-link-lib=dylib=c++_shared");
@@ -139,7 +139,7 @@ fn main() {
         && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
         && env::var("ERIKA_USE_SYSTEM_LIBS").as_deref() != Ok("0")
     {
-        // Erika's ordered memory-font fallback is an in-tree libass patch.
+        // liberika's ordered memory-font fallback is an in-tree libass patch.
         // Keep it even when the distro supplies FFmpeg and the font libraries.
         let libass = env::var_os("ERIKA_LIBASS_DIR")
             .map(PathBuf::from)

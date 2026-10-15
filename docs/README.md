@@ -1,4 +1,4 @@
-# Erika 文档 / Documentation
+# liberika 文档 / Documentation
 
 当前接入说明以 **0.2.1** 为基线。选择 SDK 后，先读其安装和使用指南；需要自建
 渲染宿主或开发内核时，再进入下列参考文档。
@@ -8,7 +8,7 @@
 | 主题 / Topic | 中文 | English | 日本語 |
 |---|---|---|---|
 | Flutter SDK：安装、视图与 Dart API | [插件指南](../packages/erika_flutter/README.zh.md) | [Plugin guide](../packages/erika_flutter/README.md) | [プラグイン](../packages/erika_flutter/README.ja.md) |
-| Swift SDK：SwiftPM 与原生视图 | [ErikaSwift](https://github.com/AimesSoft/ErikaSwift/blob/main/README.zh.md) | [ErikaSwift](https://github.com/AimesSoft/ErikaSwift) | — |
+| Swift SDK：SwiftPM 与原生视图 | [liberika-swift](https://github.com/AimesSoft/liberika-swift/blob/main/README.zh.md) | [liberika-swift](https://github.com/AimesSoft/liberika-swift) | — |
 | OpenHarmony ArkTS SDK | — | [Package guide](../packages/erika_ohos/README.md) | — |
 | C/C++ 等原生宿主 / Native hosts | [接入指南](integration.zh.md) | [Integration](integration.md) | [組み込み](integration.ja.md) |
 | C ABI：签名、类型、所有权 / Reference | [参考手册](capi_reference.zh.md) | [C ABI reference](capi_reference.md) | [C ABI](capi_reference.ja.md) |

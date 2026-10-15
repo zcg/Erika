@@ -4,6 +4,7 @@
 
 | 记录 / Record | 范围 / Scope |
 |---|---|
+| [PR #150–#159 的目的、取舍与运行验证](pr-150-159/review.zh.md) | 2026-10-05，HTTP、媒体识别、时间戳、音频、GPU、暂停状态与 OHOS 生命周期 |
 | [v0.1.8 API 对齐](v0.1.8-api-alignment.md) | 0.1.8 时的绑定、ABI 与 SDK 差异 |
 | [Windows 原生 HDR 与纹理兼容](pr129-native-hdr-compatibility.zh.md) | PR #129 的平台路径与实验 |
 | [HTTP 资源生命周期](issue-125-verification.zh.md) | 2026-09-28，Issue #125 的取消、重播与关闭 |

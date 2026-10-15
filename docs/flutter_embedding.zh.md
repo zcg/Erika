@@ -2,14 +2,14 @@
 
 [中文](flutter_embedding.zh.md) | [English](flutter_embedding.md) | [日本語](flutter_embedding.ja.md)
 
-Erika 不是 Flutter 视频渲染器。Flutter 只是可选宿主 UI。播放器内部负责解码、时序、原生渲染、字幕、弹幕、音频和 HDR 呈现。
+liberika 不是 Flutter 视频渲染器。Flutter 只是可选宿主 UI。播放器内部负责解码、时序、原生渲染、字幕、弹幕、音频和 HDR 呈现。
 
 ## API Families
 
 有两组 C ABI 入口：
 
 - `ErikaHandle`：控制与事件 API。适合宿主管理自己的 presenter loop，或只想探测/控制播放的场景。
-- `ErikaPresenterHandle`：presenter-owned API。适合 Erika 自己持有 `Player + renderer + audio output`，宿主只提供 native surface 和 display tick callback 的场景。
+- `ErikaPresenterHandle`：presenter-owned API。适合 liberika 自己持有 `Player + renderer + audio output`，宿主只提供 native surface 和 display tick callback 的场景。
 
 两组入口都声明在 `crates/erika_capi/include/erika.h`。
 
@@ -33,7 +33,7 @@ Apple HDR 路径使用 native Metal-backed surface，而不是 Flutter Texture�
 4. widget 跟踪自身位置，并通过 surface generation number 发送几何更新，因此已销毁 widget 的旧 hide 调用不会影响新 attach 的 surface。
 5. attach retry 使用 exponential backoff 处理 window readiness 时机。
 
-这个 overlay 路径是 NipaPlay 和其他 full-player UI 的推荐方案。它让视频呈现由 Erika/Metal 持有，而 Flutter 继续承担控制层和布局层。iOS/tvOS 上 native side 使用 window 加 sibling `UIView`/`CAMetalLayer`；macOS 上使用 host `NSWindow` 加 sibling `NSView`/`CAMetalLayer`。
+这个 overlay 路径是 NipaPlay 和其他 full-player UI 的推荐方案。它让视频呈现由 liberika/Metal 持有，而 Flutter 继续承担控制层和布局层。iOS/tvOS 上 native side 使用 window 加 sibling `UIView`/`CAMetalLayer`；macOS 上使用 host `NSWindow` 加 sibling `NSView`/`CAMetalLayer`。
 
 触摸事件会穿透两种 native video strategy，因此 Flutter controls 可以保持在视频 surface 上方或周围。
 
@@ -79,7 +79,7 @@ surface 取为 `OHNativeWindow` 并 attach 给 presenter；wgpu 随后通过 Vul
 
 ## 透明视频与混合模式
 
-Erika 可以呈现带透明度的视频素材，同时保留 Flutter 的布局与合成能力。透明度按 player 请求：
+liberika 可以呈现带透明度的视频素材，同时保留 Flutter 的布局与合成能力。透明度按 player 请求：
 
 ```dart
 final player = ErikaPlayer(
@@ -108,15 +108,15 @@ ErikaTextureVideoView(
 | Windows 窗口 overlay（DirectComposition） | `srcOver`、`overlay`；其他值抛插件错误 | `IDCompositionEffectGroup` opacity |
 | Android / iOS / OpenHarmony | 接受创建参数但不消费 | texture 路径上由 Flutter 侧应用 |
 
-overlay 混合是背景感知的：macOS 的 native 层基于窗口内视频背后的内容合成，Windows 的 blend effect 采样同一个 HWND，因此底层的 Flutter 或游戏画面保持可见。Windows 透明 overlay 视频使用绑定到 Flutter HWND 的 SDR BGRA8 预乘 composition swap chain；HDR 片源会在 Erika 内部 tone map 到该合成空间。不透明的 Windows overlay 视频仍沿用之前的专用子 HWND 路径；解码器或输出设备重建 swap chain 时会自动重新绑定 composition 内容。
+overlay 混合是背景感知的：macOS 的 native 层基于窗口内视频背后的内容合成，Windows 的 blend effect 采样同一个 HWND，因此底层的 Flutter 或游戏画面保持可见。Windows 透明 overlay 视频使用绑定到 Flutter HWND 的 SDR BGRA8 预乘 composition swap chain；HDR 片源会在 liberika 内部 tone map 到该合成空间。不透明的 Windows overlay 视频仍沿用之前的专用子 HWND 路径；解码器或输出设备重建 swap chain 时会自动重新绑定 composition 内容。
 
 ## iOS Build Path
 
-iOS plugin 通过 CocoaPod script phase 把 Erika C ABI static library 链接进 app。默认下载匹配的预构建归档；设 `ERIKA_FORCE_SOURCE_BUILD=1`（配合 `ERIKA_REPO_ROOT`）才会为目标 iOS architecture 从源码构建 Rust `erika_capi` crate。
+iOS plugin 通过 CocoaPod script phase 把 liberika C ABI static library 链接进 app。默认下载匹配的预构建归档；设 `ERIKA_FORCE_SOURCE_BUILD=1`（配合 `ERIKA_REPO_ROOT`）才会为目标 iOS architecture 从源码构建 Rust `erika_capi` crate。
 
 ## tvOS Build Path
 
-tvOS plugin 通过 CocoaPod script phase 链接 Erika C ABI static library；与 iOS 一样默认下载预构建归档，`ERIKA_FORCE_SOURCE_BUILD=1` 时才从源码构建。支持 tvOS 13+、arm64 真机，以及 arm64/x86_64 模拟器。详细的 Rust nightly、预构建包和源码构建选项见 [`packages/erika_flutter/README.zh.md`](../packages/erika_flutter/README.zh.md)。
+tvOS plugin 通过 CocoaPod script phase 链接 liberika C ABI static library；与 iOS 一样默认下载预构建归档，`ERIKA_FORCE_SOURCE_BUILD=1` 时才从源码构建。支持 tvOS 13+、arm64 真机，以及 arm64/x86_64 模拟器。详细的 Rust nightly、预构建包和源码构建选项见 [`packages/erika_flutter/README.zh.md`](../packages/erika_flutter/README.zh.md)。
 
 ## macOS Build Path
 
@@ -204,7 +204,7 @@ player.events.listen((event) {
 
 ## 原生调试 HUD
 
-`setDebugHudEnabled(true)` 让 Erika 在原生视频合成中绘制诊断 HUD；它不经过 Dart 渲染，
+`setDebugHudEnabled(true)` 让 liberika 在原生视频合成中绘制诊断 HUD；它不经过 Dart 渲染，
 也不会改变 Flutter widget 层级。默认关闭，适合开发、性能分析和问题截图前的现场观察。
 
 HUD 以低频快照显示轨道编码/分辨率/码率/帧率、播放位置与倍速、实时解码与渲染 FPS、硬件或
@@ -234,7 +234,7 @@ HUD 的驱动机制，数据新鲜度取决于已挂载 surface 的显示循环�
 
 ## Ownership Rule
 
-Flutter 负责布局和 controls。Erika 负责 video plane、subtitle plane、danmaku plane、audio 和 timing。plugin 通过 `MethodChannel` 传递命令和事件；渲染不会经过 Dart。
+Flutter 负责布局和 controls。liberika 负责 video plane、subtitle plane、danmaku plane、audio 和 timing。plugin 通过 `MethodChannel` 传递命令和事件；渲染不会经过 Dart。
 
 ## Linux 视频表面
 

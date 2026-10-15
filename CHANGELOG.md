@@ -378,7 +378,7 @@
 - Added charset detection and transcoding for external text subtitles, including
   GBK, Big5, Shift_JIS, and UTF-16, with UTF-8 passthrough and guarded fallback
   for low-confidence or binary input.
-- libass now registers Erika's bundled Droid Sans Fallback on every platform,
+- libass now registers liberika's bundled Droid Sans Fallback on every platform,
   not just iOS/Android, and targets without a system font provider default to
   that family instead of an unresolvable `Arial`.
 - Added subtitle fallback and selective override styling: custom font family and
@@ -392,7 +392,7 @@
   `ErikaPlayer.open` accepts `httpHeaders` on Android, iOS, macOS, and Windows,
   and applies them to the probe, ranged reads, retries, and prefetch requests.
   The original open functions remain compatible and use an empty header list.
-- Rejects caller-supplied transport headers managed by Erika and invalid HTTP
+- Rejects caller-supplied transport headers managed by liberika and invalid HTTP
   field names or values. External subtitle and danmaku sidecars remain on the
   headerless path and do not inherit media request headers.
 - Hardened HTTP range input against ignored `Range` requests, incorrect response

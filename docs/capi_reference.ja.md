@@ -1,4 +1,4 @@
-# Erika C ABI リファレンス
+# liberika C ABI リファレンス
 
 本書は `erika_capi` が公開する安定 C ABI を説明します。宣言は
 [`crates/erika_capi/include/erika.h`](../crates/erika_capi/include/erika.h) にあります。
@@ -14,12 +14,12 @@
 
 ## 2 つの handle ファミリー
 
-Erika は独立した 2 つのエントリーポイントを公開します。組み込みごとに一方を選びます。
+liberika は独立した 2 つのエントリーポイントを公開します。組み込みごとに一方を選びます。
 
 | Handle | モデル | 描画担当 | 用途 |
 |--------|--------|----------|------|
 | `ErikaHandle` | **プル** | ホスト | レンダーループを自分で持ち、デコード済みフレームを pull / 独自コンポジタを駆動する。 |
-| `ErikaPresenterHandle` | **プッシュ** | Erika | native surface を Erika に渡し、表示フレームごとに `render_tick` を 1 回呼ぶ。Erika が decode・timing・audio・overlay・presentation を所有する。 |
+| `ErikaPresenterHandle` | **プッシュ** | liberika | native surface を liberika に渡し、表示フレームごとに `render_tick` を 1 回呼ぶ。liberika が decode・timing・audio・overlay・presentation を所有する。 |
 
 `ErikaPresenterHandle` が推奨パスで、Flutter plugin と native demo もこれを使います。
 コンパイルされるのは **macOS / iOS / tvOS / Windows / Android / Linux / HarmonyOS**。surface attach は
@@ -113,7 +113,7 @@ C++ の `noexcept`/SEH を気にせず境界を越えて呼べます。
 
 ### エラーメッセージ（スレッドローカル）
 
-`Ok`/`NoEvent` 以外の結果では、Erika は可読メッセージを**スレッドローカル**スロットに
+`Ok`/`NoEvent` 以外の結果では、liberika は可読メッセージを**スレッドローカル**スロットに
 保存します。取得：
 
 ```c
@@ -127,17 +127,17 @@ if (msg) { fprintf(stderr, "erika: %s\n", msg); erika_string_free(msg); }
 
 ### 文字列の所有権
 
-Erika が返す `char*` はすべてヒープ確保で呼び出し側の所有です。
+liberika が返す `char*` はすべてヒープ確保で呼び出し側の所有です。
 
 - 単独の文字列（例：`erika_last_error_message`）→ `erika_string_free` で解放。
 - `ErikaTrackInfo` 内の文字列 → `erika_track_info_free(&track)` でレコード全体を解放
   （内部文字列をすべて解放）。
 - `ErikaDanmakuTrackInfo` 内の文字列 → `erika_danmaku_track_info_free(&track)` で解放。
 
-これらを libc の `free()` で解放しないでください。常に対応する Erika の解放関数を使い、
+これらを libc の `free()` で解放しないでください。常に対応する liberika の解放関数を使い、
 確保が同じ allocator 上で ABI を越えるようにします。
 
-渡す `const char*` 引数は呼び出し中のみ借用され、Erika は必要分をコピーします。NUL
+渡す `const char*` 引数は呼び出し中のみ借用され、liberika は必要分をコピーします。NUL
 終端の UTF-8 でなければなりません。
 
 ### カウント配列イディオム
@@ -207,7 +207,7 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 header を設定します。`headers` は呼び出し中だけ読み取られ、戻り値の後に解放できます。
 `header_count` が 0 より大きい場合、`headers` は NULL にできません。header は HEAD、Range
 GET、prefetch request に使用されます。
-認証情報と Cookie は Erika の log に書き込まれません。`seek` はマイクロ秒。
+認証情報と Cookie は liberika の log に書き込まれません。`seek` はマイクロ秒。
 
 `erika_open_with_options` は `erika_open_with_headers` の上位互換で、header 配列と
 リクエスト単位のチューニングを `ErikaOpenOptions` 構造体にまとめて渡します。
@@ -293,7 +293,7 @@ capabilities を渡すため Android extended-linear output は active になり
 
 ## `ErikaPresenterHandle` —— プッシュモデル
 
-Erika がフルスタックを所有し、ホストは surface を提供して `render_tick` を呼びます。
+liberika がフルスタックを所有し、ホストは surface を提供して `render_tick` を呼びます。
 **macOS / iOS / tvOS / Windows / Android / HarmonyOS / Linux。**
 
 ### ライフサイクルと設定
@@ -403,7 +403,7 @@ typedef struct ErikaSubtitleStyle {
 解像度に依存せず、`font_size` が `48` なら script の `PlayResY` に関係なく同じ
 pixel になります。ただし margin は違います：libass は override の margin を script
 自身の単位のまま扱うため、container の ASS track ではその script の `PlayResY` に
-比例し、plain-text 字幕（Erika が frame サイズで script を生成する）では pixel に
+比例し、plain-text 字幕（liberika が frame サイズで script を生成する）では pixel に
 なります。
 
 `ErikaHttpHeader` は次のように定義されます：
@@ -569,7 +569,7 @@ Android extended-linear では Flutter Hybrid Composition `SurfaceView` の
 `direct_composition = true` を設定し、host probe failure は `fallback_reason` に保持します。
 `desired_headroom = 0` は system auto、正の値は surface ceiling で、API 35 per-`SurfaceView`
 `setDesiredHdrHeadroom` に使用できます。
-Erika は Vulkan、`Rgba16Float`、`ADATASPACE_SCRGB_LINEAR` も検証します。どれかが失敗
+liberika は Vulkan、`Rgba16Float`、`ADATASPACE_SCRGB_LINEAR` も検証します。どれかが失敗
 すると SDR に fallback し、その理由を取得できます。
 
 ### Flutter texture surface
@@ -598,10 +598,10 @@ ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(ErikaPresente
 
 Windows のみ。presenter が `attach_wgpu_surface_with_output_capabilities`
 （`direct_composition = true`）で attach され、透明 video alpha mode または overlay
-blend で再生する場合、Erika は対象 HWND 向けに premultiplied alpha の composition
+blend で再生する場合、liberika は対象 HWND 向けに premultiplied alpha の composition
 swap chain を作成します。この getter は **AddRef 済みの `IUnknown*`** として返します。
 返された COM reference の所有者は呼び出し側で、`Release` が必須です。decoder や device
-喪失の後は再取得してください——Erika は swap chain を再構築し、新しいオブジェクトを
+喪失の後は再取得してください——liberika は swap chain を再構築し、新しいオブジェクトを
 公開します。ポインタが同じなら再構築はありません。
 
 ### Windows Flutter texture
@@ -622,7 +622,7 @@ ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *, ErikaEvent *out_e
 
 表示フレームごとに `render_tick` を 1 回呼びます（`CADisplayLink`、`CVDisplayLink`、
 Windows のフレームスケジューラなど）。`time_seconds` はそのフレームのホスト表示クロック
-（秒）——Erika は vsync 量子化スケジューリングに使うので、wall-clock 差分ではなく
+（秒）——liberika は vsync 量子化スケジューリングに使うので、wall-clock 差分ではなく
 **プレゼンテーションタイムスタンプ**を渡します。`out_stats` が非 `NULL` なら、パイプ
 ラインカウンタのスナップショットが書き込まれます。`poll_event` は非ブロッキングで、
 アイドル時は `NoEvent` を返します。
@@ -652,7 +652,7 @@ char *erika_presenter_render_tick_json(ErikaPresenterHandle *, double time_secon
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 ```
 
-返される文字列は Erika が所有するため、`erika_string_free` で解放してください。
+返される文字列は liberika が所有するため、`erika_string_free` で解放してください。
 `poll_event_json` はイベントが無いとき envelope ではなく `NULL` を返すので、
 `NULL` はエラーではなくアイドルを意味します。
 
@@ -774,7 +774,7 @@ free(rgba);
   output snapshot。
 - **`ErikaDanmakuConfig`** —— 弾幕レイアウト/外観の全設定（フォントサイズ、不透明度、
   表示領域、スクロールタイミング、衝突/スタックフラグ、ブロックモード、影スタイル）。
-  `font_size` は NipaPlay/Flutter の*論理*サイズで、Erika が surface scale を掛けて
+  `font_size` は NipaPlay/Flutter の*論理*サイズで、liberika が surface scale を掛けて
   グリフピクセルにします。
 - **`ErikaDanmakuTrackInfo`** `{ id, enabled, offset_micros, item_count, char *name, char *source }` —
   `erika_danmaku_track_info_free` で解放。

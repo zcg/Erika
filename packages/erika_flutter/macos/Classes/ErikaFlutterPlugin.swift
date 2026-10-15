@@ -112,7 +112,7 @@ private final class ErikaDisplayLinkDriver {
 }
 
 /// A Flutter texture whose backing CVPixelBuffer is also exposed as a Metal
-/// texture. Erika renders into the IOSurface-backed Metal texture directly;
+/// texture. liberika renders into the IOSurface-backed Metal texture directly;
 /// Flutter then composites the same buffer without a CPU readback.
 private final class ErikaFlutterTextureSurface: NSObject, FlutterTexture {
   struct PreparedFrame {
@@ -514,7 +514,7 @@ private struct ErikaPresenterResourceStatusC {
 
 private struct ErikaDanmakuConfigC {
   var enabled: UInt8 = 1
-  // NipaPlay/Flutter logical font size; Erika applies the surface scale internally.
+  // NipaPlay/Flutter logical font size; liberika applies the surface scale internally.
   var fontSize: Float = 30.0
   var opacity: Float = 1.0
   var displayArea: Float = 1.0

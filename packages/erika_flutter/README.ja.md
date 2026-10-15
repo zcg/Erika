@@ -2,19 +2,19 @@
 
 [中文](README.zh.md) | [English](README.md) | [日本語](README.ja.md)
 
-Erika メディア再生エンジン向けの Flutter plugin です。
+liberika メディア再生エンジン向けの Flutter plugin です。
 
 この plugin は Dart を hot path から外します。
 
 - Dart は低頻度の player command と event stream だけを公開します。
 - native plugin は window overlay、platform view、Flutter texture の 3 種類を提供します。対応する widget は `ErikaWindowOverlayVideoView`、`ErikaVideoView`、`ErikaTextureVideoView` です。platform ごとの実装は以下で説明します。
-- macOS plugin は Erika の dynamic library を読み込みます。
-- iOS plugin は Erika の static library を link します。
-- tvOS plugin は Erika の static library を link し、Apple TV platform view で Metal layer を host します。
-- Windows plugin は Erika C ABI DLL を build して link します。
+- macOS plugin は liberika の dynamic library を読み込みます。
+- iOS plugin は liberika の static library を link します。
+- tvOS plugin は liberika の static library を link し、Apple TV platform view で Metal layer を host します。
+- Windows plugin は liberika C ABI DLL を build して link します。
 - Android plugin は ABI ごとに `liberika_capi.so` を build し、`Choreographer` から native surface を駆動します。
-- HarmonyOS plugin は Flutter external texture を登録し、その `OHNativeWindow` を Erika に attach して、OHAudio で低レイテンシの PCM 出力を行います。
-- Erika は `ErikaPresenterHandle` を通じて playback、rendering、audio、timing、overlay を担当します。
+- HarmonyOS plugin は Flutter external texture を登録し、その `OHNativeWindow` を liberika に attach して、OHAudio で低レイテンシの PCM 出力を行います。
+- liberika は `ErikaPresenterHandle` を通じて playback、rendering、audio、timing、overlay を担当します。
 
 ## Video Surfaces
 
@@ -22,13 +22,13 @@ Erika メディア再生エンジン向けの Flutter plugin です。
 
 Windows では `ErikaWindowOverlayVideoView` が window-level の Direct3D 11 swapchain を sibling surface として host し、同じ overlay モデルに従います。
 
-標準的な Flutter platform view が必要な場合は `ErikaVideoView` を使います。Android の SDR video surface は native `TextureView` です。`ErikaOutputMode.extendedLinear` player は `PlatformViewLink`/Hybrid Composition の `SurfaceView` を作ります。scRGB を Flutter texture-layer composition に通さないためです。plugin は borrowed `Surface`、lifecycle、resize、audio focus、HDR eligibility、vsync tick を Erika に接続します。
+標準的な Flutter platform view が必要な場合は `ErikaVideoView` を使います。Android の SDR video surface は native `TextureView` です。`ErikaOutputMode.extendedLinear` player は `PlatformViewLink`/Hybrid Composition の `SurfaceView` を作ります。scRGB を Flutter texture-layer composition に通さないためです。plugin は borrowed `Surface`、lifecycle、resize、audio focus、HDR eligibility、vsync tick を liberika に接続します。
 
 Windows の `ErikaVideoView` も native swapchain を使い、HDR10 を維持します。Flutter の clipping、opacity、color filter には SDR の `ErikaTextureVideoView` を使います。既定の `srcOver` は BGRA8 GPU snapshot、`overlay` は Windows Composition です。
 
 ## Linux Setup
 
-[Linux ガイド](https://github.com/AimesSoft/Erika/blob/main/docs/linux.md)に従い `liberika_capi.so` を build し、所在 directory を `ERIKA_LIBRARY_DIR` に設定して `flutter build linux` を実行します。
+[Linux ガイド](https://github.com/AimesSoft/liberika/blob/main/docs/linux.md)に従い `liberika_capi.so` を build し、所在 directory を `ERIKA_LIBRARY_DIR` に設定して `flutter build linux` を実行します。
 
 `ErikaTextureVideoView` は GTK Flutter texture を使います。Linux の `ErikaVideoView` もこの path を選択します。映像・字幕・弾幕を GPU で合成して RGBA を読み戻し、SDR で表示します。Wayland では `ErikaWindowOverlayVideoView` が透明な Flutter UI の下に native video layer を置き、毎フレームの読み戻しを省きます。Wayland session が必要で、X11 には対応しません。
 
@@ -42,10 +42,10 @@ macOS は Now Playing と Remote Command Center で media 情報、再生、一�
 
 ## Prebuilt package と source build
 
-plugin は既定で現在の version に対応する native library を download し、SHA-256 を検証します。download または検証の失敗は明示的な error になり、source build へ暗黙に fallback しません。Erika checkout の local source を debug するときだけ `ERIKA_FORCE_SOURCE_BUILD=1` を設定してください。custom `ERIKA_PREBUILT_TAG` の single-ABI build には対応する `ERIKA_PREBUILT_SHA256` が必要です。Android multi-ABI build では `ERIKA_PREBUILT_SHA256_ARM64_V8A`、`ERIKA_PREBUILT_SHA256_ARMEABI_V7A`、`ERIKA_PREBUILT_SHA256_X86_64`、`ERIKA_PREBUILT_SHA256_X86` を ABI ごとに指定します。詳細は [release guide](https://github.com/AimesSoft/Erika/blob/main/docs/releasing.ja.md) を参照してください。
+plugin は既定で現在の version に対応する native library を download し、SHA-256 を検証します。download または検証の失敗は明示的な error になり、source build へ暗黙に fallback しません。liberika checkout の local source を debug するときだけ `ERIKA_FORCE_SOURCE_BUILD=1` を設定してください。custom `ERIKA_PREBUILT_TAG` の single-ABI build には対応する `ERIKA_PREBUILT_SHA256` が必要です。Android multi-ABI build では `ERIKA_PREBUILT_SHA256_ARM64_V8A`、`ERIKA_PREBUILT_SHA256_ARMEABI_V7A`、`ERIKA_PREBUILT_SHA256_X86_64`、`ERIKA_PREBUILT_SHA256_X86` を ABI ごとに指定します。詳細は [release guide](https://github.com/AimesSoft/liberika/blob/main/docs/releasing.ja.md) を参照してください。
 Android は要求された ABI ごとに約 20–22MB の runtime archive だけを download し、4 ABI combined C API bundle や static library は取得しません。
 
-source build の architecture は macOS では `ERIKA_MACOS_ARCHS=arm64|x86_64|universal`、Windows では `ERIKA_WINDOWS_ARCH=x64|arm64`、Android では `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86` で選択します。native library を直接 build する場合、`xtask --target`、`ERIKA_NATIVE_TARGET`、`cargo build --target` は同じ target にしてください。詳細は [build guide](https://github.com/AimesSoft/Erika/blob/main/docs/building.ja.md) を参照してください。
+source build の architecture は macOS では `ERIKA_MACOS_ARCHS=arm64|x86_64|universal`、Windows では `ERIKA_WINDOWS_ARCH=x64|arm64`、Android では `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86` で選択します。native library を直接 build する場合、`xtask --target`、`ERIKA_NATIVE_TARGET`、`cargo build --target` は同じ target にしてください。詳細は [build guide](https://github.com/AimesSoft/liberika/blob/main/docs/building.ja.md) を参照してください。
 
 macOS plugin は Now Playing を通じてタイトル、アーティスト、アルバム、artwork、再生状態、timeline を公開し、Remote Command Center からの再生、一時停止、停止、seek を処理します。
 
@@ -80,7 +80,7 @@ await player.play();
 ## System Media の前後移動
 
 playlist app は active item に応じて system media panel の前へ・次へ button を有効に
-できます。Erika 自身は次の media item を選択せず、
+できます。liberika 自身は次の media item を選択せず、
 `systemMediaNavigationRequested` event を発行するため、Dart を playlist の唯一の
 source of truth にできます。active item が変わるたびに capability を更新してください。
 
@@ -178,14 +178,14 @@ Windows plugin は System Media Transport Controls（SMTC）を通じてタイ�
 
 Android Gradle は選択された ABI の検証済み runtime を download します。Android API 26 以降が必要です。生成された `jniLibs` は `liberika_capi.so` と同じ ABI の NDK `libc++_shared.so` を含みます。既定は arm64 と x86_64。`-PerikaAndroidAbis=arm64-v8a,x86_64` または `ERIKA_ANDROID_ABIS` で指定できます。
 
-Android の `content://` media/subtitle URI は `ContentResolver` で開いて detach し、provider の offset/length を含む所有権付き `fd://` source として Erika に渡します。
+Android の `content://` media/subtitle URI は `ContentResolver` で開いて detach し、provider の offset/length を含む所有権付き `fd://` source として liberika に渡します。
 
 Android は MediaSession と media notification を使って lock screen、Bluetooth、system media control に接続します。`allowBackgroundPlayback: true` の場合は `mediaPlayback` foreground Service を起動し、video decode を停止したままバックグラウンドで音声を継続します。plugin Manifest には foreground service と Android 13+ の notification permission が宣言されていますが、host app は product flow に応じて `POST_NOTIFICATIONS` runtime permission を要求する必要があります。permission が拒否された場合も media session は動作しますが、notification の表示は Android version と system policy に依存します。
 
 Android minimum は API 26 のままです。Extended-linear は native-window dataspace API
 （API 28+）も必要で、API 26/27 は SDR playback を継続して該当 fallback を報告します。
 API 34+ では plugin が `Display.registerHdrSdrRatioChangedListener` を監視し、実際の ratio
-change を Erika に publish します。wgpu は surface を reattach せず後続 frame target と
+change を liberika に publish します。wgpu は surface を reattach せず後続 frame target と
 output status を更新します。API 35 では host の global Window を変更せず、`SurfaceView`
 ごとに desired HDR headroom も設定します。
 
@@ -290,7 +290,7 @@ final player = ErikaPlayer(
 );
 ```
 
-`edrHeadroom` は content-headroom ceiling です。extended-linear player で省略すると Erika
+`edrHeadroom` は content-headroom ceiling です。extended-linear player で省略すると liberika
 は default 4x content ceiling を使い、`SurfaceView` の desired headroom は `0`（system auto）
 になります。明示値は API 35 の per-`SurfaceView` desired headroom にも使います。current
 display HDR/SDR ratio が available なら wgpu effective target をさらに制限します。

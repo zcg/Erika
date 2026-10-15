@@ -1,4 +1,4 @@
-# Erika のリリース
+# liberika のリリース
 
 [中文](releasing.zh.md) · [English](releasing.md) · [ドキュメント](README.md)
 
@@ -36,7 +36,7 @@ git push origin "v${VERSION}"
 - 公開済みの checksum で Flutter/OHPM version と `native_artifacts.properties` を更新し、metadata を `main` に commit。
 - 内部 tag `erika_flutter-vX.Y.Z` を作成し、[Flutter OIDC 公開](../.github/workflows/flutter-package.yml)を開始。
 - ArkTS HAR を build し OHPM に upload。
-- Swift XCFramework を組み立て、コア Release と `SHA256SUMS` に追加。ErikaSwift に更新・テスト・同じ version の公開を通知。
+- Swift XCFramework を組み立て、コア Release と `SHA256SUMS` に追加。liberika-swift に更新・テスト・同じ version の公開を通知。
 
 Flutter、OHPM、Swift の公開は並列実行できます。メンテナーが作成するのはコア tag だけです。別 repository の tag と Swift 公開には secret `ERIKA_SWIFT_RELEASE_TOKEN` を使います。
 
@@ -73,7 +73,7 @@ Flutter は package に固定された native tag を download し、SHA-256 を
 | `ERIKA_PREBUILT_TAG` | native version を指定。対応する checksum も設定。 |
 | `ERIKA_PREBUILT_SHA256` | カスタム tag の archive checksum。 |
 | `ERIKA_PREBUILT_SHA256_<ABI>` | 複数 ABI の Android は `ARM64_V8A`、`ARMEABI_V7A`、`X86_64`、`X86` を個別に設定。 |
-| `ERIKA_FORCE_SOURCE_BUILD=1` | ローカル Erika source を build。 |
+| `ERIKA_FORCE_SOURCE_BUILD=1` | ローカル liberika source を build。 |
 | `ERIKA_MACOS_ARCHS` | `universal`, `arm64`, `x86_64`, `arm64,x86_64` |
 
 C/C++ は bundle を展開し、`lib/` を link、`include/erika.h` を include します。macOS dylib は `@rpath/liberika_capi.dylib` を使います。[ネイティブ接続](integration.ja.md)。
@@ -87,4 +87,4 @@ bash packaging/bundle.sh erika-capi-macos-universal \
   dist/erika-capi-macos-universal.zip out/liberika_capi.dylib out/liberika_capi.a
 ```
 
-Erika は MPL-2.0、依存 library はそれぞれの license を維持します。公開 bundle に license、third-party notice、build source を残します。`lgpl` / `gpl-full` の設定は[ビルドガイド](building.ja.md#ライセンス-profile)で管理します。
+liberika は MPL-2.0、依存 library はそれぞれの license を維持します。公開 bundle に license、third-party notice、build source を残します。`lgpl` / `gpl-full` の設定は[ビルドガイド](building.ja.md#ライセンス-profile)で管理します。

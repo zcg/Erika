@@ -681,6 +681,7 @@ dependencies = [
  "ureq",
  "wgpu",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

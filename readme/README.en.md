@@ -1,13 +1,13 @@
 [中文](../README.md) | [English](README.en.md) | [日本語](README.ja.md)
 
-# Erika
+# liberika
 
-> "GOOD! I'm Erika, the fifth player kernel in NipaPlay after mdk, video player, libmpv, and media kit."
+> "GOOD! I'm liberika, the fifth player kernel in NipaPlay after mdk, video player, libmpv, and media kit."
 > "Even counting you, there are only four player kernels!"
 
 **The in-house playback core of NipaPlay.** Written in Rust, embeddable, handling everything from decode to render.
 
-> Named after the detective **Furude Erika** from *Umineko When They Cry*.
+> Named after the detective **Furude liberika** from *Umineko When They Cry*.
 > [NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) takes its name from **Furude Rika**'s catchphrase "nipah~☆" in *Higurashi When They Cry* — the community simply calls her "Rika".
 > One is the player the audience sees; the other is the engine behind the curtain. Two sides of the same coin, from the same universe.
 
@@ -28,14 +28,14 @@ Current release: **0.2.1**. Start with the [documentation index](../docs/README.
 | Host | Install / entry point | Guide |
 |---|---|---|
 | Flutter | `flutter pub add erika_flutter` (0.2.1) | [Plugin guide](../packages/erika_flutter/README.md) |
-| Swift / Apple | Add `https://github.com/AimesSoft/ErikaSwift` in Xcode, from 0.2.1 | [ErikaSwift](https://github.com/AimesSoft/ErikaSwift) |
+| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode, from 0.2.1 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | Matching C ABI bundle and `erika.h` | [Native integration](../docs/integration.md) |
 | Rust | Git dependency pinned to `v0.2.1` | [Build guide](../docs/building.md) |
 | Linux | System FFmpeg 8 and patched libass; source build | [Linux guide](../docs/linux.md) |
 
 As of 2026-10-02, OHPM serves 0.1.9; 0.2.1 has been submitted for review.
-Native archives are available from [GitHub Releases](https://github.com/AimesSoft/Erika/releases/tag/v0.2.1).
+Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.2.1).
 
 ### Flutter
 
@@ -58,7 +58,7 @@ platform-specific choices and lifecycle.
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/Erika", tag = "v0.2.1" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.2.1" }
 ```
 
 ```rust

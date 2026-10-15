@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Existing Erika native release version
+        description: Existing liberika native release version
         required: true
         default: "0.1.7"
         type: string
@@ -21,7 +21,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: Existing Erika native release version
+        description: Existing liberika native release version
         required: true
         type: string
       ref:

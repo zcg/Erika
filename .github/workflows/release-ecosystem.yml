@@ -183,7 +183,7 @@ jobs:
     secrets: inherit
 
   update-swift-sdk:
-    name: Update ErikaSwift repository
+    name: Update liberika-swift repository
     needs: [version, build-swift]
     runs-on: ubuntu-latest
     permissions:
@@ -194,7 +194,7 @@ jobs:
       CHECKSUM: ${{ needs.build-swift.outputs.checksum }}
       SOURCE_TAG: ${{ needs.version.outputs.release_ref }}
     steps:
-      - name: Dispatch ErikaSwift release workflow
+      - name: Dispatch liberika-swift release workflow
         shell: bash
         run: |
           set -euo pipefail
@@ -205,4 +205,4 @@ jobs:
             --arg checksum "$CHECKSUM" \
             --arg source_tag "$SOURCE_TAG" \
             '{event_type:"erika-release", client_payload:{version:$version, checksum:$checksum, source_tag:$source_tag}}' \
-            | gh api --method POST repos/AimesSoft/ErikaSwift/dispatches --input -
+            | gh api --method POST repos/AimesSoft/liberika-swift/dispatches --input -

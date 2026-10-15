@@ -332,6 +332,7 @@ enum NativeTarget {
     X86_64Android,
     I686Android,
     Aarch64Ohos,
+    X86_64Ohos,
 }
 
 impl NativeTarget {
@@ -353,6 +354,7 @@ impl NativeTarget {
             "x86_64-linux-android" | "android-x64" => Ok(Self::X86_64Android),
             "i686-linux-android" | "x86" => Ok(Self::I686Android),
             "aarch64-unknown-linux-ohos" | "ohos-arm64" => Ok(Self::Aarch64Ohos),
+            "x86_64-unknown-linux-ohos" | "ohos-x64" => Ok(Self::X86_64Ohos),
             other => bail!("unknown native target: {other}"),
         }
     }
@@ -375,6 +377,7 @@ impl NativeTarget {
             Self::X86_64Android => Some("x86_64-linux-android"),
             Self::I686Android => Some("i686-linux-android"),
             Self::Aarch64Ohos => Some("aarch64-unknown-linux-ohos"),
+            Self::X86_64Ohos => Some("x86_64-unknown-linux-ohos"),
         }
     }
 
@@ -392,7 +395,8 @@ impl NativeTarget {
             | Self::Armv7Android
             | Self::X86_64Android
             | Self::I686Android
-            | Self::Aarch64Ohos => None,
+            | Self::Aarch64Ohos
+            | Self::X86_64Ohos => None,
         }
     }
 
@@ -414,6 +418,7 @@ impl NativeTarget {
             Self::X86_64Android => Some("x86_64"),
             Self::I686Android => Some("x86"),
             Self::Aarch64Ohos => Some("aarch64"),
+            Self::X86_64Ohos => Some("x86_64"),
         }
     }
 
@@ -435,6 +440,7 @@ impl NativeTarget {
             Self::X86_64Android => Some("x86_64"),
             Self::I686Android => Some("x86"),
             Self::Aarch64Ohos => Some("aarch64"),
+            Self::X86_64Ohos => Some("x86_64"),
         }
     }
 
@@ -456,6 +462,7 @@ impl NativeTarget {
             Self::X86_64Android => Some("x86_64"),
             Self::I686Android => Some("i686"),
             Self::Aarch64Ohos => Some("aarch64"),
+            Self::X86_64Ohos => Some("x86_64"),
         }
     }
 
@@ -520,8 +527,16 @@ impl NativeTarget {
     }
 
     fn is_ohos(self) -> bool {
-        matches!(self, Self::Aarch64Ohos)
+        matches!(self, Self::Aarch64Ohos | Self::X86_64Ohos)
             || (matches!(self, Self::Host) && cfg!(target_env = "ohos"))
+    }
+
+    fn ohos_abi(self) -> Option<&'static str> {
+        match self {
+            Self::Aarch64Ohos => Some("arm64-v8a"),
+            Self::X86_64Ohos => Some("x86_64"),
+            _ => None,
+        }
     }
 
     fn deployment_target(self) -> Option<(String, &'static str)> {
@@ -553,7 +568,8 @@ impl NativeTarget {
             | Self::Armv7Android
             | Self::X86_64Android
             | Self::I686Android
-            | Self::Aarch64Ohos => None,
+            | Self::Aarch64Ohos
+            | Self::X86_64Ohos => None,
         }
     }
 }
@@ -1668,7 +1684,7 @@ fn apply_cmake_target(command: &mut Command, target: NativeTarget) -> Result<()>
                 "-DCMAKE_TOOLCHAIN_FILE={}",
                 config.cmake_toolchain_file.display()
             ))
-            .arg("-DOHOS_ARCH=arm64-v8a")
+            .arg(format!("-DOHOS_ARCH={}", config.abi))
             .arg("-DOHOS_STL=c++_shared")
             .arg(format!(
                 "-DOHOS_COMPATIBLE_SDK_VERSION={}",
@@ -1863,12 +1879,12 @@ fn meson_cross_file(
 
 fn ohos_meson_cross_contents(config: &OhosToolchain, pkg_config: &Path) -> String {
     let flags = vec![
-        "--target=aarch64-unknown-linux-ohos".to_string(),
+        format!("--target={}", config.triple),
         format!("--sysroot={}", config.sysroot.display()),
         "-fPIC".to_string(),
     ];
     format!(
-        "[binaries]\nc = {}\ncpp = {}\nar = {}\nstrip = {}\npkg-config = {}\n\n[built-in options]\nc_args = {}\ncpp_args = {}\nc_link_args = {}\ncpp_link_args = {}\n\n[properties]\nneeds_exe_wrapper = true\n\n[host_machine]\nsystem = 'linux'\ncpu_family = 'aarch64'\ncpu = 'aarch64'\nendian = 'little'\n",
+        "[binaries]\nc = {}\ncpp = {}\nar = {}\nstrip = {}\npkg-config = {}\n\n[built-in options]\nc_args = {}\ncpp_args = {}\nc_link_args = {}\ncpp_link_args = {}\n\n[properties]\nneeds_exe_wrapper = true\n\n[host_machine]\nsystem = 'linux'\ncpu_family = {}\ncpu = {}\nendian = 'little'\n",
         meson_string(&config.clang.display().to_string()),
         meson_string(&config.clangxx.display().to_string()),
         meson_string(&config.ar.display().to_string()),
@@ -1878,6 +1894,8 @@ fn ohos_meson_cross_contents(config: &OhosToolchain, pkg_config: &Path) -> Strin
         meson_array(&flags),
         meson_array(&flags),
         meson_array(&flags),
+        meson_string(config.arch),
+        meson_string(config.arch),
     )
 }
 
@@ -2058,7 +2076,7 @@ fn apply_ffmpeg_patches(layout: &WorkspaceLayout) -> Result<()> {
         Ok(application) => application,
         Err(first_error) => {
             // third_party/src is generated from the pinned archive. If an older
-            // Erika patch set or an interrupted partial application left it in
+            // liberika patch set or an interrupted partial application left it in
             // an unknown state, refresh it automatically instead of requiring
             // users to repair the vendored source tree by hand.
             println!(
@@ -2734,7 +2752,8 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
             | NativeTarget::Armv7Android
             | NativeTarget::X86_64Android
             | NativeTarget::I686Android
-            | NativeTarget::Aarch64Ohos => {}
+            | NativeTarget::Aarch64Ohos
+            | NativeTarget::X86_64Ohos => {}
         }
     } else if let Some(config) = android_toolchain(options.target)? {
         configure.arg(format!("--cc={}", ffmpeg_flag_path_arg(&config.clang)));
@@ -2779,7 +2798,7 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         configure.arg(format!("--nm={}", ffmpeg_flag_path_arg(&config.nm)));
         configure.arg("--target-os=linux");
         configure.arg("--enable-cross-compile");
-        configure.arg("--arch=aarch64");
+        configure.arg(format!("--arch={}", config.arch));
         configure.arg(format!(
             "--sysroot={}",
             path_to_forward_slashes(&config.sysroot)
@@ -3109,6 +3128,9 @@ struct OhosToolchain {
     strip: PathBuf,
     nm: PathBuf,
     compatible_sdk_version: String,
+    triple: &'static str,
+    arch: &'static str,
+    abi: &'static str,
 }
 
 fn apple_toolchain(target: NativeTarget) -> Result<Option<AppleToolchain>> {
@@ -3202,14 +3224,15 @@ fn ohos_toolchain(target: NativeTarget) -> Result<Option<OhosToolchain>> {
     let bin_dir = native_root.join("llvm/bin");
     let sysroot = native_root.join("sysroot");
     let cmake_toolchain_file = native_root.join("build/cmake/ohos.toolchain.cmake");
+    let triple = target.triple().context("OHOS target must have a triple")?;
     let clang = required_executable_in_dir(
         &bin_dir,
-        "aarch64-unknown-linux-ohos-clang",
+        &format!("{triple}-clang"),
         "OpenHarmony C compiler",
     )?;
     let clangxx = required_executable_in_dir(
         &bin_dir,
-        "aarch64-unknown-linux-ohos-clang++",
+        &format!("{triple}-clang++"),
         "OpenHarmony C++ compiler",
     )?;
     let ar = required_executable_in_dir(&bin_dir, "llvm-ar", "OpenHarmony archiver")?;
@@ -3236,6 +3259,11 @@ fn ohos_toolchain(target: NativeTarget) -> Result<Option<OhosToolchain>> {
         strip,
         nm,
         compatible_sdk_version,
+        triple,
+        arch: target
+            .ffmpeg_arch()
+            .context("OHOS target must have an arch")?,
+        abi: target.ohos_abi().context("OHOS target must have an ABI")?,
     }))
 }
 
@@ -4954,6 +4982,9 @@ mod tests {
             strip: bin.join("llvm-strip"),
             nm: bin.join("llvm-nm"),
             compatible_sdk_version: "18".to_string(),
+            triple: "aarch64-unknown-linux-ohos",
+            arch: "aarch64",
+            abi: "arm64-v8a",
         };
         let content = ohos_meson_cross_contents(&config, Path::new("/usr/bin/pkg-config"));
         assert!(content.contains(&format!(
@@ -5022,6 +5053,7 @@ mod tests {
                 NativeTarget::X86_64Android,
                 NativeTarget::I686Android,
                 NativeTarget::Aarch64Ohos,
+                NativeTarget::X86_64Ohos,
             ] {
                 let flags = profile.ffmpeg_configure_flags_for_target(target);
                 let enabled = |kind: &str, name: &str| {
@@ -5442,7 +5474,7 @@ fn print_help() {
     println!("  cargo run -p xtask -- deps fetch --profile lgpl [--all]");
     println!("  cargo run -p xtask -- deps status --profile lgpl");
     println!(
-        "  cargo run -p xtask -- deps build --profile lgpl [--target host|aarch64-apple-darwin|x86_64-apple-darwin|aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios|aarch64-apple-tvos|aarch64-apple-tvos-sim|x86_64-apple-tvos|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc|aarch64-linux-android|armv7-linux-androideabi|x86_64-linux-android|i686-linux-android] [--force] [--jobs N]"
+        "  cargo run -p xtask -- deps build --profile lgpl [--target host|aarch64-apple-darwin|x86_64-apple-darwin|aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios|aarch64-apple-tvos|aarch64-apple-tvos-sim|x86_64-apple-tvos|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc|aarch64-linux-android|armv7-linux-androideabi|x86_64-linux-android|i686-linux-android|aarch64-unknown-linux-ohos|x86_64-unknown-linux-ohos] [--force] [--jobs N]"
     );
     println!("  cargo run -p xtask -- check cargo-patches");
     println!("  cargo run -p xtask -- check license");

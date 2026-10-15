@@ -1,6 +1,6 @@
 # iOS DFM+ presentation timing
 
-Erika already rendered on a serial worker driven by CADisplayLink. Its DFM+
+liberika already rendered on a serial worker driven by CADisplayLink. Its DFM+
 positions nevertheless sampled the shared playback clock after audio/video
 pumping, using the worker's current time. Variable queue/pump latency therefore
 changed scroll displacement between display frames. While a render was queued,

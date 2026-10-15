@@ -1,8 +1,8 @@
-# Erika へのコントリビュート
+# liberika へのコントリビュート
 
 > [English](CONTRIBUTING.md) | [中文](CONTRIBUTING.zh.md)
 
-Erika は NipaPlay の自社開発再生コアです：demux/decode から GPU プレゼンテーション、
+liberika は NipaPlay の自社開発再生コアです：demux/decode から GPU プレゼンテーション、
 オーディオ、字幕、弾幕までを所有する Rust エンジンで、C ABI と Flutter プラグインを通じて
 ホストに公開されます。本書は作業のためのオリエンテーション地図です。
 

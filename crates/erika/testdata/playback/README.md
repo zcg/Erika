@@ -1,11 +1,11 @@
 # Deterministic playback fixture
 
-`playback-fixture.mkv` is a small, deterministic input for Erika playback
+`playback-fixture.mkv` is a small, deterministic input for liberika playback
 state and track-switching tests. It is eight seconds long and contains, in
 this exact order:
 
 Every input and output in this directory is original synthetic material made
-for the Erika repository. The video and audio come from deterministic FFmpeg
+for the liberika repository. The video and audio come from deterministic FFmpeg
 filters, and the subtitle cues and supporting files were authored for this
 fixture. No third-party media is included. The inputs, generated output,
 script, and documentation are distributed under the repository root's

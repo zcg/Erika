@@ -783,7 +783,7 @@ impl Default for LibassRenderConfig {
     }
 }
 
-/// Text colour Erika falls back to when nothing else specifies one, as
+/// Text colour liberika falls back to when nothing else specifies one, as
 /// `0xRRGGBBAA` with alpha 255 meaning fully opaque.
 pub const DEFAULT_SUBTITLE_PRIMARY_COLOR_RGBA: u32 = 0xffff_ffff;
 /// Outline/shadow colour fallback, half-transparent black.
@@ -810,7 +810,7 @@ pub const SUBTITLE_OVERRIDE_ALL: u32 = SUBTITLE_OVERRIDE_LEGACY_FORCE
     | SUBTITLE_OVERRIDE_MARGINS
     | SUBTITLE_OVERRIDE_BLUR;
 
-/// User-chosen subtitle look. Empty strings mean "keep Erika's default", so
+/// User-chosen subtitle look. Empty strings mean "keep liberika's default", so
 /// [`SubtitleStyleConfig::default`] reproduces the built-in style exactly.
 ///
 /// The font and colours act as *fallbacks*: a container ASS script keeps its
@@ -888,7 +888,7 @@ impl Default for SubtitleStyleConfig {
 impl SubtitleStyleConfig {
     /// Trims caller-provided paths and family names, and clamps the metrics to
     /// a range libass can render. An empty string stays the "unset" marker; a
-    /// non-finite metric falls back to Erika's default.
+    /// non-finite metric falls back to liberika's default.
     pub fn normalized(mut self) -> Self {
         self.font_family = self.font_family.trim().to_string();
         self.font_file_path = self.font_file_path.trim().to_string();
@@ -2104,11 +2104,11 @@ impl SubtitleTimeline {
 
 pub fn parse_srt(input: &str) -> Result<SubtitleTimeline> {
     let mut cues = Vec::new();
-    for block in input.replace("\r\n", "\n").split("\n\n") {
-        let lines = block
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect::<Vec<_>>();
+    // SRT and WebVTT separators may contain spaces or tabs. Treat any
+    // whitespace-only line as a boundary, preserving multiline cue text.
+    let normalized = input.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    for lines in lines.split(|line| line.trim().is_empty()) {
         if lines.is_empty() {
             continue;
         }
@@ -2288,7 +2288,15 @@ fn parse_timestamp(value: &str) -> Result<Duration> {
         ),
         _ => return Err(SubtitleError::InvalidTimestamp(value)),
     };
-    Ok(Duration::from_secs(hours * 3600 + minutes * 60) + seconds)
+    // Checked so an absurd-but-parseable timestamp ("99999999999:00:00.000")
+    // reports an error instead of overflowing or panicking.
+    let base = hours
+        .checked_mul(3600)
+        .and_then(|product| product.checked_add(minutes.checked_mul(60)?))
+        .ok_or_else(|| SubtitleError::InvalidTimestamp(value.clone()))?;
+    Duration::from_secs(base)
+        .checked_add(seconds)
+        .ok_or_else(|| SubtitleError::InvalidTimestamp(value))
 }
 
 fn parse_int(value: &str) -> Result<u64> {
@@ -2301,7 +2309,8 @@ fn parse_seconds(value: &str) -> Result<Duration> {
     let seconds = value
         .parse::<f64>()
         .map_err(|_| SubtitleError::InvalidTimestamp(value.to_string()))?;
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| SubtitleError::InvalidTimestamp(value.to_string()))
 }
 
 fn clean_ass_text(value: &str) -> String {
@@ -2394,7 +2403,7 @@ const MIN_ASS_FONT_SIZE: f64 = 8.0;
 const MAX_ASS_FONT_SIZE: f64 = 400.0;
 const MAX_ASS_OUTLINE: f64 = 32.0;
 
-/// Attachment name Erika registers the bundled `assets/subfont.ttf` under.
+/// Attachment name liberika registers the bundled `assets/subfont.ttf` under.
 const BUNDLED_ASS_FALLBACK_FONT_NAME: &str = "subfont.ttf";
 /// Family name carried by the bundled fallback face. Keep in sync with the
 /// asset itself; `bundled_ass_fallback_family_matches_asset` locks the two.
@@ -2795,6 +2804,62 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "Hello"
         );
         assert!(timeline.active_cues(Duration::from_millis(3500)).is_empty());
+    }
+
+    #[test]
+    fn parse_srt_rejects_unrepresentable_timestamps_instead_of_panicking() {
+        // "inf" parses as f64 infinity and "-1.5" as a negative value, both of
+        // which Duration::from_secs_f64 panics on; absurd hour counts overflow
+        // the seconds arithmetic. All of them are invalid timestamps.
+        let finite_overflow = parse_srt("1\n00:00:01,000 --> 0:00:1e100\nboom\n");
+        assert!(finite_overflow.is_err());
+
+        let infinite = parse_srt("1\n00:00:01,000 --> 0:00:inf\nboom\n");
+        assert!(infinite.is_err());
+
+        let negative = parse_srt("1\n00:00:01,000 --> 0:00:-1.500\nboom\n");
+        assert!(negative.is_err());
+
+        let overflow =
+            parse_srt("1\n99999999999999999:00:00,000 --> 99999999999999999:00:01,000\nboom\n");
+        assert!(overflow.is_err());
+    }
+
+    #[test]
+    fn subtitle_cues_split_on_whitespace_separators_with_lf_and_crlf() {
+        for newline in ["\n", "\r\n"] {
+            for separator in [" ", "\t", " \t "] {
+                let srt = [
+                    "1",
+                    "00:00:01,000 --> 00:00:02,000",
+                    "First",
+                    "continued",
+                    separator,
+                    "2",
+                    "00:00:03,000 --> 00:00:04,000",
+                    "Second",
+                ]
+                .join(newline);
+                let timeline = parse_srt(&srt).unwrap();
+                assert_eq!(
+                    timeline.cues().len(),
+                    2,
+                    "newline={newline:?}, separator={separator:?}"
+                );
+                assert_eq!(timeline.cues()[0].text, "First\ncontinued");
+                assert_eq!(timeline.cues()[1].text, "Second");
+                assert_eq!(timeline.active_cues(Duration::from_millis(3500)).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn webvtt_cues_split_on_whitespace_separators_and_preserve_multiline_text() {
+        let vtt = "WEBVTT\r\n\r\n00:00:01.000 --> 00:00:02.000\r\nFirst\r\ncontinued\r\n \t \r\n00:00:03.000 --> 00:00:04.000\r\nSecond\r\n";
+        let timeline = parse_webvtt(vtt).unwrap();
+        assert_eq!(timeline.cues().len(), 2);
+        assert_eq!(timeline.cues()[0].text, "First\ncontinued");
+        assert_eq!(timeline.cues()[1].text, "Second");
     }
 
     #[test]

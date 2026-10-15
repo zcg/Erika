@@ -1,14 +1,14 @@
-# Integrating Erika in a Native Host
+# Integrating liberika in a Native Host
 
 > Translations: [中文](integration.zh.md) · [日本語](integration.ja.md)
 
-This guide walks through embedding Erika in a non-Flutter host — a C/C++/Swift
+This guide walks through embedding liberika in a non-Flutter host — a C/C++/Swift
 app, a Win32 window, or any runtime with C FFI. It uses the **presenter** (push)
-model, where Erika owns decode, timing, audio, overlays, and presentation, and
+model, where liberika owns decode, timing, audio, overlays, and presentation, and
 the host supplies a surface plus a per-frame `render_tick`.
 
 Prerequisites: the C ABI ([capi_reference.md](capi_reference.md)) and a built
-Erika library ([building.md](building.md)). For Flutter, use the
+liberika library ([building.md](building.md)). For Flutter, use the
 [`erika_flutter`](../packages/erika_flutter) plugin instead, described in
 [flutter_embedding.md](flutter_embedding.md).
 
@@ -22,7 +22,7 @@ calls below are the 1:1 equivalents.
 
 Use `ErikaPresenterHandle` unless you have a reason to render yourself. The
 pull-model `ErikaHandle` is for hosts that own their compositor and only want
-Erika's decode/timing/state. The rest of this guide is presenter-based.
+liberika's decode/timing/state. The rest of this guide is presenter-based.
 
 The presenter family is compiled on **macOS, iOS, tvOS, Windows, Android, and
 HarmonyOS and experimental Linux**. The native host API is platform-specific; HarmonyOS Flutter hosts
@@ -67,12 +67,12 @@ explicit `Inactive` status and fallback reason.
 
 ## 4. Attach a surface
 
-Erika renders directly into a platform surface you own. Width/height are
+liberika renders directly into a platform surface you own. Width/height are
 **physical pixels**; `scale` is the DPI/backing factor.
 
 ### macOS / iOS / tvOS — `CAMetalLayer`
 
-Create a `CAMetalLayer`, size it, then hand its pointer to Erika:
+Create a `CAMetalLayer`, size it, then hand its pointer to liberika:
 
 ```c
 // `layer` is a CAMetalLayer* (e.g. from your NSView/UIView host layer)
@@ -185,7 +185,7 @@ Read-ahead defaults to 4 MiB, rewind to 16 MiB. Zero selects defaults;
 bytes; size the rewind cache for the media bitrate and desired rewind time.
 
 HTTP(S) origins may ignore Range and return `200` with the full resource,
-including responses without Content-Length. Erika discards the prefix before
+including responses without Content-Length. liberika discards the prefix before
 the requested offset and buffers only the requested bytes; a complete response
 can establish the resource length at EOF. Seeking or reconnecting to such an
 origin downloads the prefix again, so servers supporting `206` remain faster
@@ -198,7 +198,7 @@ reads but cannot authorize resuming a partial response.
 Drive `render_tick` from the surface's display timer — `CADisplayLink`
 (iOS/tvOS) / `CVDisplayLink` or `CADisplayLink` (macOS) / a frame scheduler on
 Windows / `Choreographer` on Android. Pass the frame's **presentation time in
-seconds** from a monotonic host clock; Erika uses it for vsync-quantized
+seconds** from a monotonic host clock; liberika uses it for vsync-quantized
 scheduling, so pass an absolute timestamp, not a delta.
 
 ```c
@@ -285,7 +285,7 @@ erika_presenter_detach_surface(p);   // stop drawing into the surface first
 erika_presenter_destroy(p);          // stops playback, releases everything
 ```
 
-Detach before you tear down the window/layer so Erika stops touching the
+Detach before you tear down the window/layer so liberika stops touching the
 surface. `destroy` is safe on a `NULL` handle.
 
 ## 10. Threading model
@@ -305,7 +305,7 @@ failing call.
 Include `erika.h`, link the library (see [building.md](building.md)), and you
 are done — the ABI is plain C. In C++ wrap the handle in an RAII type that calls
 `erika_presenter_destroy` in its destructor, and free returned strings /
-`ErikaTrackInfo` records with the matching Erika free functions, never `delete`.
+`ErikaTrackInfo` records with the matching liberika free functions, never `delete`.
 
 ### Swift
 

@@ -1,8 +1,8 @@
 [中文](../README.md) | [English](README.en.md) | [日本語](README.ja.md)
 
-# Erika
+# liberika
 
-> 「GOOD！私はErika、NipaPlayにおいてmdk、video player、libmpv、media kitに次ぐ5番目のプレイヤーカーネルです。」
+> 「GOOD！私はliberika、NipaPlayにおいてmdk、video player、libmpv、media kitに次ぐ5番目のプレイヤーカーネルです。」
 > 「あなたを数えても、プレイヤーカーネルは4つだけ！」
 
 **NipaPlay の自社開発再生コア。** Rust 実装、組み込み可能、デコードからレンダリングまで一手に引き受けます。
@@ -11,7 +11,7 @@
 > そして [NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) は『ひぐらしのなく頃に』の古手梨花の口癖「にぱー☆」から——コミュニティではみんな「梨花」と呼んでいます。
 > 一方は表舞台のプレイヤー、もう一方は舞台裏のエンジン。同じ世界から生まれた、表裏一体の存在です。
 
-ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて Erika 内部で完結します。
+ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて liberika 内部で完結します。
 
 現在のリリースは **0.2.1** です。[ドキュメント一覧](../docs/README.md) からガイドを選べます。
 
@@ -28,14 +28,14 @@
 | ホスト | インストール / 入口 | ガイド |
 |---|---|---|
 | Flutter | `flutter pub add erika_flutter`（0.2.1） | [プラグイン](../packages/erika_flutter/README.ja.md) |
-| Swift / Apple | Xcode に `https://github.com/AimesSoft/ErikaSwift` を追加、0.2.1 以降 | [ErikaSwift](https://github.com/AimesSoft/ErikaSwift) |
+| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加、0.2.1 以降 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
 | Rust | Git 依存を `v0.2.1` に固定 | [ビルド](../docs/building.ja.md) |
 | Linux | システム FFmpeg 8 とパッチ済み libass、ソースビルド | [Linux](../docs/linux.md) |
 
 2026-10-02 時点の OHPM 公開版は 0.1.9、0.2.1 は審査に提出済みです。
-ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/Erika/releases/tag/v0.2.1) にあります。
+ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.2.1) にあります。
 
 ### Flutter
 
@@ -58,7 +58,7 @@ Windows HDR10 にはネイティブ映像サーフェスを使います。選択
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/Erika", tag = "v0.2.1" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.2.1" }
 ```
 
 ```rust

@@ -2153,12 +2153,44 @@ impl D3d11Renderer {
         self.set_device(frame_device, context)
     }
 
+    /// 设备被移除的 HRESULT 原因码（`None` 表示设备仍然可用）。设备正常时
+    /// `GetDeviceRemovedReason` 返回 S_OK，TDR/驱动重置/换适配器后返回失败。
+    fn device_removed_reason(&self) -> Option<i32> {
+        self.state.as_ref().and_then(|state| {
+            unsafe { state.device.GetDeviceRemovedReason() }
+                .err()
+                .map(|error| error.code().0)
+        })
+    }
+
     /// 设备是否已失效：`GetDeviceRemovedReason` 返回非 S_OK（设备移除/重置）
     /// 即判定。注意设备正常时该调用返回 S_OK，TDR 后返回失败。
     fn device_removed(&self) -> bool {
-        self.state
-            .as_ref()
-            .is_some_and(|state| unsafe { state.device.GetDeviceRemovedReason().is_err() })
+        self.device_removed_reason().is_some()
+    }
+
+    /// Drops the renderer state when the GPU device is gone (TDR, driver
+    /// reset, adapter change) so the next call rebuilds everything through
+    /// `ensure_default_device` -> `set_device`, which already re-creates the
+    /// device-bound pipeline, swapchain, and targets. Without this probe a
+    /// removed device poisons every later call: errors repeat forever while
+    /// the host believes playback is alive.
+    ///
+    /// 注意：本调用会清空 `state`，之后再读 `device_removed_reason` 就拿不到
+    /// 原因码；需要诊断 / presenter 自愈原因码的调用方请在调用前先取。
+    fn drop_device_if_removed(&mut self) {
+        if !self.device_removed() {
+            return;
+        }
+        self.invalidate_device();
+        eprintln!("erika d3d11: GPU device removed; renderer will rebuild on the next frame");
+    }
+
+    fn invalidate_device(&mut self) {
+        self.current_video = None;
+        self.danmaku_atlas_cache = None;
+        self.flutter_scene = None;
+        self.state = None;
     }
 
     fn set_device(&mut self, device: ID3D11Device, context: ID3D11DeviceContext) -> Result<()> {
@@ -3484,8 +3516,13 @@ impl RendererBackend for D3d11Renderer {
     }
 
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        self.drop_device_if_removed();
         if frame.frame.d3d11va_texture().is_some() {
-            return self.import_d3d11va_frame(frame);
+            let result = self.import_d3d11va_frame(frame);
+            if result.is_err() {
+                self.stats.import_failures += 1;
+            }
+            return result;
         }
         if frame.frame.has_hw_frames_context() {
             self.stats.hardware_video_frames += 1;
@@ -3511,28 +3548,28 @@ impl RendererBackend for D3d11Renderer {
     }
 
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
+        // 上游探针：设备已被移除时先丢弃设备态，让下面的 `render_video` 通过
+        // `ensure_default_device` -> `set_device` 重建管线 / 交换链 / 目标，
+        // 本帧就有机会恢复。丢弃会清空 `state`，而下面的自愈记账需要原因码，
+        // 所以在丢弃之前先取一次。
+        let removed_reason = self.device_removed_reason();
+        self.drop_device_if_removed();
         let result = self.render_video(context);
         // 无帧可渲染（Ok(false)，current_video 为空）时同样检查设备是否已失效：
         // import 切设备失败会清空 current_video，且错误被 pump_video 吞掉（仅
         // eprintln 记录、不触发自愈）；若此时设备已被 TDR 移除，render_video
         // 空转返回 Ok(false)，走不到下方 Err 分支的 device_lost 检测——在此
-        // 补检，否则 presenter 永不触发自愈，画面永久黑屏。设备正常时短路
-        // 不调用 GetDeviceRemovedReason，无额外开销。
+        // 补检，否则 presenter 永不触发自愈，画面永久黑屏。
         let frame_absent = matches!(&result, Ok(false));
-        if (result.is_err() || frame_absent) && self.device_removed() {
+        let device_gone = removed_reason.is_some() || self.device_removed();
+        if (result.is_err() || frame_absent) && device_gone {
             // GPU 设备移除/重置（TDR 通常返回 DXGI_ERROR_DEVICE_RESET，硬件
             // 错误返回 DEVICE_REMOVED）后所有设备操作失败。用
             // GetDeviceRemovedReason 确认（而非匹配错误文本），避免把 shader
             // 编译等普通渲染错误误判为设备丢失。PresenterRuntime 据此自愈。
             self.device_lost = true;
-            let reason = self
-                .state
-                .as_ref()
-                .and_then(|state| {
-                    unsafe { state.device.GetDeviceRemovedReason() }
-                        .err()
-                        .map(|e| e.code().0)
-                })
+            let reason = removed_reason
+                .or_else(|| self.device_removed_reason())
                 .unwrap_or(0);
             self.stats.device_lost_events += 1;
             self.stats.last_device_lost_reason = reason as u32;
@@ -5164,6 +5201,72 @@ mod tests {
             .set_device(device.unwrap(), context.unwrap())
             .unwrap();
         renderer
+    }
+
+    #[test]
+    fn software_device_invalidation_rebuilds_flutter_targets_and_preserves_pixels() {
+        use crate::core::FlutterTextureHandle;
+        let mut renderer = software_test_renderer();
+        renderer
+            .attach_surface(PlatformSurface::FlutterTexture(FlutterTextureHandle::new(
+                FlutterTextureKind::WindowsTextureRegistrar,
+                1,
+                4,
+                4,
+                1.0,
+            )))
+            .unwrap();
+        let upload = |renderer: &mut D3d11Renderer| {
+            renderer
+                .upload_planar_frame(
+                    PlanarFrame {
+                        format: PlanarPixelFormat::Nv12,
+                        width: 4,
+                        height: 4,
+                        luma: vec![235; 16],
+                        chroma: vec![128; 8],
+                    },
+                    SourceColorState::new(ColorPrimaries::Bt709, TransferFunction::Bt1886),
+                )
+                .unwrap();
+            assert!(
+                renderer
+                    .render_current_frame(RenderFrameContext::new(Duration::ZERO, 1))
+                    .unwrap()
+            );
+        };
+        upload(&mut renderer);
+        let old_device = renderer.state.as_ref().unwrap().device.clone();
+        let old_image = renderer
+            .surface
+            .as_ref()
+            .unwrap()
+            .published_texture
+            .as_ref()
+            .unwrap()
+            .clone();
+        let before = read_bgra_pixel(renderer.state.as_ref().unwrap(), &old_image);
+        assert_eq!(before, [255, 255, 255, 255]);
+
+        // Exercise the native teardown/rebuild that a removal HRESULT selects,
+        // without resetting the user's GPU or disrupting other applications.
+        renderer.invalidate_device();
+        upload(&mut renderer);
+        let state = renderer.state.as_ref().unwrap();
+        let image = renderer
+            .surface
+            .as_ref()
+            .unwrap()
+            .published_texture
+            .as_ref()
+            .unwrap();
+        assert_ne!(state.device.as_raw(), old_device.as_raw());
+        assert_ne!(image.as_raw(), old_image.as_raw());
+        assert_eq!(
+            unsafe { image.GetDevice() }.unwrap().as_raw(),
+            state.device.as_raw()
+        );
+        assert_eq!(read_bgra_pixel(state, image), before);
     }
 
     #[test]

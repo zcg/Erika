@@ -8,7 +8,7 @@ P010 remains 10-bit. No `av_hwframe_transfer_data` or CPU plane upload is used.
 This is **GPU copy**, not direct zero-copy. Dozen 26.0.8 is non-conformant and
 uses software WSI on Linux (`dzn_wsi.c` sets `sw_device = true`). Window
 presentation can therefore still read back the rendered output. WSLg/RDP and
-compositor copies are outside Erika's decoded-frame counters. Neither strict
+compositor copies are outside liberika's decoded-frame counters. Neither strict
 end-to-end zero-copy nor physical HDR output is established by this path.
 
 ## Reproduce on Ubuntu 26.04 / WSLg x86_64

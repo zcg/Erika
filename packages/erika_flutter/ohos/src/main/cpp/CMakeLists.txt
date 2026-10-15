@@ -60,7 +60,7 @@ if(NOT "$ENV{ERIKA_FORCE_SOURCE_BUILD}" STREQUAL "1")
     "${ERIKA_PREBUILT_DIR}/erika-capi-openharmony-arm64/lib/liberika_capi.so"
   )
   set(ERIKA_PREBUILT_URL
-    "https://github.com/AimesSoft/Erika/releases/download/${ERIKA_PREBUILT_TAG}/erika-capi-openharmony-arm64.zip"
+    "https://github.com/AimesSoft/liberika/releases/download/${ERIKA_PREBUILT_TAG}/erika-capi-openharmony-arm64.zip"
   )
 
   if(EXISTS "${ERIKA_PREBUILT_ZIP}")

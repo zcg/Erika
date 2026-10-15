@@ -1,6 +1,6 @@
 # Linux native integration (experimental)
 
-Linux supports the Rust player, C ABI, and Flutter through system FFmpeg 8.x, Erika's patched libass, wgpu, and PulseAudio. PipeWire desktops need `pipewire-pulse`; WSL2 uses WSLg display and audio services.
+Linux supports the Rust player, C ABI, and Flutter through system FFmpeg 8.x, liberika's patched libass, wgpu, and PulseAudio. PipeWire desktops need `pipewire-pulse`; WSL2 uses WSLg display and audio services.
 
 Video can render into X11 / Wayland windows. Flutter offers an RGBA SDR texture or a native Wayland video layer. NVIDIA uses NVDEC, Intel/AMD use VA-API, and FFmpeg software decoding is also available. Linux currently builds from source.
 
@@ -61,7 +61,7 @@ one CPU frame is retained so a paused image survives detach/reattach. NVDEC/VA-A
 frames on the WSL OpenGL path are downloaded using FFmpeg and uploaded to wgpu.
 This is hardware decode with a CPU transfer; statistics report these separately.
 
-Erika retains WSL's D3D runtime until process exit to keep its thread-local
+liberika retains WSL's D3D runtime until process exit to keep its thread-local
 cleanup callbacks valid after EGL teardown. Audio uses the callback consumption
 clock, consistent with the other ring-based outputs. WSLg/RDP device latency is
 reported separately for draining/rate transitions; subtracting it from this
@@ -154,7 +154,7 @@ Vulkan device. A local format-properties experiment reached CUDA external memory
 import, which returned `CUDA_ERROR_NOT_SUPPORTED`. WSLg also did not expose HDR
 color-management/WSI capabilities. This is a specific interop/display limitation;
 hardware OpenGL and Vulkan rendering both work. The experimental Mesa build is
-not a required dependency and is not installed by Erika's launcher. The optional
+not a required dependency and is not installed by liberika's launcher. The optional
 WSL GPU-copy bridge uses Mesa D3D12 VA-API instead of CUDA external-memory import;
 see its [build steps, performance results and presentation limits](wsl-gpu-copy.md).
 
@@ -174,7 +174,7 @@ an independent DPI factor. Resolve `.so` dependencies using rpath or
 
 Linux uses system FFmpeg shared libraries and a static, PIC, **patched libass
 0.17.5**, with system font libraries. The script verifies the upstream archive
-SHA256 and applies Erika's ordered memory-font fallback patch. Stock libass
+SHA256 and applies liberika's ordered memory-font fallback patch. Stock libass
 does not preserve that behavior. `ERIKA_LIBASS_DIR` can point to an equivalent
 patched prefix. `ERIKA_FFMPEG_DIR` selects an existing static FFmpeg bundle;
 `ERIKA_USE_SYSTEM_LIBS=0` preserves the original bundle lookup path but requires

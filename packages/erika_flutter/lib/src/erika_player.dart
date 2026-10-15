@@ -111,10 +111,10 @@ class ErikaMediaMetadata {
   };
 }
 
-/// Subtitle text colour Erika falls back to, as `0xRRGGBBAA`: opaque white.
+/// Subtitle text colour liberika falls back to, as `0xRRGGBBAA`: opaque white.
 const int kErikaDefaultSubtitlePrimaryColorRgba = 0xFFFFFFFF;
 
-/// Subtitle outline colour Erika falls back to: half-transparent black.
+/// Subtitle outline colour liberika falls back to: half-transparent black.
 const int kErikaDefaultSubtitleOutlineColorRgba = 0x0000007F;
 
 /// Base subtitle font size in ASS script units, before [ErikaPlayer.setSubtitleScale].
@@ -167,7 +167,7 @@ enum ErikaVideoAlphaMode {
   opaque(0),
 
   /// The left half is colour and the right half is a grayscale alpha mask.
-  /// Erika presents the video at half of its encoded width and reconstructs a
+  /// liberika presents the video at half of its encoded width and reconstructs a
   /// premultiplied-alpha frame in the GPU presentation shader.
   packedAlphaRight(1);
 
@@ -330,7 +330,7 @@ class ErikaPresenterResourceStatus {
   });
 
   /// Metal's process-wide counter for the current device. This can include
-  /// allocations from other Erika presenters and other Metal users.
+  /// allocations from other liberika presenters and other Metal users.
   final int deviceCurrentAllocatedBytes;
   final int deviceRecommendedWorkingSetBytes;
   final int drawableEstimatedBytes;
@@ -1331,12 +1331,12 @@ class ErikaPlayer {
     });
   }
 
-  /// Exports an animated GIF through Erika's independent headless pipeline.
+  /// Exports an animated GIF through liberika's independent headless pipeline.
   /// Playback can continue while this operation runs.
   ///
-  /// Supported on every native platform published by Erika: Android, iOS,
+  /// Supported on every native platform published by liberika: Android, iOS,
   /// tvOS, macOS, Windows, and OpenHarmony. Web is not supported because it
-  /// cannot load Erika's native C API or write an arbitrary output path.
+  /// cannot load liberika's native C API or write an arbitrary output path.
   static Future<ErikaGifExportResult> exportGif(
     ErikaGifExportOptions options,
   ) async {
@@ -1511,7 +1511,7 @@ class ErikaPlayer {
 
   Future<void> setDanmakuConfig({
     bool? enabled,
-    // NipaPlay/Flutter logical danmaku font size. Erika uses the NipaPlay
+    // NipaPlay/Flutter logical danmaku font size. liberika uses the NipaPlay
     // default danmaku font and applies the native surface scale internally.
     double? fontSize,
     double? opacity,

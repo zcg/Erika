@@ -1,8 +1,8 @@
 [English](readme/README.en.md) | [日本語](readme/README.ja.md)
 
-# Erika
+# liberika
 
-> 「GOOD！我是Erika，是NipaPlay里继mdk、video player、libmpv、media kit之后的第五个播放器内核。」
+> 「GOOD！我是liberika，是NipaPlay里继mdk、video player、libmpv、media kit之后的第五个播放器内核。」
 > 「即便算上你，也只有四个播放器内核！」
 
 **NipaPlay 的自研播放内核。** Rust 实现，可嵌入，从解码到渲染一手包办。
@@ -11,7 +11,7 @@
 > 而 [NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) 来自《寒蝉鸣泣之时》古手梨花的口癖「にぱー☆」——社区里大家都叫她「梨花」。
 > 一个是台前的播放器，一个是幕后的引擎。同出一脉，互为表里。
 
-宿主应用只需提供一个渲染表面并发送播放命令——解码、时序同步、音视频渲染、字幕、弹幕、音频输出均由 Erika 内部完成。原生视频层直接呈现；Flutter 纹理可交给宿主合成。
+宿主应用只需提供一个渲染表面并发送播放命令——解码、时序同步、音视频渲染、字幕、弹幕、音频输出均由 liberika 内部完成。原生视频层直接呈现；Flutter 纹理可交给宿主合成。
 
 当前版本：**0.2.1**。从 [文档目录](docs/README.md) 选择接入、构建或内核设计说明。
 
@@ -28,14 +28,14 @@
 | 宿主 | 安装或入口 | 指南 |
 |---|---|---|
 | Flutter | `flutter pub add erika_flutter`，当前 0.2.1 | [插件使用指南](packages/erika_flutter/README.zh.md) |
-| Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/ErikaSwift`，从 0.2.1 开始 | [ErikaSwift](https://github.com/AimesSoft/ErikaSwift) |
+| Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/liberika-swift`，从 0.2.1 开始 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](packages/erika_ohos/README.md) |
 | C / C++ | 下载匹配版本的 C ABI 归档与 `erika.h` | [原生接入](docs/integration.zh.md) |
 | Rust | Git 依赖，固定 `tag = "v0.2.1"` | [构建与依赖](docs/building.zh.md) |
-| Linux | 系统 FFmpeg 8 + Erika 补丁 libass，从源码构建 | [Linux 接入](docs/linux.zh.md) |
+| Linux | 系统 FFmpeg 8 + liberika 补丁 libass，从源码构建 | [Linux 接入](docs/linux.zh.md) |
 
 截至 2026-10-02，OHPM 公开版为 0.1.9，0.2.1 已提交审核。原生二进制从
-[GitHub Releases](https://github.com/AimesSoft/Erika/releases/tag/v0.2.1) 下载。
+[GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.2.1) 下载。
 
 ### Flutter
 
@@ -57,7 +57,7 @@ Apple EDR、Windows HDR10 等直接呈现。平台差异和生命周期在插件
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/Erika", tag = "v0.2.1" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.2.1" }
 ```
 
 ```rust

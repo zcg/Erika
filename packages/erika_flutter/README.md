@@ -1,6 +1,6 @@
 # erika_flutter
 
-Flutter plugin for the Erika media playback engine.
+Flutter plugin for the liberika media playback engine.
 
 The plugin keeps Dart out of the hot path:
 
@@ -8,16 +8,16 @@ The plugin keeps Dart out of the hot path:
 - The native plugins offer window overlays, platform views, and Flutter textures
   through `ErikaWindowOverlayVideoView`, `ErikaVideoView`, and
   `ErikaTextureVideoView`. Platform behavior is described below.
-- The macOS plugin loads the Erika dynamic library.
-- The iOS plugin links the Erika static library.
-- The tvOS plugin links the Erika static library and hosts its Metal layer in an
+- The macOS plugin loads the liberika dynamic library.
+- The iOS plugin links the liberika static library.
+- The tvOS plugin links the liberika static library and hosts its Metal layer in an
   Apple TV platform view.
-- The Windows plugin builds and links the Erika C ABI DLL.
+- The Windows plugin builds and links the liberika C ABI DLL.
 - The Android plugin builds `liberika_capi.so` per ABI and drives its native
   surface from `Choreographer`.
 - The HarmonyOS plugin registers a Flutter external texture, attaches its
-  `OHNativeWindow` to Erika, and uses OHAudio for low-latency PCM output.
-- Erika owns playback, rendering, audio, timing, and overlays through
+  `OHNativeWindow` to liberika, and uses OHAudio for low-latency PCM output.
+- liberika owns playback, rendering, audio, timing, and overlays through
   `ErikaPresenterHandle`.
 
 ## Video Surfaces
@@ -46,13 +46,13 @@ small embedder, compatibility path, or diagnostics.
 On Android the SDR video surface is a native `TextureView`. An
 `ErikaOutputMode.extendedLinear` player instead creates a `SurfaceView` through
 `PlatformViewLink`/Hybrid Composition, because scRGB must bypass Flutter's
-texture-layer composition. The plugin forwards the borrowed `Surface` to Erika
+texture-layer composition. The plugin forwards the borrowed `Surface` to liberika
 and handles creation, resize, destruction, audio focus, HDR eligibility, and
 vsync ticks.
 
 ## Linux Setup
 
-Build the Linux C ABI library as described in [Linux setup](https://github.com/AimesSoft/Erika/blob/main/docs/linux.md),
+Build the Linux C ABI library as described in [Linux setup](https://github.com/AimesSoft/liberika/blob/main/docs/linux.md),
 then set `ERIKA_LIBRARY_DIR` to the directory containing `liberika_capi.so` before
 running `flutter build linux`. The plugin bundles that library and uses a GTK
 Flutter texture. Use `ErikaTextureVideoView` (also selected by `ErikaVideoView`
@@ -89,11 +89,11 @@ The plugin downloads its version-pinned native runtime by default on macOS,
 Windows, iOS, tvOS, Android, and OpenHarmony. Every archive is pinned by SHA-256;
 a missing or invalid archive fails with an explicit error instead of silently
 requiring a Rust, FFmpeg, or NDK toolchain. See the
-[release guide](https://github.com/AimesSoft/Erika/blob/main/docs/releasing.md).
+[release guide](https://github.com/AimesSoft/liberika/blob/main/docs/releasing.md).
 Android downloads one approximately 20–22 MB runtime archive per requested ABI;
 it does not fetch the four-ABI C API bundle or its static libraries.
 
-When debugging local Erika changes from an Erika checkout, set
+When debugging local liberika changes from a liberika checkout, set
 `ERIKA_FORCE_SOURCE_BUILD=1`. A custom `ERIKA_PREBUILT_TAG` must be accompanied
 by the matching `ERIKA_PREBUILT_SHA256`. A custom multi-ABI Android build uses
 the per-ABI variables `ERIKA_PREBUILT_SHA256_ARM64_V8A`,
@@ -105,7 +105,7 @@ Windows with `ERIKA_WINDOWS_ARCH=x64|arm64`, and Android with
 `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86`. For direct native builds,
 `xtask --target`, `ERIKA_NATIVE_TARGET`, and `cargo build --target` must name the
 same target. See the
-[build guide](https://github.com/AimesSoft/Erika/blob/main/docs/building.md).
+[build guide](https://github.com/AimesSoft/liberika/blob/main/docs/building.md).
 
 ## iOS Setup
 
@@ -139,7 +139,7 @@ await player.play();
 ## System Media Navigation
 
 Playlist apps can enable the system previous and next buttons for the active
-item. Erika emits a `systemMediaNavigationRequested` event instead of choosing
+item. liberika emits a `systemMediaNavigationRequested` event instead of choosing
 the next media item itself, so Dart remains the source of truth for the
 playlist. Update the capabilities whenever the active item changes.
 
@@ -229,7 +229,7 @@ with `-Z build-std=std,panic_abort`.
 
 ## Windows Setup
 
-The Windows plugin (`ErikaFlutterPluginCApi`) downloads the verified Erika C ABI
+The Windows plugin (`ErikaFlutterPluginCApi`) downloads the verified liberika C ABI
 runtime (`erika_capi.dll`) during the CMake build,
 automatically following the CMake generator's x64 or ARM64 architecture and
 staging the DLL next to the app. A consuming project can explicitly select the
@@ -245,7 +245,7 @@ Windows SDK. An explicit source build additionally requires:
   (via the repo `xtask deps build` flow)
 
 Set `ERIKA_REPO_ROOT` together with `ERIKA_FORCE_SOURCE_BUILD=1` when developing
-against an Erika checkout.
+against a liberika checkout.
 
 The Windows plugin publishes title, artist, album, artwork, playback state, and
 timeline through System Media Transport Controls (SMTC), and handles system
@@ -261,7 +261,7 @@ x86_64 are selected; override
 this with `-PerikaAndroidAbis=arm64-v8a,x86_64` or `ERIKA_ANDROID_ABIS`.
 
 Android `content://` media and subtitle URIs are opened through
-`ContentResolver`, detached, and passed to Erika as owned `fd://` sources with
+`ContentResolver`, detached, and passed to liberika as owned `fd://` sources with
 their provider offset and length.
 
 Android uses MediaSession and a media notification for lock-screen, Bluetooth,
@@ -277,7 +277,7 @@ Android's minimum remains API 26. Extended-linear output additionally needs the
 native-window dataspace API (API 28+); API 26/27 continue in SDR and report the
 specific fallback. On API 34+, the plugin observes
 `Display.registerHdrSdrRatioChangedListener` and publishes real ratio changes
-to Erika, allowing wgpu to update subsequent frame targets and output status
+to liberika, allowing wgpu to update subsequent frame targets and output status
 without reattaching the surface. On API 35 it also applies per-`SurfaceView`
 desired HDR headroom without changing the host window globally.
 
@@ -389,7 +389,7 @@ final player = ErikaPlayer(
 ```
 
 `edrHeadroom` is a content-headroom ceiling. If it is omitted for an
-extended-linear player, Erika uses a 4x content ceiling while the
+extended-linear player, liberika uses a 4x content ceiling while the
 `SurfaceView` receives desired headroom `0` (system auto). An explicit value is
 also applied as the per-`SurfaceView` desired headroom on API 35. The current
 display HDR/SDR ratio, when available, further bounds the effective wgpu target.

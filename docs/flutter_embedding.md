@@ -2,7 +2,7 @@
 
 [中文](flutter_embedding.zh.md) | [English](flutter_embedding.md) | [日本語](flutter_embedding.ja.md)
 
-Erika is not a Flutter video renderer. Flutter is an optional host UI.
+liberika is not a Flutter video renderer. Flutter is an optional host UI.
 The player owns decode, timing, native rendering, subtitles, danmaku, audio, and
 HDR presentation.
 
@@ -12,7 +12,7 @@ There are two C ABI entrypoint families:
 
 - `ErikaHandle`: control and event API. Use this when the host owns its own
   presenter loop or only wants to probe/control playback.
-- `ErikaPresenterHandle`: presenter-owned API. Use this when Erika should
+- `ErikaPresenterHandle`: presenter-owned API. Use this when liberika should
   own `Player + renderer + audio output` and the host only supplies a
   native surface plus a display-tick callback.
 
@@ -51,7 +51,7 @@ overlay that sits outside Flutter's platform-view compositor:
 5. Attach retry with exponential backoff handles window readiness timing.
 
 The overlay path is the recommended path for NipaPlay and other full-player
-UIs. It keeps video presentation owned by Erika/Metal while Flutter remains a
+UIs. It keeps video presentation owned by liberika/Metal while Flutter remains a
 control and layout layer. On iOS/tvOS the native side uses a window plus a
 sibling `UIView`/`CAMetalLayer`; on macOS it uses the host `NSWindow` plus a
 sibling `NSView`/`CAMetalLayer`.
@@ -131,7 +131,7 @@ device-side run verification.
 
 ## Transparent Video and Blend Modes
 
-Erika can present alpha-bearing video assets while keeping Flutter layout and
+liberika can present alpha-bearing video assets while keeping Flutter layout and
 composition. Transparency is requested per player:
 
 ```dart
@@ -177,14 +177,14 @@ rebound automatically if the decoder or output device rebuilds the swap chain.
 
 ## iOS Build Path
 
-The iOS plugin links the Erika C ABI static library into the app through a
+The iOS plugin links the liberika C ABI static library into the app through a
 CocoaPod script phase. By default it downloads the matching prebuilt archive;
 set `ERIKA_FORCE_SOURCE_BUILD=1` (with `ERIKA_REPO_ROOT`) to build the Rust
 `erika_capi` crate for the target iOS architecture instead.
 
 ## tvOS Build Path
 
-The tvOS plugin links the Erika C ABI static library through its CocoaPod script
+The tvOS plugin links the liberika C ABI static library through its CocoaPod script
 phase. Like iOS it downloads the prebuilt archive by default, with
 `ERIKA_FORCE_SOURCE_BUILD=1` falling back to building from source. It supports
 tvOS 13+, arm64 devices, and arm64/x86_64 simulators. See
@@ -262,7 +262,7 @@ provides `codec`, `width`, `height`, `pixelFormat`, `profile`, `level`, `bitRate
 `frameRateNumerator`, and `frameRateDenominator`; audio tracks additionally provide
 `sampleRate`, `channels`, and `sampleFormat`.
 
-- `bitRate` is in bit/s. Erika prefers the video track's own codec parameters; only when there is
+- `bitRate` is in bit/s. liberika prefers the video track's own codec parameters; only when there is
   exactly one video track with no declared bitrate and the container bitrate plus every other
   media track's bitrate (audio, subtitle, other video) are known does it estimate video bitrate as
   container bitrate minus those. It is `null` when
@@ -290,7 +290,7 @@ player.events.listen((event) {
 
 ## Native Debug HUD
 
-`setDebugHudEnabled(true)` makes Erika draw a diagnostic HUD in the native video composition. It
+`setDebugHudEnabled(true)` makes liberika draw a diagnostic HUD in the native video composition. It
 does not render through Dart or alter the Flutter widget hierarchy. It is off by
 default and intended for development, performance analysis, and on-device diagnosis.
 
@@ -326,7 +326,7 @@ compute and GLES reports an explicit `inactive` fallback. See
 
 ## Ownership Rule
 
-Flutter owns layout and controls. Erika owns the video plane, subtitle plane,
+Flutter owns layout and controls. liberika owns the video plane, subtitle plane,
 danmaku plane, audio, and timing. The plugin bridges commands and events through
 a `MethodChannel`; rendering never passes through Dart.
 

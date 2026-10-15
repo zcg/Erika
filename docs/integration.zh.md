@@ -1,10 +1,10 @@
-# 在原生宿主中接入 Erika
+# 在原生宿主中接入 liberika
 
-本指南讲解如何把 Erika 嵌入非 Flutter 宿主——C/C++/Swift 应用、Win32 窗口，或任何
-带 C FFI 的运行时。它使用 **presenter（推送）模型**:Erika 负责解码、时序、音频、
+本指南讲解如何把 liberika 嵌入非 Flutter 宿主——C/C++/Swift 应用、Win32 窗口，或任何
+带 C FFI 的运行时。它使用 **presenter（推送）模型**:liberika 负责解码、时序、音频、
 overlay 和呈现,宿主提供一个 surface 并每帧调一次 `render_tick`。
 
-前置:C ABI（[capi_reference.zh.md](capi_reference.zh.md)）和一个已构建好的 Erika 库
+前置:C ABI（[capi_reference.zh.md](capi_reference.zh.md)）和一个已构建好的 liberika 库
 （[building.zh.md](building.zh.md)）。Flutter 请改用
 [`erika_flutter`](../packages/erika_flutter) 插件,见
 [flutter_embedding.zh.md](flutter_embedding.zh.md)。
@@ -20,7 +20,7 @@ overlay 和呈现,宿主提供一个 surface 并每帧调一次 `render_tick`。
 ## 1. 选择 handle 族
 
 除非你有理由自己渲染,否则用 `ErikaPresenterHandle`。拉取模型的 `ErikaHandle` 适合
-拥有自己合成器、只想要 Erika 解码/时序/状态的宿主。本指南其余部分都基于 presenter。
+拥有自己合成器、只想要 liberika 解码/时序/状态的宿主。本指南其余部分都基于 presenter。
 
 presenter 族在 **macOS、iOS、tvOS、Windows、Android、OpenHarmony 与实验性 Linux** 上编译。
 
@@ -59,12 +59,12 @@ luma sampling，并明确报告 `Inactive` 状态和回退原因。
 
 ## 4. Attach 一个 surface
 
-Erika 直接渲染进你拥有的平台 surface。宽高单位是**物理像素**,`scale` 是 DPI/backing
+liberika 直接渲染进你拥有的平台 surface。宽高单位是**物理像素**,`scale` 是 DPI/backing
 因子。
 
 ### macOS / iOS / tvOS —— `CAMetalLayer`
 
-创建一个 `CAMetalLayer`,设好尺寸,再把它的指针交给 Erika:
+创建一个 `CAMetalLayer`,设好尺寸,再把它的指针交给 liberika:
 
 ```c
 // `layer` 是 CAMetalLayer*（如来自你的 NSView/UIView 宿主 layer）
@@ -165,7 +165,7 @@ erika_presenter_open_with_options(p, "https://example.com/video.mp4", &options);
 `ERIKA_HTTP_READAHEAD_BYTES` 可设置默认预读窗口。预算按字节计算，回退时间取决于码率。
 
 HTTP(S) 源可以忽略 Range、返回包含完整文件的 `200`，也可以不提供 Content-Length。
-Erika 会丢弃请求偏移之前的字节，只缓存所需数据；完整响应到达 EOF 后可以得到文件长度。
+liberika 会丢弃请求偏移之前的字节，只缓存所需数据；完整响应到达 EOF 后可以得到文件长度。
 这类源在跳转或重连时需要重新下载前缀，因此支持 `206` 的服务器读取大文件更快。
 重试期间若资源校验标识缺失或发生变化，会拒绝该响应，
 避免拼接不同版本的文件。弱 ETag 不影响首次读取，但不能用于恢复未完成的响应。
@@ -174,7 +174,7 @@ Erika 会丢弃请求偏移之前的字节，只缓存所需数据；完整响�
 
 从 surface 的显示定时器驱动 `render_tick`——`CADisplayLink`（iOS/tvOS）/ `CVDisplayLink`
 或 `CADisplayLink`（macOS）/ Windows 的帧调度器 / Android `Choreographer`。传该帧的
-**呈现时间(秒)**,取自单调宿主时钟;Erika 用它做 vsync 量化调度,所以传绝对时间戳,
+**呈现时间(秒)**,取自单调宿主时钟;liberika 用它做 vsync 量化调度,所以传绝对时间戳,
 不是增量。
 
 ```c
@@ -255,7 +255,7 @@ erika_presenter_detach_surface(p);   // 先停止往 surface 绘制
 erika_presenter_destroy(p);          // 停止播放,释放一切
 ```
 
-在拆掉窗口/layer 之前先 detach,让 Erika 停止触碰 surface。`destroy` 对 `NULL` handle
+在拆掉窗口/layer 之前先 detach,让 liberika 停止触碰 surface。`destroy` 对 `NULL` handle
 安全。
 
 ## 10. 线程模型
@@ -271,7 +271,7 @@ handle **没有内部同步**。最简单的正确设计:在一个线程上拥�
 
 include `erika.h`,链接库(见 [building.zh.md](building.zh.md)),就这么简单——ABI 是
 纯 C。C++ 里把 handle 包进一个在析构时调 `erika_presenter_destroy` 的 RAII 类型,并
-用配套的 Erika 释放函数释放返回的字符串 / `ErikaTrackInfo`,绝不用 `delete`。
+用配套的 liberika 释放函数释放返回的字符串 / `ErikaTrackInfo`,绝不用 `delete`。
 
 ### Swift
 

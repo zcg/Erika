@@ -655,7 +655,7 @@ impl PlatformSurface {
     }
 }
 
-/// Exact native drawable/swapchain extent. Surface width and height in Erika's
+/// Exact native drawable/swapchain extent. Surface width and height in liberika's
 /// public API are physical pixels and are never derived from the content scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfacePhysicalExtent {
@@ -1107,7 +1107,7 @@ pub struct RendererRuntimeStats {
 }
 
 /// Snapshot of memory visible from the renderer. Individual fields describe
-/// resources tracked by Erika; `device_current_allocated_bytes` is Metal's
+/// resources tracked by liberika; `device_current_allocated_bytes` is Metal's
 /// process-wide device counter and can therefore include driver allocations
 /// that do not belong to a single presenter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2403,6 +2403,7 @@ fn run_playback_worker(
             &inner,
             playback_generation,
             "before_video_tick",
+            last_executed_playback_command_sequence,
             &mut last_worker_clock,
         );
         let after_clock_sync = std::time::Instant::now();
@@ -2460,6 +2461,7 @@ fn run_playback_worker(
             &inner,
             playback_generation,
             "after_video_tick",
+            last_executed_playback_command_sequence,
             &mut last_worker_clock,
         );
         let after_video = std::time::Instant::now();
@@ -2513,6 +2515,7 @@ fn run_playback_worker(
             &inner,
             playback_generation,
             "after_av_tick",
+            last_executed_playback_command_sequence,
             &mut last_worker_clock,
         );
         let after_av = std::time::Instant::now();
@@ -3608,6 +3611,7 @@ fn sync_playback_clock_from_worker(
     inner: &Arc<Mutex<PlayerInner>>,
     playback_generation: u64,
     stage: &'static str,
+    last_executed_sequence: u64,
     last_worker_clock: &mut Option<(Duration, u64)>,
 ) {
     let clock = engine.clock();
@@ -3624,6 +3628,24 @@ fn sync_playback_clock_from_worker(
             trace::duration_label(Some(shared_before)),
             generation,
             shared_generation,
+        ));
+        return;
+    }
+    if inner.state == PlayerState::Paused
+        && inner.playback_command_sequence > last_executed_sequence
+    {
+        // A pause intent bumped the command sequence and parked the shared
+        // clock, but the worker has not executed the Pause command yet: the
+        // engine clock is still running, and publishing it would overwrite
+        // the parked clock and show a Paused player whose position advances
+        // until the worker catches up. Seek and stop intents bump the
+        // generation too, so this sequence check only gates pause.
+        trace::log(format!(
+            "[erika-clock-trace] stage=worker_sync:{stage} action=skip_pause_intent media={} shared_before={} worker_seq={} shared_seq={}",
+            trace::duration_label(Some(media_time)),
+            trace::duration_label(Some(shared_before)),
+            last_executed_sequence,
+            inner.playback_command_sequence,
         ));
         return;
     }
@@ -4093,6 +4115,107 @@ mod tests {
             Some(PlayerState::Playing),
         ));
         (sequence, generation)
+    }
+
+    #[test]
+    fn worker_sync_respects_a_pause_intent_the_worker_has_not_executed() {
+        let player = Player::new(PlayerConfig::default());
+        let worker_generation = 3;
+        let commands = install_fake_playback(
+            &player,
+            PlayerState::Playing,
+            Duration::ZERO,
+            worker_generation,
+            false,
+        );
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/playback/playback-fixture.mkv");
+        let mut engine = VideoPlaybackEngine::open(
+            &MediaRequest::new(path.to_string_lossy().as_ref()),
+            PlaybackSessionConfig::default(),
+        )
+        .unwrap();
+        engine
+            .seek_with_playback_intent(Duration::from_millis(5_125), false)
+            .unwrap();
+        engine.play().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if engine.tick().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the asynchronous seek preview"
+            );
+            std::thread::yield_now();
+        }
+        let engine_clock = engine.clock();
+        assert!(
+            engine_clock.is_running(),
+            "precondition: worker clock is running"
+        );
+
+        player.pause().expect("queue pause command");
+        let pause_sequence = match commands
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pause command")
+        {
+            PlaybackCommand::Pause { sequence, .. } => sequence,
+            other => panic!("expected pause command"),
+        };
+        let parked_clock = player.inner.lock().unwrap().playback_clock.clone();
+        assert!(!parked_clock.is_running());
+        // The intent bumped the command sequence past everything the worker
+        // has executed, parked the shared clock, and published Paused.
+        assert_eq!(pause_sequence, 1);
+        assert_eq!(player.state(), PlayerState::Paused);
+        assert_ne!(
+            engine_clock,
+            player.inner.lock().unwrap().playback_clock,
+            "precondition: the engine clock must differ from the intent-parked clock"
+        );
+
+        // The worker has executed nothing when it syncs: the pause intent
+        // owns the shared clock, and publishing the still-running engine
+        // clock would show a Paused player whose position advances.
+        let mut last_worker_clock = None;
+        sync_playback_clock_from_worker(
+            &engine,
+            &player.inner,
+            worker_generation,
+            "test",
+            0,
+            &mut last_worker_clock,
+        );
+        assert_ne!(
+            player.inner.lock().unwrap().playback_clock,
+            engine_clock,
+            "a pending pause intent must not be overwritten by the worker clock"
+        );
+
+        assert_eq!(player.inner.lock().unwrap().playback_clock, parked_clock);
+        assert!(last_worker_clock.is_none());
+
+        // Executing the pause command releases the sync: the engine clock is
+        // authoritative again.
+        engine.pause();
+        let engine_clock = engine.clock();
+        assert!(!engine_clock.is_running());
+        sync_playback_clock_from_worker(
+            &engine,
+            &player.inner,
+            worker_generation,
+            "test",
+            pause_sequence,
+            &mut last_worker_clock,
+        );
+        assert_eq!(
+            player.inner.lock().unwrap().playback_clock,
+            engine_clock,
+            "after the pause command executes, the worker clock publishes again"
+        );
     }
 
     fn install_fake_playback(

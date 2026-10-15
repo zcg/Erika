@@ -2,14 +2,14 @@
 #define ERIKA_H
 
 /*
- * Erika media playback engine — C ABI.
+ * liberika media playback engine — C ABI.
  *
  * Full reference: docs/capi_reference.md. Embedding walkthrough:
  * docs/integration.md.
  *
  * Two independent entry points; pick one per integration:
  *   - ErikaHandle:          pull model. The host renders and pulls state.
- *   - ErikaPresenterHandle: push model. Erika owns decode/timing/audio/render;
+ *   - ErikaPresenterHandle: push model. liberika owns decode/timing/audio/render;
  *                           the host gives it a surface and calls render_tick.
  *                           Compiled on macOS / iOS / Windows / Android /
  *                           OpenHarmony / Linux; on other targets
@@ -21,7 +21,7 @@
  *   - On a non-Ok/NoEvent result a human-readable message is stored in a
  *     THREAD-LOCAL slot; read it on the same thread via
  *     erika_last_error_message() and free with erika_string_free().
- *   - Any char* Erika returns is caller-owned: free standalone strings with
+ *   - Any char* liberika returns is caller-owned: free standalone strings with
  *     erika_string_free(); free strings inside ErikaTrackInfo /
  *     ErikaDanmakuTrackInfo with the matching *_info_free() function.
  *   - const char* arguments are borrowed for the call only and must be
@@ -344,7 +344,7 @@ typedef struct ErikaSubtitleMemoryFontInfo {
 
 typedef struct ErikaDanmakuConfig {
   bool enabled;
-  /* NipaPlay/Flutter logical danmaku font size. Erika uses the NipaPlay
+  /* NipaPlay/Flutter logical danmaku font size. liberika uses the NipaPlay
    * default danmaku font and multiplies by the surface scale for glyph pixels. */
   float font_size;
   float opacity;
@@ -846,7 +846,7 @@ ErikaStatus erika_presenter_get_stats(
 ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *handle, ErikaEvent *out_event);
 
 /* JSON bridge used by embedders whose platform channel already serializes
- * structured arguments. Returned strings are owned by Erika and must be
+ * structured arguments. Returned strings are owned by liberika and must be
  * released with erika_string_free. poll_event_json returns NULL when idle. */
 char *erika_presenter_invoke_json(
     ErikaPresenterHandle *handle,

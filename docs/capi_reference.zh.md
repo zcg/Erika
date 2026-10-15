@@ -1,4 +1,4 @@
-# Erika C ABI 参考手册
+# liberika C ABI 参考手册
 
 本文档描述 `erika_capi` 导出的稳定 C ABI，声明在
 [`crates/erika_capi/include/erika.h`](../crates/erika_capi/include/erika.h)。该
@@ -12,12 +12,12 @@ ABI 是所有非 Rust 宿主（C、C++、Swift、Dart FFI、Win32……）的唯
 
 ## 两个 handle 族
 
-Erika 暴露两个相互独立的入口，每个集成选其一。
+liberika 暴露两个相互独立的入口，每个集成选其一。
 
 | Handle | 模型 | 谁渲染 | 适用 |
 |--------|------|--------|------|
 | `ErikaHandle` | **拉取（Pull）** | 宿主 | 你拥有渲染循环、自己拉取解码帧 / 驱动自己的合成器。 |
-| `ErikaPresenterHandle` | **推送（Push）** | Erika | 你把一个原生 surface 交给 Erika，每个显示帧调一次 `render_tick`。Erika 负责解码、时序、音频、overlay 和呈现。 |
+| `ErikaPresenterHandle` | **推送（Push）** | liberika | 你把一个原生 surface 交给 liberika，每个显示帧调一次 `render_tick`。liberika 负责解码、时序、音频、overlay 和呈现。 |
 
 `ErikaPresenterHandle` 是推荐路径，也是 Flutter 插件和原生 demo 所用的。它在
 **macOS、iOS、tvOS、Windows、Android、Linux、HarmonyOS** 上编译。surface attach 按平台不同：
@@ -97,7 +97,7 @@ ABI 永不让 unwind 穿越 FFI 边界。每个入口都把函数体包在 `catc
 
 ### 错误信息（线程局部）
 
-任何非 `Ok`/`NoEvent` 的结果，Erika 会把一条可读信息存进**线程局部**槽。读取：
+任何非 `Ok`/`NoEvent` 的结果，liberika 会把一条可读信息存进**线程局部**槽。读取：
 
 ```c
 char *msg = erika_last_error_message();   // 堆分配，可能为 NULL
@@ -110,7 +110,7 @@ if (msg) { fprintf(stderr, "erika: %s\n", msg); erika_string_free(msg); }
 
 ### 字符串所有权
 
-Erika 返回的任何 `char*` 都是堆分配、归调用方所有：
+liberika 返回的任何 `char*` 都是堆分配、归调用方所有：
 
 - 独立字符串（如 `erika_last_error_message`）→ 用 `erika_string_free` 释放。
 - 内嵌在 `ErikaTrackInfo` 中的字符串 → 用 `erika_track_info_free(&track)`
@@ -118,10 +118,10 @@ Erika 返回的任何 `char*` 都是堆分配、归调用方所有：
 - 内嵌在 `ErikaDanmakuTrackInfo` 中的字符串 → 用
   `erika_danmaku_track_info_free(&track)` 释放。
 
-切勿用 libc `free()` 释放这些；始终用配套的 Erika 释放函数，使分配在同一 allocator
+切勿用 libc `free()` 释放这些；始终用配套的 liberika 释放函数，使分配在同一 allocator
 上跨越 ABI。
 
-你传入的 `const char*` 参数仅在调用期间被借用；Erika 会复制所需内容。它们必须是
+你传入的 `const char*` 参数仅在调用期间被借用；liberika 会复制所需内容。它们必须是
 NUL 结尾的 UTF-8。
 
 ### 计数数组惯用法
@@ -189,7 +189,7 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 `uri` 是本地文件路径或 HTTP(S) URL。`erika_open_with_headers` 用于为 HTTP(S) 播放
 设置请求头；`headers` 只在调用期间读取，调用返回后即可释放。`header_count` 大于零时
 `headers` 不能为 NULL。请求头会用于 HEAD、Range GET 和预取请求。
-认证信息和 Cookie 不会写入 Erika 日志。`seek` 单位为微秒。
+认证信息和 Cookie 不会写入 liberika 日志。`seek` 单位为微秒。
 
 `erika_open_with_options` 是 `erika_open_with_headers` 的超集：通过 `ErikaOpenOptions`
 结构体把请求头数组与逐请求调参打包在一起。`options` 传 NULL 表示全部使用默认值。
@@ -275,7 +275,7 @@ Android extended-linear 输出。
 
 ## `ErikaPresenterHandle` —— 推送模型
 
-Erika 拥有完整栈；宿主提供 surface 并调用 `render_tick`。
+liberika 拥有完整栈；宿主提供 surface 并调用 `render_tick`。
 **macOS / iOS / tvOS / Windows / Android / HarmonyOS / Linux。**
 
 ### 生命周期与配置
@@ -382,7 +382,7 @@ override 覆盖 ASS 对白自带的样式。它是 `erika.h` 中 `ERIKA_SUBTITLE
 传 `0` 则全部保持回退语义，未知位会被丢弃。覆盖时字号仍与分辨率无关——`font_size`
 为 `48` 时，无论脚本声明何种 `PlayResY` 都落在同样的像素上。边距则不然：libass 让
 覆盖用的 margin 保持脚本自身的单位，因此在容器内的 ASS 轨上它随该脚本的 `PlayResY`
-缩放，而在纯文本字幕（Erika 按画面尺寸生成脚本）上就是像素。
+缩放，而在纯文本字幕（liberika 按画面尺寸生成脚本）上就是像素。
 
 `ErikaHttpHeader` 定义如下：
 
@@ -527,7 +527,7 @@ Android extended-linear 应把 Flutter Hybrid Composition `SurfaceView` 对应�
 后才设置 `extended_linear`，只有直接 `SurfaceView` 才设置
 `direct_composition = true`，并把宿主探测失败保留在 `fallback_reason`。
 `desired_headroom = 0` 表示系统 auto；正数是 surface 上限，可用于 API 35 per-`SurfaceView`
-`setDesiredHdrHeadroom`。Erika 仍会自行
+`setDesiredHdrHeadroom`。liberika 仍会自行
 验证 Vulkan、`Rgba16Float` 和 `ADATASPACE_SCRGB_LINEAR`；任何一项失败都会回退 SDR，
 且原因可查询。
 
@@ -557,9 +557,9 @@ ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(ErikaPresente
 
 仅限 Windows。当 presenter 通过
 `attach_wgpu_surface_with_output_capabilities`（`direct_composition = true`）attach，
-且以透明视频 alpha 模式或 overlay 混合播放时，Erika 会为目标 HWND 创建预乘 alpha 的
+且以透明视频 alpha 模式或 overlay 混合播放时，liberika 会为目标 HWND 创建预乘 alpha 的
 composition swap chain。此 getter 以 **AddRef 后的 `IUnknown*`** 返回它：调用者拥有返回的
-COM 引用，必须自行 `Release`。解码器/设备丢失后应重新获取——Erika 会重建 swap chain
+COM 引用，必须自行 `Release`。解码器/设备丢失后应重新获取——liberika 会重建 swap chain
 并暴露新对象；指针未变说明没有重建。
 
 ### Windows Flutter 纹理
@@ -579,7 +579,7 @@ ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *, ErikaEvent *out_e
 ```
 
 每个显示帧调一次 `render_tick`（如来自 `CADisplayLink`、`CVDisplayLink` 或 Windows
-帧调度器）。`time_seconds` 是该帧的宿主显示时钟（秒）——Erika 用它做 vsync 量化调度，
+帧调度器）。`time_seconds` 是该帧的宿主显示时钟（秒）——liberika 用它做 vsync 量化调度，
 所以传**呈现时间戳**，不是 wall-clock 增量。若 `out_stats` 非 `NULL`，会填入流水线
 计数器快照。`poll_event` 非阻塞，空闲时返回 `NoEvent`。
 
@@ -606,7 +606,7 @@ char *erika_presenter_render_tick_json(ErikaPresenterHandle *, double time_secon
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 ```
 
-返回的字符串归 Erika 所有，必须用 `erika_string_free` 释放。`poll_event_json`
+返回的字符串归 liberika 所有，必须用 `erika_string_free` 释放。`poll_event_json`
 在无事件时返回 `NULL`——不是信封——所以 `NULL` 表示空闲而非错误。
 
 三者的返回值都包在同一层信封里：
@@ -722,7 +722,7 @@ free(rgba);
 - **`ErikaOutputStatus`** —— 上文“诊断与截图”说明的 13 字段协商输出快照。
 - **`ErikaDanmakuConfig`** —— 完整弹幕布局/外观配置（字号、不透明度、显示区域、滚动
   时序、碰撞/堆叠开关、屏蔽模式、阴影样式）。`font_size` 是 NipaPlay/Flutter 的*逻辑*
-  字号；Erika 会乘以 surface scale 得到 glyph 像素。
+  字号；liberika 会乘以 surface scale 得到 glyph 像素。
 - **`ErikaDanmakuTrackInfo`** `{ id, enabled, offset_micros, item_count, char *name, char *source }` —
   用 `erika_danmaku_track_info_free` 释放。
 - **`ErikaVideoParams`** `{ width, height, primaries, transfer }` —— 通过

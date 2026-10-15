@@ -1,8 +1,8 @@
-# 为 Erika 贡献
+# 为 liberika 贡献
 
 > [English](CONTRIBUTING.md) | [日本語](CONTRIBUTING.ja.md)
 
-Erika 是 NipaPlay 的自研播放内核:一个 Rust 引擎,从 demux/decode 一路负责到 GPU
+liberika 是 NipaPlay 的自研播放内核:一个 Rust 引擎,从 demux/decode 一路负责到 GPU
 呈现、音频、字幕和弹幕,并通过 C ABI 和 Flutter 插件暴露给宿主。本文档是上手地图。
 
 另见:[architecture.zh.md](docs/architecture.zh.md)(引擎设计)、

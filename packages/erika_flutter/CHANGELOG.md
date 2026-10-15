@@ -16,7 +16,7 @@
 
 ## 0.2.0
 
-- Added headless GIF export through the native Erika runtime.
+- Added headless GIF export through the native liberika runtime.
 - Added Dolby Vision RPU mapping and a libplacebo-style HDR tone/gamut pipeline.
 - Improved HTTP(S) streaming with persistent prefetch, resumable range reads,
   and a host-tunable rewind cache.
@@ -77,5 +77,5 @@
 - Exposed renderer resource status on Android, Windows, and OpenHarmony.
 - Restored Windows system media controls and tightened the OpenHarmony bridge.
 
-See the [repository changelog](https://github.com/AimesSoft/Erika/blob/main/CHANGELOG.md)
+See the [repository changelog](https://github.com/AimesSoft/liberika/blob/main/CHANGELOG.md)
 for native engine and earlier release details.

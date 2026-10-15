@@ -1,8 +1,8 @@
-# Erika のビルド
+# liberika のビルド
 
 > 翻訳：[English](building.md) · [中文](building.zh.md)
 
-Erika は一連の**静的ビルドされたネイティブ依存**（FFmpeg、全ターゲット向け dav1d AV1
+liberika は一連の**静的ビルドされたネイティブ依存**（FFmpeg、全ターゲット向け dav1d AV1
 ソフトウェアフォールバック、オプションの libass 字幕スタック）をリンクする Rust workspace です。これらのネイティブライブラリは vendoring
 されていません——`xtask` オーケストレータで一度ビルドすると `third_party/dist/` 配下に
 配置され、Rust crate がそのステージングディレクトリをリンクします。
@@ -19,7 +19,7 @@ xtask deps build  ──▶  third_party/dist/<target>/<profile>/{ffmpeg,dav1d,z
 
 ## Linux のシステムライブラリビルド
 
-Linux は FFmpeg 8、PulseAudio と Erika パッチ済み libass を使います。
+Linux は FFmpeg 8、PulseAudio と liberika パッチ済み libass を使います。
 以下の xtask リリースターゲットとは別経路です。[Linux ガイド](linux.md) から始めます。
 
 ## 前提
@@ -118,7 +118,7 @@ cargo run -p xtask -- deps build --all --profile lgpl
 
 HarmonyOS build は `OHOS_NDK_HOME` または `OHOS_SDK_NATIVE` が指す DevEco Studio の
 `openharmony/native` ディレクトリを使い、その中の `aarch64-unknown-linux-ohos-clang`
-で FFmpeg、zlib、Erika を build します。Flutter plugin の Hvigor/CMake build が
+で FFmpeg、zlib、liberika を build します。Flutter plugin の Hvigor/CMake build が
 この chain を自動実行し、`liberika_capi.so` と `liberika_flutter.so` を HAP に
 package します。
 
@@ -126,7 +126,7 @@ package します。
 
 Flutter の依存 project は、macOS では `ERIKA_MACOS_ARCHS=arm64|x86_64|universal`、Windows では `ERIKA_WINDOWS_ARCH=x64|arm64`、Android では `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86` で architecture を選択します。`ERIKA_FORCE_SOURCE_BUILD=1` を設定すると prebuilt download を無効化できます。
 
-Apple plugin の既定は checksum 検証済み prebuilt アーカイブですが、Erika checkout 内の macOS だけは例外です。pod script が package の上位に `crates/erika_capi/Cargo.toml` を見つけた場合（または `ERIKA_REPO_ROOT` が指す場合）、新しい prebuilt release を待たずにローカルの変更を取り込めるよう、`erika_capi` をソースからビルドします。`ERIKA_FORCE_PREBUILT=1` を設定すると常にアーカイブのダウンロードになります——Rust toolchain の無いリポジトリ内 consumer はこちらを使ってください。pub cache に解決された git dependency はリポジトリ全体を保持するため、こちらもソースビルドに切り替わる点に注意してください。
+Apple plugin の既定は checksum 検証済み prebuilt アーカイブですが、liberika checkout 内の macOS だけは例外です。pod script が package の上位に `crates/erika_capi/Cargo.toml` を見つけた場合（または `ERIKA_REPO_ROOT` が指す場合）、新しい prebuilt release を待たずにローカルの変更を取り込めるよう、`erika_capi` をソースからビルドします。`ERIKA_FORCE_PREBUILT=1` を設定すると常にアーカイブのダウンロードになります——Rust toolchain の無いリポジトリ内 consumer はこちらを使ってください。pub cache に解決された git dependency はリポジトリ全体を保持するため、こちらもソースビルドに切り替わる点に注意してください。
 
 native library を直接 build する場合、3 つの target 指定を一致させます：
 
@@ -200,7 +200,7 @@ third_party/
    では `ios/` セグメント付き）。
 
 関連する環境変数：`ERIKA_NATIVE_PROFILE`、`ERIKA_NATIVE_TARGET`、`ERIKA_FFMPEG_DIR`、
-`ERIKA_DAV1D_DIR`、`ERIKA_ZLIB_DIR`、`LIBCLANG_PATH`、`ERIKA_ALLOW_LEGACY_FFMPEG`（脱出ハッチ）。Erika は
+`ERIKA_DAV1D_DIR`、`ERIKA_ZLIB_DIR`、`LIBCLANG_PATH`、`ERIKA_ALLOW_LEGACY_FFMPEG`（脱出ハッチ）。liberika は
 FFmpeg **8.x**（`libavutil >= 60`）を要求し、Windows と Android のネイティブコアはこれを強制します。
 `ERIKA_ALLOW_LEGACY_FFMPEG=1` はローカルの互換性実験のときだけ設定してください。
 

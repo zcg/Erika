@@ -643,7 +643,7 @@ impl Default for ErikaPresenterConfig {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ErikaDanmakuConfig {
     pub enabled: bool,
-    /// NipaPlay/Flutter logical danmaku font size. Erika uses the NipaPlay
+    /// NipaPlay/Flutter logical danmaku font size. liberika uses the NipaPlay
     /// default danmaku font and multiplies by the surface scale for glyph pixels.
     pub font_size: f32,
     pub opacity: f32,
@@ -4306,9 +4306,9 @@ fn c_open_options(
     Ok((headers, read_ahead, back_buffer))
 }
 
-/// Headers Erika derives itself for every request. Accepting a caller override
+/// Headers liberika derives itself for every request. Accepting a caller override
 /// would append a second copy (ureq appends rather than replaces), which makes
-/// servers answer requests Erika cannot interpret — a duplicated `Range` in
+/// servers answer requests liberika cannot interpret — a duplicated `Range` in
 /// particular can yield a `200` full-entity response.
 const RESERVED_HTTP_HEADERS: [&str; 5] = [
     "range",

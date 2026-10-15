@@ -19,7 +19,7 @@ pub const MIDDLE_LAYER_COUNT: usize = 5;
 
 const HALF4_BYTES: usize = 8;
 
-/// Header stored at the start of every Erika ArtCNN weights blob.
+/// Header stored at the start of every liberika ArtCNN weights blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArtCnnBlobHeader {
     pub magic: u32,

@@ -34,7 +34,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MPL-2.0"
-repository = "https://github.com/AimesSoft/Erika"
+repository = "https://github.com/AimesSoft/liberika"
 rust-version = "1.92"
 version = "0.1.9"
 

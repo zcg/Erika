@@ -1,8 +1,8 @@
-# Building Erika
+# Building liberika
 
 > Translations: [中文](building.zh.md) · [日本語](building.ja.md)
 
-Erika is a Rust workspace that links a set of **statically built native
+liberika is a Rust workspace that links a set of **statically built native
 dependencies** (FFmpeg, dav1d for AV1 software decode on every target, and optionally
 the libass subtitle stack). Those native libraries are not vendored — you build them once with the `xtask` orchestrator,
 which stages them under `third_party/dist/`, and the Rust crates link against
@@ -74,7 +74,7 @@ Run the commands from a shell where the MSVC environment is active (e.g. a
   `OHOS_NDK_HOME` or `OHOS_SDK_NATIVE`, plus the
   `aarch64-unknown-linux-ohos` Rust standard-library target.
 
-Erika's Android minimum is API **26**. Override it with
+liberika's Android minimum is API **26**. Override it with
 `ANDROID_API_LEVEL` only when targeting a newer API.
 
 ## Native dependencies via `xtask`
@@ -135,7 +135,7 @@ Android builds use `android-26`, `c++_shared`, PIC static dependencies, and the
 NDK LLVM toolchain selected for the requested ABI.
 
 HarmonyOS builds take the DevEco Studio `openharmony/native` directory from
-`OHOS_NDK_HOME` or `OHOS_SDK_NATIVE` and build FFmpeg, zlib, and Erika with the
+`OHOS_NDK_HOME` or `OHOS_SDK_NATIVE` and build FFmpeg, zlib, and liberika with the
 `aarch64-unknown-linux-ohos-clang` toolchain inside it. The Flutter plugin's
 Hvigor/CMake build runs this chain automatically and packages `liberika_capi.so`
 and `liberika_flutter.so` into the HAP.
@@ -148,7 +148,7 @@ Windows with `ERIKA_WINDOWS_ARCH=x64|arm64`, and Android with
 `ERIKA_FORCE_SOURCE_BUILD=1` to bypass prebuilt downloads.
 
 The Apple plugins default to the checksummed prebuilt archive, except on macOS
-inside an Erika checkout: when the pod script finds
+inside a liberika checkout: when the pod script finds
 `crates/erika_capi/Cargo.toml` above the package (or `ERIKA_REPO_ROOT` points
 at one), it builds `erika_capi` from source so local changes are picked up
 without a new prebuilt release. `ERIKA_FORCE_PREBUILT=1` always downloads the
@@ -267,7 +267,7 @@ For the `host` target the `<target>` path segment is omitted
 
 Relevant environment variables: `ERIKA_NATIVE_PROFILE`, `ERIKA_NATIVE_TARGET`,
 `ERIKA_FFMPEG_DIR`, `ERIKA_DAV1D_DIR`, `ERIKA_ZLIB_DIR`, `LIBCLANG_PATH`, and
-`ERIKA_ALLOW_LEGACY_FFMPEG` (escape hatch). Erika requires FFmpeg **8.x**
+`ERIKA_ALLOW_LEGACY_FFMPEG` (escape hatch). liberika requires FFmpeg **8.x**
 (`libavutil >= 60`); the Windows and Android native core enforces this. Set
 `ERIKA_ALLOW_LEGACY_FFMPEG=1` only for local compatibility experiments.
 

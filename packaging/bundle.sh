@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Stage and zip an Erika C ABI prebuilt bundle.
+# Stage and zip a liberika C ABI prebuilt bundle.
 #
 # Usage: packaging/bundle.sh <bundle-name> <out-zip> <artifact> [<artifact> ...]
 #   <bundle-name>  directory name inside the zip, e.g. erika-capi-macos-universal
@@ -10,7 +10,7 @@
 # Produces a zip containing:
 #   <bundle-name>/lib/<artifacts>
 #   <bundle-name>/include/erika.h
-#   <bundle-name>/LICENSE                 (Erika, MPL-2.0)
+#   <bundle-name>/LICENSE                 (liberika, MPL-2.0)
 #   <bundle-name>/THIRD_PARTY_NOTICES.md  (FFmpeg LGPL etc.)
 #   <bundle-name>/licenses/               (dependency and asset licenses/notices)
 #   <bundle-name>/MANIFEST.txt           (ref/commit/profile/date)

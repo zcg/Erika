@@ -1,8 +1,8 @@
-# Erika Architecture
+# liberika Architecture
 
 [中文](architecture.zh.md) | [English](architecture.md) | [日本語](architecture.ja.md)
 
-Erika は埋め込み可能な Rust メディア再生ライブラリです。ホストアプリは Rust API、C ABI (`erika_capi`)、または Flutter バインディング (`erika_flutter`) から呼び出せます。動画フレーム、字幕、弾幕はすべてエンジン内部に留まり、レンダラー内で合成され、native surface は直接表示し、Flutter texture は host で合成します。
+liberika は埋め込み可能な Rust メディア再生ライブラリです。ホストアプリは Rust API、C ABI (`erika_capi`)、または Flutter バインディング (`erika_flutter`) から呼び出せます。動画フレーム、字幕、弾幕はすべてエンジン内部に留まり、レンダラー内で合成され、native surface は直接表示し、Flutter texture は host で合成します。
 
 ## システム概要
 
@@ -102,7 +102,7 @@ background 再生と foreground の video 復帰中も、動作中の audio mast
 ## 字幕システム
 
 - **Parsing**: SRT、WebVTT、ASS timeline parsing。embedded / external subtitle track を扱い、external track は runtime で追加・削除できます。
-- **libass renderer**: static link で既定有効。ASS script を受け取り、`ass_render_frame` を呼び、alpha plane を Erika の overlay system に取り込みます。macOS では CoreText font provider、Windows では DirectWrite を使います。それ以外の target は system font provider 無しで動作するため（vendored libass は fontconfig を無効化）、全 platform で memory font として登録される内蔵の Droid Sans Fallback が libass の既定 family になります。
+- **libass renderer**: static link で既定有効。ASS script を受け取り、`ass_render_frame` を呼び、alpha plane を liberika の overlay system に取り込みます。macOS では CoreText font provider、Windows では DirectWrite を使います。それ以外の target は system font provider 無しで動作するため（vendored libass は fontconfig を無効化）、全 platform で memory font として登録される内蔵の Droid Sans Fallback が libass の既定 family になります。
 - **字幕スタイル**: custom な font family と font file、色、metrics（サイズ・縁取り・影・blur・字間・拡大率）、attribute、border style、alignment、margin は fallback として働き、script が指定していない部分と plain-text 字幕の styling を埋めます（metrics には字幕 scale がさらに掛かります）。`override_mask` は選んだ field を libass の selective style override に昇格させ、ASS dialogue が要求する styling も置き換えます。override 時の metrics は再正規化され、script の `PlayResY` に関係なく同じ pixel になります。
 - **SubtitleRendererCore**: changed / unchanged frame を追跡し、不要な GPU upload を避ける renderer-facing boundary です。
 
@@ -157,7 +157,7 @@ Windows のネイティブ renderer（`renderer/d3d11.rs`）：
 - OpenHarmony では AVCodec の Surface 出力を `OHNativeBuffer` 由来の Vulkan external image として import し、Vulkan YCbCr sampler で YUV 変換を GPU 上で行うため、decode したフレームは CPU コピーなしで wgpu compositor に到達します。必要な Vulkan extension がない端末では software decode と CPU upload に fallback し、その経緯は diagnostics event から確認できます。
 - Android は bounded Vulkan/GLES backend recovery と import/capability/quality/device-failure diagnostics を備えます。high-headroom output は FP16 **extended-linear scRGB** であり HDR10/PQ ではありません。renderer は `Rgba16Float`、Vulkan extended-sRGB-linear color space を使い、configure/reconfigure ごとに `ANativeWindow` の `ADATASPACE_SCRGB_LINEAR`（`0x18410000`）を検証します。Android scRGB は BT.709 primaries、`1.0 = 80 nit` で、PQ や HDR10 static metadata は出力しません。
 - Extended-linear が active になる条件は、`ExtendedLinear` の明示要求、HDR 対応 display/surface、Flutter Hybrid Composition の `SurfaceView`、Vulkan wgpu backend、surface の `Rgba16Float` 対応、`SCRGB_LINEAR` dataspace readback 成功です。どれかが欠けると通常の SDR surface を直ちに選び、安定 ABI の fallback reason `0..8` を記録します。そのため GLES と `TextureView` は SDR path です。
-- API 34+ では Android host が `Display.registerHdrSdrRatioChangedListener` で display を監視し、実際の変化を `erika_presenter_set_output_headroom` で Erika に publish します。wgpu は surface を reattach せず、後続 frame の effective content headroom と queryable output status を更新します。ratio が available なら `activeHeadroomKnown` は true で、known flag または ratio が実際に変わった場合だけ `headroomUpdates` が増えます。
+- API 34+ では Android host が `Display.registerHdrSdrRatioChangedListener` で display を監視し、実際の変化を `erika_presenter_set_output_headroom` で liberika に publish します。wgpu は surface を reattach せず、後続 frame の effective content headroom と queryable output status を更新します。ratio が available なら `activeHeadroomKnown` は true で、known flag または ratio が実際に変わった場合だけ `headroomUpdates` が増えます。
 - Flutter extended-linear player で `edrHeadroom` を明示しない場合、content ceiling は default 4x、`SurfaceView` の desired headroom は system auto を意味する `0` です。明示値は content ceiling となり、API 35 では per-`SurfaceView` desired headroom にもなります。global Window は変更しません。
 - emulator / non-HDR device では明示的な SDR fallback branch を検証済みです。API 35 HDR 実機で `Rgba16Float + SCRGB_LINEAR` の acceptance が完了するまで、active extended-linear path を実機検証済みとは表現しません。
 
@@ -186,7 +186,7 @@ Windows のネイティブ renderer（`renderer/d3d11.rs`）：
 `erika_capi` は 2 つの handle family を提供します。
 
 - **`ErikaHandle`**: player control と event polling。rendering は host 管理です。
-- **`ErikaPresenterHandle`**: Erika が full stack を所有します。host は surface を渡して `render_tick` を呼びます。
+- **`ErikaPresenterHandle`**: liberika が full stack を所有します。host は surface を渡して `render_tick` を呼びます。
 
 create/destroy、open/play/pause/stop/seek、track selection、subtitle track add/remove、danmaku track management（add/remove/enable/offset/config）、surface attach/detach/resize、event polling、volume、playback rate、neural luma upscaler switching、upscaler diagnostics、`erika_presenter_get_output_status` が返す 13-field output status snapshot を含みます。
 

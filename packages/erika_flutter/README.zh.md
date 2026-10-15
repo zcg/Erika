@@ -2,19 +2,19 @@
 
 [中文](README.zh.md) | [English](README.md) | [日本語](README.ja.md)
 
-Erika 媒体播放引擎的 Flutter plugin。
+liberika 媒体播放引擎的 Flutter plugin。
 
 插件让 Dart 不进入热路径：
 
 - Dart 只暴露低频播放器命令和事件流。
 - 原生插件提供窗口叠加、platform view 与 Flutter 纹理三种接入方式，对应 `ErikaWindowOverlayVideoView`、`ErikaVideoView` 和 `ErikaTextureVideoView`。具体平台实现见下方。
-- macOS 插件加载 Erika 动态库。
-- iOS 插件链接 Erika 静态库。
-- tvOS 插件链接 Erika 静态库，并在 Apple TV platform view 中承载 Metal layer。
-- Windows 插件构建并链接 Erika C ABI DLL。
+- macOS 插件加载 liberika 动态库。
+- iOS 插件链接 liberika 静态库。
+- tvOS 插件链接 liberika 静态库，并在 Apple TV platform view 中承载 Metal layer。
+- Windows 插件构建并链接 liberika C ABI DLL。
 - Android 插件按 ABI 构建 `liberika_capi.so`，并由 `Choreographer` 驱动原生 surface。
-- HarmonyOS 插件注册 Flutter 外部纹理，把它的 `OHNativeWindow` attach 给 Erika，并用 OHAudio 做低延迟 PCM 输出。
-- Erika 通过 `ErikaPresenterHandle` 负责播放、渲染、音频、时序和 overlay。
+- HarmonyOS 插件注册 Flutter 外部纹理，把它的 `OHNativeWindow` attach 给 liberika，并用 OHAudio 做低延迟 PCM 输出。
+- liberika 通过 `ErikaPresenterHandle` 负责播放、渲染、音频、时序和 overlay。
 
 ## Video Surfaces
 
@@ -22,13 +22,13 @@ Erika 媒体播放引擎的 Flutter plugin。
 
 Windows 上 `ErikaWindowOverlayVideoView` 以 sibling surface 的形式托管一个 window-level Direct3D 11 swapchain，遵循同样的 overlay 模型。
 
-需要标准 Flutter platform view 时则使用 `ErikaVideoView`。Android 的 SDR 视频 surface 是原生 `TextureView`；`ErikaOutputMode.extendedLinear` player 则通过 `PlatformViewLink`/Hybrid Composition 创建 `SurfaceView`，因为 scRGB 不能经过 Flutter texture-layer composition。插件把借用的 `Surface` 交给 Erika，并完整处理创建、resize、销毁、音频焦点、HDR eligibility 和 vsync tick。
+需要标准 Flutter platform view 时则使用 `ErikaVideoView`。Android 的 SDR 视频 surface 是原生 `TextureView`；`ErikaOutputMode.extendedLinear` player 则通过 `PlatformViewLink`/Hybrid Composition 创建 `SurfaceView`，因为 scRGB 不能经过 Flutter texture-layer composition。插件把借用的 `Surface` 交给 liberika，并完整处理创建、resize、销毁、音频焦点、HDR eligibility 和 vsync tick。
 
 Windows 的 `ErikaVideoView` 同样使用原生 swapchain，支持 HDR10。需要 Flutter 裁剪、透明度或颜色滤镜时使用 SDR 的 `ErikaTextureVideoView`：默认 `srcOver` 使用 BGRA8 GPU snapshot，`overlay` 使用 Windows Composition。
 
 ## Linux Setup
 
-按 [Linux 接入指南](https://github.com/AimesSoft/Erika/blob/main/docs/linux.zh.md) 构建 `liberika_capi.so`，将 `ERIKA_LIBRARY_DIR` 指向其所在目录，再运行 `flutter build linux`。
+按 [Linux 接入指南](https://github.com/AimesSoft/liberika/blob/main/docs/linux.zh.md) 构建 `liberika_capi.so`，将 `ERIKA_LIBRARY_DIR` 指向其所在目录，再运行 `flutter build linux`。
 
 `ErikaTextureVideoView` 使用 GTK Flutter 纹理；Linux 上的 `ErikaVideoView` 也选择此路径。视频、字幕和弹幕在 GPU 合成后读回 RGBA，输出为 SDR。Wayland 下可用 `ErikaWindowOverlayVideoView` 把原生视频层放在透明 Flutter UI 下方，避免每帧读回；它要求 Wayland 会话，不适用于 X11。
 
@@ -42,10 +42,10 @@ macOS 通过 Now Playing 和 Remote Command Center 提供媒体信息、播放�
 
 ## 预构建包与源码构建
 
-插件默认下载与当前版本对应的 原生库，并校验 SHA-256。下载失败或校验不一致会明确报错，不会静默回退源码构建。只有在 Erika checkout 中调试源码时才设置 `ERIKA_FORCE_SOURCE_BUILD=1`。自定义 `ERIKA_PREBUILT_TAG` 时，单 ABI 构建须提供对应的 `ERIKA_PREBUILT_SHA256`；Android 多 ABI 构建则须分别提供 `ERIKA_PREBUILT_SHA256_ARM64_V8A`、`ERIKA_PREBUILT_SHA256_ARMEABI_V7A`、`ERIKA_PREBUILT_SHA256_X86_64` 和 `ERIKA_PREBUILT_SHA256_X86`。完整发布方式见 [发布指南](https://github.com/AimesSoft/Erika/blob/main/docs/releasing.zh.md)。
+插件默认下载与当前版本对应的 原生库，并校验 SHA-256。下载失败或校验不一致会明确报错，不会静默回退源码构建。只有在 liberika checkout 中调试源码时才设置 `ERIKA_FORCE_SOURCE_BUILD=1`。自定义 `ERIKA_PREBUILT_TAG` 时，单 ABI 构建须提供对应的 `ERIKA_PREBUILT_SHA256`；Android 多 ABI 构建则须分别提供 `ERIKA_PREBUILT_SHA256_ARM64_V8A`、`ERIKA_PREBUILT_SHA256_ARMEABI_V7A`、`ERIKA_PREBUILT_SHA256_X86_64` 和 `ERIKA_PREBUILT_SHA256_X86`。完整发布方式见 [发布指南](https://github.com/AimesSoft/liberika/blob/main/docs/releasing.zh.md)。
 Android 会为每个实际请求的 ABI 只下载一个约 20–22MB 的 runtime 归档，不会获取四 ABI 合并 C API 包或其中的静态库。
 
-源码构建时，macOS 使用 `ERIKA_MACOS_ARCHS=arm64|x86_64|universal`，Windows 使用 `ERIKA_WINDOWS_ARCH=x64|arm64`，Android 使用 `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86`。直接构建原生库时，`xtask --target`、`ERIKA_NATIVE_TARGET` 和 `cargo build --target` 必须使用同一个 target。详细示例见 [构建指南](https://github.com/AimesSoft/Erika/blob/main/docs/building.zh.md)。
+源码构建时，macOS 使用 `ERIKA_MACOS_ARCHS=arm64|x86_64|universal`，Windows 使用 `ERIKA_WINDOWS_ARCH=x64|arm64`，Android 使用 `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86`。直接构建原生库时，`xtask --target`、`ERIKA_NATIVE_TARGET` 和 `cargo build --target` 必须使用同一个 target。详细示例见 [构建指南](https://github.com/AimesSoft/liberika/blob/main/docs/building.zh.md)。
 
 ## iOS Setup
 
@@ -77,7 +77,7 @@ await player.play();
 
 ## 系统媒体上一项与下一项
 
-播放列表应用可以按当前条目启用系统媒体面板的上一项和下一项按钮。Erika 不会自行选择
+播放列表应用可以按当前条目启用系统媒体面板的上一项和下一项按钮。liberika 不会自行选择
 媒体，而是发出 `systemMediaNavigationRequested` 事件，让 Dart 始终作为播放列表的唯一
 数据源。当前条目变化后应同步更新按钮能力。
 
@@ -173,13 +173,13 @@ Windows 通过 System Media Transport Controls 发布标题、作者、专辑、
 
 Android Gradle 构建默认为选定 ABI 下载经校验的运行时。最低 Android API 26；生成的 `jniLibs` 包含 `liberika_capi.so` 和匹配 ABI 的 NDK `libc++_shared.so`。默认选择 arm64 与 x86_64；可通过 `-PerikaAndroidAbis=arm64-v8a,x86_64` 或 `ERIKA_ANDROID_ABIS` 指定。
 
-Android `content://` 媒体和字幕 URI 会通过 `ContentResolver` 打开并 detach，连同 provider 的 offset/length 作为由 Rust 接管所有权的 `fd://` source 传入 Erika。
+Android `content://` 媒体和字幕 URI 会通过 `ContentResolver` 打开并 detach，连同 provider 的 offset/length 作为由 Rust 接管所有权的 `fd://` source 传入 liberika。
 
 Android 使用 MediaSession 和媒体通知接入锁屏、蓝牙耳机及系统媒体面板。`allowBackgroundPlayback: true` 时会启动 `mediaPlayback` 前台 Service，并在后台仅驱动音频；插件 Manifest 已声明前台服务和 Android 13+ 通知权限，但宿主应用仍需按产品流程向用户请求 `POST_NOTIFICATIONS` 运行时权限。该权限被拒绝时，系统媒体会话仍可工作，但通知展示取决于 Android 版本和系统策略。
 
 Android 最低版本仍为 API 26。Extended-linear 还要求 native-window dataspace API（API
 28+）；API 26/27 会继续 SDR 播放并报告对应 fallback。API 34+ 上，插件会监听
-`Display.registerHdrSdrRatioChangedListener`，把真实 ratio 变化发布给 Erika，让 wgpu 无需
+`Display.registerHdrSdrRatioChangedListener`，把真实 ratio 变化发布给 liberika，让 wgpu 无需
 重新 attach surface 就能更新后续帧 target 和输出状态。API 35 上插件还会按
 `SurfaceView` 设置 desired HDR headroom，不修改宿主的全局 Window。
 
@@ -276,7 +276,7 @@ final player = ErikaPlayer(
 );
 ```
 
-`edrHeadroom` 是内容 headroom 上限。Extended-linear player 未传该参数时，Erika 使用默认
+`edrHeadroom` 是内容 headroom 上限。Extended-linear player 未传该参数时，liberika 使用默认
 4x 内容上限，同时给 `SurfaceView` 传 desired headroom `0`（系统 auto）。显式值在 API 35
 上还会作为 per-`SurfaceView` desired headroom。显示器当前 HDR/SDR ratio 可用时，会进一步
 约束 wgpu 的有效 target。

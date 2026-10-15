@@ -2,14 +2,14 @@
 
 [中文](flutter_embedding.zh.md) | [English](flutter_embedding.md) | [日本語](flutter_embedding.ja.md)
 
-Erika は Flutter の動画レンダラーではありません。Flutter はあくまで任意の host UI です。再生コアが decode、timing、native rendering、字幕、弾幕、音声、HDR presentation を担当します。
+liberika は Flutter の動画レンダラーではありません。Flutter はあくまで任意の host UI です。再生コアが decode、timing、native rendering、字幕、弾幕、音声、HDR presentation を担当します。
 
 ## API Families
 
 C ABI の entrypoint family は 2 つあります。
 
 - `ErikaHandle`: control と event API。host が自前の presenter loop を持つ場合や、再生の probe / control だけを行いたい場合に使います。
-- `ErikaPresenterHandle`: presenter-owned API。Erika が `Player + renderer + audio output` を所有し、host は native surface と display tick callback だけを提供する場合に使います。
+- `ErikaPresenterHandle`: presenter-owned API。liberika が `Player + renderer + audio output` を所有し、host は native surface と display tick callback だけを提供する場合に使います。
 
 どちらも `crates/erika_capi/include/erika.h` に定義されています。
 
@@ -33,7 +33,7 @@ HDR/EDR の推奨 path は、Flutter の platform-view compositor の外側に�
 4. widget は位置を追跡し、surface generation number 付きで geometry update を送るため、dispose 済み widget からの古い hide call が新しく attach された surface に影響しません。
 5. attach retry は exponential backoff で window readiness のタイミングを吸収します。
 
-この overlay path は NipaPlay や他の full-player UI に推奨です。video presentation は Erika/Metal が持ち、Flutter は control / layout layer に専念できます。iOS / tvOS では window + sibling `UIView`/`CAMetalLayer`、macOS では host `NSWindow` + sibling `NSView`/`CAMetalLayer` を使います。
+この overlay path は NipaPlay や他の full-player UI に推奨です。video presentation は liberika/Metal が持ち、Flutter は control / layout layer に専念できます。iOS / tvOS では window + sibling `UIView`/`CAMetalLayer`、macOS では host `NSWindow` + sibling `NSView`/`CAMetalLayer` を使います。
 
 touch events は両方の native video strategy を通過するので、Flutter controls を video surface の上や周囲に置けます。
 
@@ -79,7 +79,7 @@ CI は OpenHarmony C ABI をビルドしますが、デバイス側の実行検�
 
 ## 透明 video と blend mode
 
-Erika は Flutter の layout / composition を保ったまま alpha を持つ video asset を表示できます。透明は player ごとに要求します。
+liberika は Flutter の layout / composition を保ったまま alpha を持つ video asset を表示できます。透明は player ごとに要求します。
 
 ```dart
 final player = ErikaPlayer(
@@ -108,15 +108,15 @@ ErikaTextureVideoView(
 | Windows window overlay（DirectComposition） | `srcOver` / `overlay`。他の値は plugin error | `IDCompositionEffectGroup` opacity |
 | Android / iOS / OpenHarmony | creation parameter としては受け取るが未使用 | texture path では Flutter 側で適用 |
 
-overlay blending は backdrop-aware です。macOS の native layer は window 内で video の背後にある content に対して合成し、Windows の blend effect は同じ HWND を sampling するため、背後の Flutter や game の画面は見えたまま維持されます。Windows の透明 overlay video は Flutter HWND に bind した SDR BGRA8 premultiplied composition swap chain を使い、HDR source は Erika 内部でその合成空間へ tone map されます。不透明な Windows overlay video は従来どおり専用 child HWND path を使います。decoder や output device が swap chain を再構築した場合は composition content が自動で再 bind されます。
+overlay blending は backdrop-aware です。macOS の native layer は window 内で video の背後にある content に対して合成し、Windows の blend effect は同じ HWND を sampling するため、背後の Flutter や game の画面は見えたまま維持されます。Windows の透明 overlay video は Flutter HWND に bind した SDR BGRA8 premultiplied composition swap chain を使い、HDR source は liberika 内部でその合成空間へ tone map されます。不透明な Windows overlay video は従来どおり専用 child HWND path を使います。decoder や output device が swap chain を再構築した場合は composition content が自動で再 bind されます。
 
 ## iOS Build Path
 
-iOS plugin は CocoaPod script phase 経由で Erika C ABI static library を app にリンクします。既定では一致する prebuilt アーカイブをダウンロードし、`ERIKA_FORCE_SOURCE_BUILD=1`（`ERIKA_REPO_ROOT` と併用）で初めて対象 iOS architecture 向けに Rust の `erika_capi` crate をビルドします。
+iOS plugin は CocoaPod script phase 経由で liberika C ABI static library を app にリンクします。既定では一致する prebuilt アーカイブをダウンロードし、`ERIKA_FORCE_SOURCE_BUILD=1`（`ERIKA_REPO_ROOT` と併用）で初めて対象 iOS architecture 向けに Rust の `erika_capi` crate をビルドします。
 
 ## tvOS Build Path
 
-tvOS plugin は CocoaPod script phase 経由で Erika C ABI static library をリンクします。iOS と同様に既定では prebuilt アーカイブをダウンロードし、`ERIKA_FORCE_SOURCE_BUILD=1` のときのみソースビルドします。tvOS 13+、arm64 実機、arm64/x86_64 simulator に対応します。Rust nightly、prebuilt bundle、source build の詳細は [`packages/erika_flutter/README.ja.md`](../packages/erika_flutter/README.ja.md) を参照してください。
+tvOS plugin は CocoaPod script phase 経由で liberika C ABI static library をリンクします。iOS と同様に既定では prebuilt アーカイブをダウンロードし、`ERIKA_FORCE_SOURCE_BUILD=1` のときのみソースビルドします。tvOS 13+、arm64 実機、arm64/x86_64 simulator に対応します。Rust nightly、prebuilt bundle、source build の詳細は [`packages/erika_flutter/README.ja.md`](../packages/erika_flutter/README.ja.md) を参照してください。
 
 ## macOS Build Path
 
@@ -225,7 +225,7 @@ GLES は明示的な `inactive` fallback を報告します。renderer 側の設
 
 ## Ownership Rule
 
-Flutter は layout と controls を担当し、Erika は video plane、subtitle plane、danmaku plane、audio、timing を担当します。plugin は `MethodChannel` を通じて command と event を橋渡しし、rendering は Dart を経由しません。
+Flutter は layout と controls を担当し、liberika は video plane、subtitle plane、danmaku plane、audio、timing を担当します。plugin は `MethodChannel` を通じて command と event を橋渡しし、rendering は Dart を経由しません。
 
 ## Linux の映像サーフェス
 

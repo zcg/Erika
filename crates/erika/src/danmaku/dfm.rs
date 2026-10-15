@@ -1,9 +1,9 @@
-//! Erika adapter for the NipaPlay DFM+ layout core.
+//! liberika adapter for the NipaPlay DFM+ layout core.
 //!
 //! This module keeps the DFM+ prepare/frame-query contract intact while removing
 //! the Flutter Rust Bridge handle store. The input is prepared danmaku content,
 //! viewport, and user config; the output is a prepared layout plus per-media-time
-//! frame positions that Erika maps into its native GPU render plan.
+//! frame positions that liberika maps into its native GPU render plan.
 
 use rustc_hash::{FxHashMap, FxHasher};
 

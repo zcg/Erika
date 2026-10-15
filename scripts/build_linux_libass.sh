@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Erika's patched libass against the Linux distribution's font libraries.
+# Build liberika's patched libass against the Linux distribution's font libraries.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

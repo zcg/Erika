@@ -1,6 +1,6 @@
-# 构建 Erika
+# 构建 liberika
 
-Erika 是一个 Rust workspace,它链接一组**静态构建的原生依赖**(FFmpeg、所有目标的
+liberika 是一个 Rust workspace,它链接一组**静态构建的原生依赖**(FFmpeg、所有目标的
 dav1d AV1 软解回退,以及可选的 libass 字幕栈)。这些原生库不随仓库 vendoring——你用 `xtask` 编排器构建一次,它会把
 产物安置到 `third_party/dist/` 下,Rust crate 再链接那个目录。
 
@@ -16,7 +16,7 @@ xtask deps build  ──▶  third_party/dist/<target>/<profile>/{ffmpeg,dav1d,z
 
 ## Linux 系统库构建
 
-Linux 使用系统 FFmpeg 8、PulseAudio 和 Erika 补丁 libass，入口不同于下文
+Linux 使用系统 FFmpeg 8、PulseAudio 和 liberika 补丁 libass，入口不同于下文
 xtask 发布目标。安装依赖和构建步骤在 [Linux 接入](linux.zh.md)。
 
 ## 前置依赖
@@ -125,7 +125,7 @@ Android 使用 `android-26`、`c++_shared`、PIC 静态依赖和所选 ABI 对�
 
 HarmonyOS 使用 `OHOS_NDK_HOME` 或 `OHOS_SDK_NATIVE` 指向 DevEco Studio 的
 `openharmony/native` 目录，并通过其中的
-`aarch64-unknown-linux-ohos-clang` 构建 FFmpeg、zlib 和 Erika。Flutter 插件的
+`aarch64-unknown-linux-ohos-clang` 构建 FFmpeg、zlib 和 liberika。Flutter 插件的
 Hvigor/CMake 构建会自动执行这条链路，并把 `liberika_capi.so` 与
 `liberika_flutter.so` 打入 HAP。
 
@@ -133,7 +133,7 @@ Hvigor/CMake 构建会自动执行这条链路，并把 `liberika_capi.so` 与
 
 Flutter 依赖项目通过 `ERIKA_MACOS_ARCHS=arm64|x86_64|universal` 选择 macOS 架构，通过 `ERIKA_WINDOWS_ARCH=x64|arm64` 选择 Windows 架构，通过 `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86` 选择 Android ABI。设置 `ERIKA_FORCE_SOURCE_BUILD=1` 可强制跳过预构建包。
 
-Apple 插件默认使用带校验的预构建归档，唯一例外是 Erika checkout 内的 macOS：pod 脚本在包上层发现 `crates/erika_capi/Cargo.toml`（或 `ERIKA_REPO_ROOT` 指向 checkout）时，会改为从源码构建 `erika_capi`，使本地改动无需等待新的预构建发布即可生效。设置 `ERIKA_FORCE_PREBUILT=1` 可强制始终下载归档——仓库内没有 Rust 工具链的消费者请使用该开关；注意解析到 pub cache 的 git 依赖保留了整个仓库，因此同样会切换为源码构建。
+Apple 插件默认使用带校验的预构建归档，唯一例外是 liberika checkout 内的 macOS：pod 脚本在包上层发现 `crates/erika_capi/Cargo.toml`（或 `ERIKA_REPO_ROOT` 指向 checkout）时，会改为从源码构建 `erika_capi`，使本地改动无需等待新的预构建发布即可生效。设置 `ERIKA_FORCE_PREBUILT=1` 可强制始终下载归档——仓库内没有 Rust 工具链的消费者请使用该开关；注意解析到 pub cache 的 git 依赖保留了整个仓库，因此同样会切换为源码构建。
 
 直接构建原生库时，三个目标参数必须一致：
 
@@ -143,7 +143,7 @@ ERIKA_NATIVE_PROFILE=lgpl ERIKA_NATIVE_TARGET=aarch64-apple-darwin \
   cargo build -p erika_capi --release --target aarch64-apple-darwin
 ```
 
-tvOS 的 Rust 目标虽已是 tier 2，但 Erika 直接构建时仍用 nightly 并从 `rust-src`
+tvOS 的 Rust 目标虽已是 tier 2，但 liberika 直接构建时仍用 nightly 并从 `rust-src`
 构建标准库：
 
 ```sh
@@ -238,7 +238,7 @@ third_party/
    段)。
 
 相关环境变量:`ERIKA_NATIVE_PROFILE`、`ERIKA_NATIVE_TARGET`、`ERIKA_FFMPEG_DIR`、
-`ERIKA_DAV1D_DIR`、`ERIKA_ZLIB_DIR`、`LIBCLANG_PATH`,以及 `ERIKA_ALLOW_LEGACY_FFMPEG`(应急开关)。Erika
+`ERIKA_DAV1D_DIR`、`ERIKA_ZLIB_DIR`、`LIBCLANG_PATH`,以及 `ERIKA_ALLOW_LEGACY_FFMPEG`(应急开关)。liberika
 需要 FFmpeg **8.x**(`libavutil >= 60`);Windows 和 Android 原生核心强制此点。仅在本地兼容性实验时
 才设 `ERIKA_ALLOW_LEGACY_FFMPEG=1`。
 

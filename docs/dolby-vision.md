@@ -1,6 +1,6 @@
 # Dolby Vision HDR Mapping
 
-This document describes Erika's implementation of Dolby Vision RPU (Reference Processing Unit) metadata processing and color mapping.
+This document describes liberika's implementation of Dolby Vision RPU (Reference Processing Unit) metadata processing and color mapping.
 
 ## Overview
 

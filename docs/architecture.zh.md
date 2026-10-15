@@ -1,8 +1,8 @@
-# Erika Architecture
+# liberika Architecture
 
 [中文](architecture.zh.md) | [English](architecture.md) | [日本語](architecture.ja.md)
 
-Erika 是一个可嵌入的 Rust 媒体播放库。宿主应用可以通过 Rust API、C ABI (`erika_capi`) 或 Flutter 绑定 (`erika_flutter`) 调用它。视频帧、字幕和弹幕都留在引擎内部，并在渲染器里合成，原生 surface 直接呈现，Flutter texture 交给宿主合成。
+liberika 是一个可嵌入的 Rust 媒体播放库。宿主应用可以通过 Rust API、C ABI (`erika_capi`) 或 Flutter 绑定 (`erika_flutter`) 调用它。视频帧、字幕和弹幕都留在引擎内部，并在渲染器里合成，原生 surface 直接呈现，Flutter texture 交给宿主合成。
 
 ## 系统概览
 
@@ -99,7 +99,7 @@ presenter 在输出重置、重新配置、设备状态切换和倍速切换时�
 ## 字幕系统
 
 - **Parsing**：SRT、WebVTT、ASS 时间线解析。支持内嵌和外部字幕轨，外部轨可在运行时增删。
-- **libass renderer**：静态链接且默认启用。接收 ASS 脚本，调用 `ass_render_frame`，把 alpha plane 导入 Erika 的 overlay 系统。macOS 使用 CoreText 字体提供者，Windows 用 DirectWrite；其余目标运行时没有任何系统字体提供者（vendored libass 关闭了 fontconfig），因此 Erika 内嵌并在所有平台注册为内存字体的 Droid Sans Fallback 就是 libass 默认解析到的字体族。
+- **libass renderer**：静态链接且默认启用。接收 ASS 脚本，调用 `ass_render_frame`，把 alpha plane 导入 liberika 的 overlay 系统。macOS 使用 CoreText 字体提供者，Windows 用 DirectWrite；其余目标运行时没有任何系统字体提供者（vendored libass 关闭了 fontconfig），因此 liberika 内嵌并在所有平台注册为内存字体的 Droid Sans Fallback 就是 libass 默认解析到的字体族。
 - **字幕样式**：自定义字体族与字体文件、颜色、度量（字号、描边、阴影、模糊、字距、缩放）、字形属性、描边样式、对齐与边距都作为回退值，补足脚本未指定的部分以及纯文本字幕的样式；度量还会再乘上字幕缩放。`override_mask` 会把选中的字段提升为 libass 的 selective style override，从而覆盖 ASS 对白自带的样式；覆盖用的度量经过重新归一，无论脚本声明何种 `PlayResY` 都落在同样的像素上。
 - **SubtitleRendererCore**：面向 renderer 的边界层，用 changed/unchanged frame 跟踪避免重复 GPU 上传。
 
@@ -154,8 +154,8 @@ Windows 平台的原生渲染器（`renderer/d3d11.rs`）：
 - OpenHarmony 把 AVCodec 的 Surface 输出作为 `OHNativeBuffer` 支撑的 Vulkan 外部图像导入，并用 Vulkan YCbCr sampler 在 GPU 上完成 YUV 转换，解码帧无需 CPU 拷贝即可进入 wgpu 合成器。缺少所需 Vulkan 扩展的设备回退到软解 + CPU 上传，回退过程通过诊断事件上报。
 - Android 提供有界 Vulkan/GLES backend recovery，以及 import、能力、质量降级和 device failure 的结构化日志。其高 headroom 输出是 FP16 **extended-linear scRGB**，不是 HDR10/PQ：renderer 使用 `Rgba16Float`、Vulkan extended-sRGB-linear color space，并在每次 configure/reconfigure 后验证 `ANativeWindow` 的 `ADATASPACE_SCRGB_LINEAR`（`0x18410000`）。Android scRGB 使用 BT.709 primaries，`1.0 = 80 nit`，不会输出 PQ 或 HDR10 static metadata。
 - Extended-linear 只有在显式请求 `ExtendedLinear`、显示器/surface 支持 HDR、使用 Flutter Hybrid Composition 承载 `SurfaceView`、wgpu 后端为 Vulkan、surface 支持 `Rgba16Float`，且 `SCRGB_LINEAR` dataspace 回读成功时才会激活。任一条件缺失都会立即选择正常 SDR surface，并记录稳定的 `0..8` fallback reason；因此 GLES 与 `TextureView` 都是 SDR 路径。
-- API 34+ 上，Android 宿主通过 `Display.registerHdrSdrRatioChangedListener` 观察显示器，并把真实变化经 `erika_presenter_set_output_headroom` 发布给 Erika。wgpu 无需重新 attach surface，就会让后续帧使用更新后的有效内容 headroom，并同步可查询状态。ratio 可用时 `activeHeadroomKnown` 为 true；只有 known 标志或 ratio 确实变化时，`headroomUpdates` 才增长。
-- Flutter extended-linear player 未显式传 `edrHeadroom` 时，内容上限默认为 4x，同时给 `SurfaceView` 传 `0` 表示系统 auto desired headroom。显式数值会成为内容上限，并在 API 35 上作为 per-`SurfaceView` desired headroom；Erika 不修改全局 Window。
+- API 34+ 上，Android 宿主通过 `Display.registerHdrSdrRatioChangedListener` 观察显示器，并把真实变化经 `erika_presenter_set_output_headroom` 发布给 liberika。wgpu 无需重新 attach surface，就会让后续帧使用更新后的有效内容 headroom，并同步可查询状态。ratio 可用时 `activeHeadroomKnown` 为 true；只有 known 标志或 ratio 确实变化时，`headroomUpdates` 才增长。
+- Flutter extended-linear player 未显式传 `edrHeadroom` 时，内容上限默认为 4x，同时给 `SurfaceView` 传 `0` 表示系统 auto desired headroom。显式数值会成为内容上限，并在 API 35 上作为 per-`SurfaceView` desired headroom；liberika 不修改全局 Window。
 - 模拟器/非 HDR 设备覆盖已经验证明确的 SDR 回退分支；在完成 API 35 HDR 真机上的 `Rgba16Float + SCRGB_LINEAR` 验收前，不把 active extended-linear 路径描述为“已通过真机验证”。
 
 ### Render Pipeline
@@ -183,7 +183,7 @@ Windows 平台的原生渲染器（`renderer/d3d11.rs`）：
 `erika_capi` 提供两组 handle family：
 
 - **`ErikaHandle`**：播放器控制与事件轮询，渲染由宿主管理。
-- **`ErikaPresenterHandle`**：Erika 持有完整栈，宿主只需提供 surface 并调用 `render_tick`。
+- **`ErikaPresenterHandle`**：liberika 持有完整栈，宿主只需提供 surface 并调用 `render_tick`。
 
 覆盖范围包括：create/destroy、open/play/pause/stop/seek、轨道选择、字幕轨增删、弹幕轨管理（add/remove/enable/offset/config）、surface attach/detach/resize、事件轮询、音量、播放速率、神经亮度超分切换、超分诊断，以及 `erika_presenter_get_output_status` 返回的 13 字段输出状态快照。
 

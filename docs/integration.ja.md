@@ -1,11 +1,11 @@
-# ネイティブホストへの Erika 組み込み
+# ネイティブホストへの liberika 組み込み
 
-本ガイドは Erika を非 Flutter ホスト——C/C++/Swift アプリ、Win32 ウィンドウ、C FFI を
+本ガイドは liberika を非 Flutter ホスト——C/C++/Swift アプリ、Win32 ウィンドウ、C FFI を
 持つ任意のランタイム——に組み込む手順です。**presenter（プッシュ）モデル**を使います。
-Erika が decode・timing・audio・overlay・presentation を所有し、ホストは surface を提供して
+liberika が decode・timing・audio・overlay・presentation を所有し、ホストは surface を提供して
 フレームごとに `render_tick` を 1 回呼びます。
 
-前提：C ABI（[capi_reference.ja.md](capi_reference.ja.md)）とビルド済みの Erika ライブラリ
+前提：C ABI（[capi_reference.ja.md](capi_reference.ja.md)）とビルド済みの liberika ライブラリ
 （[building.ja.md](building.ja.md)）。Flutter では代わりに
 [`erika_flutter`](../packages/erika_flutter) プラグインを使い、
 [flutter_embedding.ja.md](flutter_embedding.ja.md) を参照してください。
@@ -20,7 +20,7 @@ Rust の `PresenterRuntime` を直接駆動します。以下の C ABI 呼び出
 ## 1. handle ファミリーを選ぶ
 
 自分で描画する理由がなければ `ErikaPresenterHandle` を使います。プルモデルの
-`ErikaHandle` は、独自コンポジタを持ち Erika の decode/timing/state だけが欲しいホスト
+`ErikaHandle` は、独自コンポジタを持ち liberika の decode/timing/state だけが欲しいホスト
 向けです。本ガイドの残りは presenter ベースです。
 
 presenter ファミリーは **macOS / iOS / tvOS / Windows / Android / OpenHarmony / Linux（実験的）** でコンパイルされます。
@@ -63,12 +63,12 @@ native luma sampling を維持し、`Inactive` status と fallback reason を明
 
 ## 4. surface を attach する
 
-Erika は所有する surface に直接描画します。幅・高さは**物理ピクセル**、`scale` は
+liberika は所有する surface に直接描画します。幅・高さは**物理ピクセル**、`scale` は
 DPI/backing 係数です。
 
 ### macOS / iOS / tvOS —— `CAMetalLayer`
 
-`CAMetalLayer` を作りサイズを設定し、そのポインタを Erika に渡します：
+`CAMetalLayer` を作りサイズを設定し、そのポインタを liberika に渡します：
 
 ```c
 // `layer` は CAMetalLayer*（例：NSView/UIView のホスト layer から）
@@ -183,7 +183,7 @@ Content-Length がない場合にも対応します。要求オフセットよ�
 
 surface の表示タイマー——`CADisplayLink`（iOS/tvOS）/ `CVDisplayLink` または `CADisplayLink`
 （macOS）/ Windows のフレームスケジューラ / Android `Choreographer`——から `render_tick` を駆動します。そのフレームの
-**プレゼンテーション時刻（秒）**を単調なホストクロックから渡します。Erika は vsync 量子化
+**プレゼンテーション時刻（秒）**を単調なホストクロックから渡します。liberika は vsync 量子化
 スケジューリングに使うので、差分ではなく絶対タイムスタンプを渡します。
 
 ```c
@@ -267,7 +267,7 @@ erika_presenter_detach_surface(p);   // 先に surface への描画を止める
 erika_presenter_destroy(p);          // 再生を止め、すべて解放
 ```
 
-ウィンドウ/layer を破棄する前に detach し、Erika が surface に触れるのを止めます。
+ウィンドウ/layer を破棄する前に detach し、liberika が surface に触れるのを止めます。
 `destroy` は `NULL` handle に対して安全です。
 
 ## 10. スレッドモデル
@@ -285,7 +285,7 @@ handle は**内部同期されません**。最もシンプルで正しい設計
 
 `erika.h` を include し、ライブラリをリンク（[building.ja.md](building.ja.md) 参照）すれば
 完了——ABI は素の C です。C++ ではデストラクタで `erika_presenter_destroy` を呼ぶ RAII 型に
-handle を包み、返された文字列 / `ErikaTrackInfo` レコードは対応する Erika の解放関数で解放
+handle を包み、返された文字列 / `ErikaTrackInfo` レコードは対応する liberika の解放関数で解放
 し、`delete` は使いません。
 
 ### Swift

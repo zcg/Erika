@@ -663,7 +663,7 @@ jobs:
             Each archive contains the library, `include/erika.h`, `LICENSE`
             (MPL-2.0), and `THIRD_PARTY_NOTICES.md`. `SHA256SUMS` in this
             release records the digest of every archive. See
-            [docs/capi_reference.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/docs/capi_reference.md)
-            and [docs/integration.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/docs/integration.md)
-            to integrate. Review [CHANGELOG.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/CHANGELOG.md)
+            [docs/capi_reference.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/capi_reference.md)
+            and [docs/integration.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/integration.md)
+            to integrate. Review [CHANGELOG.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/CHANGELOG.md)
             before upgrading, especially the compatibility notes.

@@ -1,4 +1,4 @@
-# Erika C ABI Reference
+# liberika C ABI Reference
 
 > Translations: [中文](capi_reference.zh.md) · [日本語](capi_reference.ja.md)
 
@@ -14,12 +14,12 @@ For the embedding walkthrough (surface attach, the render loop, teardown) see
 
 ## Two handle families
 
-Erika exposes two independent entry points. Pick one per integration.
+liberika exposes two independent entry points. Pick one per integration.
 
 | Handle | Model | Who renders | Use when |
 |--------|-------|-------------|----------|
 | `ErikaHandle` | **Pull** | The host | You own the render loop and pull decoded frames / drive your own compositor. |
-| `ErikaPresenterHandle` | **Push** | Erika | You give Erika a native surface and call `render_tick` once per display frame. Erika owns decode, timing, audio, overlays, and presentation. |
+| `ErikaPresenterHandle` | **Push** | liberika | You give liberika a native surface and call `render_tick` once per display frame. liberika owns decode, timing, audio, overlays, and presentation. |
 
 `ErikaPresenterHandle` is the recommended path and what the Flutter plugin and
 the native demos use. It is compiled on **macOS, iOS, tvOS, Windows, Android,
@@ -106,7 +106,7 @@ set. You can call across the boundary without C++ `noexcept`/SEH concerns.
 
 ### Error messages (thread-local)
 
-On any non-`Ok`/`NoEvent` result, Erika stores a human-readable message in a
+On any non-`Ok`/`NoEvent` result, liberika stores a human-readable message in a
 **thread-local** slot. Retrieve it with:
 
 ```c
@@ -121,7 +121,7 @@ clears it). `erika_last_error_message` returns a copy you own — free it with
 
 ### String ownership
 
-Any `char*` Erika hands back is heap-allocated and owned by the caller:
+Any `char*` liberika hands back is heap-allocated and owned by the caller:
 
 - Standalone strings (e.g. `erika_last_error_message`) → free with
   `erika_string_free`.
@@ -130,11 +130,11 @@ Any `char*` Erika hands back is heap-allocated and owned by the caller:
 - Strings embedded in `ErikaDanmakuTrackInfo` → free with
   `erika_danmaku_track_info_free(&track)`.
 
-Never `free()` these with libc; always use the matching Erika free function so
+Never `free()` these with libc; always use the matching liberika free function so
 allocation crosses the ABI on the same allocator.
 
 `const char*` arguments you pass in are borrowed for the duration of the call
-only; Erika copies what it needs. They must be NUL-terminated UTF-8.
+only; liberika copies what it needs. They must be NUL-terminated UTF-8.
 
 ### Counted-array idiom
 
@@ -205,7 +205,7 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 sets headers for HTTP(S) playback; `headers` is read only during the call and
 may be released after it returns. When `header_count` is nonzero, `headers`
 must not be `NULL`. Headers are used for HEAD, Range GET, and prefetch requests.
-Authentication information and cookies are not written to Erika logs. `seek`
+Authentication information and cookies are not written to liberika logs. `seek`
 takes microseconds.
 
 `erika_open_with_options` supersedes `erika_open_with_headers`: it takes an
@@ -303,7 +303,7 @@ capabilities and therefore cannot activate Android extended-linear output.
 
 ## `ErikaPresenterHandle` — push model
 
-Erika owns the full stack; the host supplies a surface and calls `render_tick`.
+liberika owns the full stack; the host supplies a surface and calls `render_tick`.
 **macOS / iOS / tvOS / Windows / Android / HarmonyOS.**
 
 ### Lifecycle and configuration
@@ -421,7 +421,7 @@ resolution-independent when overridden — a `font_size` of `48` lands on the sa
 pixels whatever `PlayResY` a script declares. Margins do not: libass leaves
 override margins in the script's own units, so on a container ASS track they
 scale with that script's `PlayResY`, while on plain-text subtitles (whose script
-Erika generates at the frame size) they are pixels.
+liberika generates at the frame size) they are pixels.
 
 `ErikaHttpHeader` is defined as:
 
@@ -547,7 +547,7 @@ parentheses):
 - `font_size` (`fontSize`, `size`, `s`), `opacity` (`alpha`, `a`), and `is_me`
   (`isMe`, `self`, `mine`): optional style and self-danmaku metadata.
 - `id`: an optional unsigned 64-bit integer or decimal string. When omitted,
-  Erika assigns the item's position in the complete input. The session creates
+  liberika assigns the item's position in the complete input. The session creates
   a separate internal layout identity, so hosts do not need to synthesize a
   business ID to keep tracks stable across planner windows.
 
@@ -586,7 +586,7 @@ function. Set `extended_linear` only after the display/surface HDR probe, set
 `direct_composition = true` only for the direct `SurfaceView`, and preserve any
 host probe failure in `fallback_reason`. `desired_headroom = 0` means system
 auto; a positive value is a surface ceiling and is suitable for API 35
-per-`SurfaceView` `setDesiredHdrHeadroom`. Erika still verifies Vulkan,
+per-`SurfaceView` `setDesiredHdrHeadroom`. liberika still verifies Vulkan,
 `Rgba16Float`, and `ADATASPACE_SCRGB_LINEAR` itself; failure of any condition
 falls back to SDR and remains queryable.
 
@@ -618,10 +618,10 @@ ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(ErikaPresente
 Windows only. When the presenter was attached through
 `attach_wgpu_surface_with_output_capabilities` with `direct_composition = true`
 (and the presenter plays with a transparent video alpha mode or an overlay
-blend), Erika creates a premultiplied-alpha composition swap chain for the
+blend), liberika creates a premultiplied-alpha composition swap chain for the
 target HWND. This getter returns it as an **AddRef'd `IUnknown*`**: the caller
 owns the returned COM reference and must `Release` it. Re-fetch it after
-decoder/device loss — Erika recreates the swap chain and exposes the new
+decoder/device loss — liberika recreates the swap chain and exposes the new
 object; the same pointer means nothing was rebuilt.
 
 ### Windows Flutter texture
@@ -679,7 +679,7 @@ char *erika_presenter_render_tick_json(ErikaPresenterHandle *, double time_secon
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 ```
 
-Every returned string is owned by Erika and must be released with
+Every returned string is owned by liberika and must be released with
 `erika_string_free`. `poll_event_json` returns `NULL` — not an envelope — when
 no event is pending, so a `NULL` return is the idle case, not an error.
 
@@ -824,7 +824,7 @@ snapshots from the same runtime state as `get_output_status`.
   `erika_subtitle_memory_font_info_free`.
 - **`ErikaDanmakuConfig`** — full danmaku layout/appearance config (font size,
   opacity, display area, scroll timing, collision/stacking flags, blocked modes,
-  shadow style). `font_size` is a NipaPlay/Flutter *logical* size; Erika
+  shadow style). `font_size` is a NipaPlay/Flutter *logical* size; liberika
   multiplies by the surface scale for glyph pixels.
 - **`ErikaDanmakuTrackInfo`** `{ id, enabled, offset_micros, item_count, char *name, char *source }` —
   free with `erika_danmaku_track_info_free`.

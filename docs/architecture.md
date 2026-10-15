@@ -1,8 +1,8 @@
-# Erika Architecture
+# liberika Architecture
 
 [中文](architecture.zh.md) | [English](architecture.md) | [日本語](architecture.ja.md)
 
-Erika is an embeddable Rust media playback library. Host applications call into
+liberika is an embeddable Rust media playback library. Host applications call into
 the engine through the Rust API, a C ABI (`erika_capi`), or Flutter bindings
 (`erika_flutter`). Video frames, subtitles, and danmaku stay inside the engine
 and are composited in the renderer — they do not flow through the host.
@@ -154,10 +154,10 @@ clock recovery does not replace independent audio delivery.
 - **Parsing**: SRT, WebVTT, ASS timeline parsing. Embedded and external subtitle
   tracks. External tracks can be added/removed at runtime.
 - **libass renderer**: Statically linked, enabled by default. Accepts ASS
-  scripts, calls `ass_render_frame`, imports alpha planes into Erika's overlay
+  scripts, calls `ass_render_frame`, imports alpha planes into liberika's overlay
   system. macOS uses the CoreText font provider and Windows DirectWrite; every
   other target runs without a system font provider (the vendored libass build
-  disables fontconfig), so Erika's bundled Droid Sans Fallback — registered as
+  disables fontconfig), so liberika's bundled Droid Sans Fallback — registered as
   an in-memory font on all platforms — is the family libass resolves by default.
 - **Subtitle style**: A custom font family and font file, colours, metrics
   (size, outline, shadow, blur, spacing, scale), attributes, border style,
@@ -292,7 +292,7 @@ Second renderer backend for portability:
 - A Flutter extended-linear player with no explicit `edrHeadroom` uses a 4x
   content ceiling while passing `0` to the `SurfaceView` as system-auto desired
   headroom. An explicit value becomes the content ceiling and, on API 35, the
-  per-`SurfaceView` desired headroom; Erika never changes the global window.
+  per-`SurfaceView` desired headroom; liberika never changes the global window.
 - Emulator/non-HDR coverage verifies the explicit SDR fallback path. Active
   `Rgba16Float + SCRGB_LINEAR` presentation still requires acceptance on an
   API 35 HDR device before it is described as device-validated.
@@ -332,7 +332,7 @@ The canonical header is `crates/erika_capi/include/erika.h`; package copies must
 `erika_capi` exposes two handle families:
 
 - **`ErikaHandle`** — player control and event polling. The host owns rendering.
-- **`ErikaPresenterHandle`** — Erika owns the full stack. The host provides a
+- **`ErikaPresenterHandle`** — liberika owns the full stack. The host provides a
   surface and calls `render_tick`.
 
 Covers: create/destroy, open/play/pause/stop/seek, track selection, subtitle

@@ -3776,6 +3776,11 @@ pub struct HttpRangeSource {
     cancellation: SourceCancellation,
     http_headers: Vec<(String, String)>,
     content_length: Option<u64>,
+    /// 是否已经完成过一次完整的长度探测（上游修复移植）：某些源用 chunked /
+    /// 连接关闭收尾，HEAD 与 0 字节 Range 探测都拿不到总长而返回 None；若不记住
+    /// 这次「已探测过且确实没有长度」，每次整片预载 / 诊断读 len() 都会重发 HEAD
+    /// + Range 探测（每片各一次）。只有探测成功才置位，探测出错仍可重试。
+    length_probed: bool,
     /// 诊断槽位：DASH 双流时 video=0 / audio=1，各源独立发布/清空诊断
     /// 快照互不覆盖（单流/直播默认 0）。
     diag_slot: usize,
@@ -5902,6 +5907,7 @@ impl HttpRangeSource {
             http_headers,
             content_length: None,
             diag_slot,
+            length_probed: false,
             cache_start: 0,
             cache_bytes: Vec::new(),
             back_bytes: http_back_bytes(diag_slot),
@@ -8565,17 +8571,30 @@ fn fetch_http_range(
                 // or a changed entity that ignored If-Range -- would otherwise
                 // be spliced onto the bytes already held and returned as
                 // silently corrupt media.
-                if let Some(start) = content_range.as_deref().and_then(parse_content_range_start)
-                    && start != resume_range.start
-                {
+                if let Some(start) = content_range.as_deref().and_then(parse_content_range_start) {
+                    if start != resume_range.start {
+                        http_trace_log(format!(
+                            "{{\"event\":\"{}_error\",\"phase\":\"content_range\",\"attempt\":{},\"start\":{},\"served_start\":{}}}",
+                            event, attempt, resume_range.start, start,
+                        ));
+                        return Err(SourceError::Http(format!(
+                            "server served range from {start}, expected {}",
+                            resume_range.start
+                        )));
+                    }
+                } else if resume_range.start > 0 {
+                    // A 206 without Content-Range cannot be position-verified,
+                    // and a spliced answer would be silent cache corruption;
+                    // only offset 0 is unambiguous, so lenient servers keep
+                    // working for whole-file requests.
                     http_trace_log(format!(
-                        "{{\"event\":\"{}_error\",\"phase\":\"content_range\",\"attempt\":{},\"start\":{},\"served_start\":{}}}",
-                        event, attempt, resume_range.start, start,
+                        "{{\"event\":\"{}_error\",\"phase\":\"content_range\",\"attempt\":{},\"start\":{},\"served_start\":null}}",
+                        event, attempt, resume_range.start,
                     ));
-                    return Err(SourceError::Http(format!(
-                        "server served range from {start}, expected {}",
-                        resume_range.start
-                    )));
+                    return Err(SourceError::Http(
+                        "server served 206 without Content-Range; cannot verify the resumed offset"
+                            .to_string(),
+                    ));
                 }
                 if total_length.is_none() {
                     total_length = content_range.as_deref().and_then(parse_content_range_total);
@@ -8821,6 +8840,12 @@ impl MediaSource for HttpRangeSource {
         if self.content_length.is_some() {
             return Ok(self.content_length);
         }
+        if self.length_probed {
+            // A finished probe already established that the origin reports no
+            // length (chunked / connection-close). Only transient probe errors
+            // stay retryable.
+            return Ok(None);
+        }
         let started = Instant::now();
         http_trace_log(format!(
             "[erika-http-trace] stage=head_request uri={} cache_start={} cache_end={} read_ahead={}",
@@ -8896,6 +8921,7 @@ impl MediaSource for HttpRangeSource {
                         {
                             Ok(total_length) => {
                                 self.content_length = total_length;
+                                self.length_probed = true;
                                 Ok(self.content_length)
                             }
                             Err(error) => Err(SourceError::Http(format!(
@@ -8904,6 +8930,7 @@ impl MediaSource for HttpRangeSource {
                         };
                     }
                     self.content_length = length;
+                    self.length_probed = true;
                     self.publish_diag();
                     http_trace_log(format!(
                         "[erika-http-trace] stage=head_response status={} length={} elapsed_ms={:.3}",
@@ -8947,6 +8974,7 @@ impl MediaSource for HttpRangeSource {
         match probe_http_total_length(&self.agent, &uri, &self.http_headers) {
             Ok(total_length) => {
                 self.content_length = total_length;
+                self.length_probed = true;
                 self.publish_diag();
                 Ok(self.content_length)
             }
@@ -10623,6 +10651,72 @@ mod tests {
         assert_eq!(source.read_range(ByteRange::suffix_from(0)).unwrap(), body);
         // The 206 Content-Range total satisfies len() without a HEAD request.
         assert_eq!(source.len().unwrap(), Some(4096));
+    }
+
+    #[test]
+    fn http_range_caps_bodies_that_overrun_the_requested_length() {
+        // Answers bytes 0-63/4096 to a bytes=0-7 request: the excess must be
+        // discarded instead of buffered, or a Range-ignoring origin (which
+        // sends the whole file for offset 0) would balloon the cache. The
+        // Local sequential-long-read design opens the connection with an
+        // unbounded `bytes=<start>-` request (see the design note at the top of
+        // this file), so only the truncation half of upstream's contract is
+        // asserted here.
+        let mut raw =
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-63/4096\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        raw.extend_from_slice(&[b'x'; 64]);
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(raw)]);
+        let mut source =
+            HttpRangeSource::with_http_headers_and_read_ahead(uri, Vec::new(), Some(8));
+        source.content_length = Some(4096);
+        let fetched = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(8),
+            })
+            .unwrap();
+        assert_eq!(fetched, vec![b'x'; 8]);
+        let head = recv_request_head(&requests);
+        assert!(head.contains("range: bytes=0-"), "unexpected range: {head}");
+    }
+
+    #[test]
+    fn http_range_rejects_206_without_content_range_on_a_resumed_offset() {
+        let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nConnection: close\r\n\r\n01234567"
+                .to_vec(),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(4096);
+        let error = source
+            .read_range(ByteRange {
+                start: 32,
+                length: Some(8),
+            })
+            .expect_err("a 206 without Content-Range cannot prove the served offset");
+        assert!(
+            matches!(&error, SourceError::Http(message) if message.contains("Content-Range")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn length_probe_caches_an_absent_content_length() {
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        assert_eq!(source.len().unwrap(), None);
+        assert_eq!(source.len().unwrap(), None);
+        assert!(
+            requests.try_recv().is_ok(),
+            "the first len() probes the origin"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "a finished probe must not re-issue HEAD for every piece"
+        );
     }
 
     #[test]

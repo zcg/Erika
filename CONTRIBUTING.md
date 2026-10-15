@@ -1,8 +1,8 @@
-# Contributing to Erika
+# Contributing to liberika
 
 > [中文](CONTRIBUTING.zh.md) | [日本語](CONTRIBUTING.ja.md)
 
-Erika is the in-house playback core for NipaPlay: a Rust engine that owns
+liberika is the in-house playback core for NipaPlay: a Rust engine that owns
 everything from demux/decode to GPU presentation, audio, subtitles, and danmaku,
 exposed to hosts through a C ABI and a Flutter plugin. This document is the
 orientation map for working on it.

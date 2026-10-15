@@ -1,7 +1,7 @@
 # erika
 
 Native ArkTS/HarmonyOS SDK powered by Erika. This package is independent of
-Flutter and exposes the Erika presenter through an ArkTS-friendly API.
+Flutter and exposes the liberika presenter through an ArkTS-friendly API.
 
 The first package target is OpenHarmony arm64. The package contains the native
 N-API bridge and the matching `liberika_capi.so` runtime. A host application

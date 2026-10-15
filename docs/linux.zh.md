@@ -1,6 +1,6 @@
 # Linux 原生接入（实验性）
 
-Linux 支持 Rust 播放器、C ABI 与 Flutter，使用系统 FFmpeg 8.x、Erika 补丁 libass、wgpu 和 PulseAudio。PipeWire 桌面需启用 `pipewire-pulse`；WSL2 使用 WSLg 的显示与音频服务。
+Linux 支持 Rust 播放器、C ABI 与 Flutter，使用系统 FFmpeg 8.x、liberika 补丁 libass、wgpu 和 PulseAudio。PipeWire 桌面需启用 `pipewire-pulse`；WSL2 使用 WSLg 的显示与音频服务。
 
 视频可通过 X11 / Wayland 窗口呈现；Flutter 可选 RGBA SDR 纹理或 Wayland 原生视频层。NVIDIA 使用 NVDEC，Intel/AMD 使用 VA-API，也可使用 FFmpeg 软件解码。Linux 当前从源码构建。
 
@@ -66,7 +66,7 @@ bash scripts/run_wsl_gpu.sh --x11
 ```
 
 该启动脚本将 `GALLIUM_DRIVER=d3d12`、`WGPU_BACKEND=gl` 和
-`ERIKA_REQUIRE_HARDWARE_GPU=1` 仅应用于 Erika 进程。多 GPU 机器可额外设置
+`ERIKA_REQUIRE_HARDWARE_GPU=1` 仅应用于 liberika 进程。多 GPU 机器可额外设置
 `MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA`（也可指定 AMD / Intel）。
 无需在 WSL 中安装 Linux NVIDIA 内核驱动；WSL 使用 Windows 驱动提供的 `/dev/dxg`。
 
@@ -82,7 +82,7 @@ WSL OpenGL 路径中 NVDEC/VA-API 解码后的帧经 `av_hwframe_transfer_data` 
 该路径是硬件解码，但不是零拷贝；统计中的 `hardwareVideoFrames` 与
 `cpuVideoFrameFallbacks` 会同时增加，`softwareVideoFrames` 不会因此增加。
 
-WSL D3D 运行库会在线程退出时执行 TLS 清理；Erika 保留其加载引用直到进程退出，
+WSL D3D 运行库会在线程退出时执行 TLS 清理；liberika 保留其加载引用直到进程退出，
 避免 EGL 销毁后清理函数指向已卸载的库。音频同步采用回调消费时钟，与其它 ring-buffer
 输出后端一致；WSLg/RDP 的额外设备延迟单独用于排空/倍速切换，不从此时钟扣除，
 避免超过引擎的音频预取窗口而反复缓冲。远端音频设备的实际延迟仍取决于 WSLg/RDP。
@@ -103,7 +103,7 @@ bash scripts/check_wsl_gpu.sh
 
 ## 硬件解码与显卡驱动
 
-| 显卡 | Erika 后端 | Linux 驱动要求 |
+| 显卡 | liberika 后端 | Linux 驱动要求 |
 |---|---|---|
 | NVIDIA | `cuda` / NVDEC | 支持该显卡的 NVIDIA 用户态驱动、`libcuda.so.1`、`libnvcuvid.so.1` |
 | Intel | `vaapi` | Intel media-driver (`iHD`)，旧显卡可使用 i965；可访问 `/dev/dri/renderD*` |
@@ -211,7 +211,7 @@ detach 在宿主窗口事件线程执行。每个 presenter 的调用应串行�
 ## 4. 依赖选择与许可
 
 - Linux 默认通过 pkg-config 动态链接系统 FFmpeg 8 与 PulseAudio。
-- libass 使用 Erika 补丁版本 0.17.5；系统 libass 缺少有序内存字体回退补丁，不能直接替代。
+- libass 使用 liberika 补丁版本 0.17.5；系统 libass 缺少有序内存字体回退补丁，不能直接替代。
   脚本将其安装到 `third_party/dist/<rust-host-triple>/system/libass`。
   `ERIKA_LIBASS_DIR` 可指定兼容的补丁构建前缀。
 - `ERIKA_FFMPEG_DIR` 可指定已有的静态 FFmpeg bundle。`ERIKA_USE_SYSTEM_LIBS=0`

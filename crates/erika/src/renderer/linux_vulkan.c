@@ -1,7 +1,7 @@
 // FFmpeg owns decoder-specific CUDA/VA-API interop. This bridge never maps
 // decoded pixels into host memory. VA-API images can be sampled directly;
 // the separate CUDA fallback uses device-local copies of NV12/P010 planes.
-// Erika continues to perform color conversion, tone mapping and composition.
+// liberika continues to perform color conversion, tone mapping and composition.
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/error.h>
