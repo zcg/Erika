@@ -1032,6 +1032,12 @@ pub trait MediaSource: Send {
     fn cancellation(&self) -> Option<SourceCancellation> {
         None
     }
+
+    /// 释放可放弃的预读缓冲，把内存还给宿主（播放中内存压力下由上层调用）。
+    ///
+    /// 契约与上游同名能力同义：只释放**可再取回**的数据 —— 后续 `read_range`
+    /// 仍必须从源重新读到同样的字节，位置语义不变。默认无操作。
+    fn release_buffer(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -8834,6 +8840,28 @@ impl MediaSource for HttpRangeSource {
     /// 不必等到段超时再退出（见 `SourceCancellation`）。
     fn cancellation(&self) -> Option<SourceCancellation> {
         Some(self.cancellation.clone())
+    }
+
+    /// 释放范围缓存窗口（对齐上游 `HttpRangeSource::release_buffer`：那边是
+    /// "杀 stripe 流 + 清缓存 + 重置读前沿"，本地可放弃的那一块就是范围窗口）。
+    ///
+    /// 安全性：`&mut self` 已排除并发读者；这里只清空窗口、不动 `cache_start`，
+    /// 于是 `cache_end()` 回落为 `cache_start`，后续任何 `read_range` 都落在
+    /// 窗口外并走正常重新拉取路径 —— 不会把旧字节按旧偏移算错。
+    /// 不触碰 `prefetch` 段：本地预取是按 range 段的独立线程，与上游持久
+    /// stripe 流不同构，杀它需要额外的生命周期处理，留待后续对齐。
+    fn release_buffer(&mut self) {
+        if self.cache_bytes.is_empty() {
+            return;
+        }
+        let released = self.cache_bytes.len();
+        self.cache_bytes = Vec::new();
+        self.cache_bytes.shrink_to_fit();
+        self.publish_diag();
+        http_trace_log(format!(
+            "{{\"event\":\"http_release_buffer\",\"cache_start\":{},\"released_bytes\":{}}}",
+            self.cache_start, released,
+        ));
     }
 
     fn len(&mut self) -> Result<Option<u64>> {

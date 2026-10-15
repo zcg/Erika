@@ -733,6 +733,28 @@ impl Demuxer {
         &self.probe
     }
 
+    /// 释放各输入底层源的预读缓冲（宿主内存压力 / 后台挂起由此进入，对齐上游
+    /// `Demuxer::release_source_buffer`）。
+    ///
+    /// 本地形态：`Demuxer` 是多输入（DASH 双流），因此逐个输入透传；`&mut self`
+    /// 保证此刻没有在途读者。
+    ///
+    /// 暂无调用者：本地 `AsyncDemuxer` 把 `Demuxer` move 进 demux 线程，Drop 时
+    /// 以「Stop + 有限超时 join」让整条所有权链析构（`FormatContext::drop` →
+    /// `avio.take()` → `CustomAvio` → `Box<dyn MediaSource>`），源缓冲已随之
+    /// 释放；上游需要显式调用，是因为它的外部字幕 demuxer 在 Drop 时仍被共享
+    /// 存活。此处保留该方法作为形态对齐与将来的内存压力入口，**不接线**：本地
+    /// `DemuxCommand` 是单向通道（无 reply），在 Drop 路径加阻塞命令与本地
+    /// 「Drop 不阻塞 UI」的设计冲突。
+    #[allow(dead_code)]
+    pub(crate) fn release_source_buffer(&mut self) {
+        for input in &mut self.inputs {
+            if let Some(avio) = &mut input.context.avio {
+                avio.source.release_buffer();
+            }
+        }
+    }
+
     pub fn selection(&self) -> &StreamSelection {
         &self.selection
     }
