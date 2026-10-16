@@ -17,7 +17,7 @@
 use std::time::Instant;
 
 use super::diag;
-use super::legacy::HttpLiveStreamSource;
+use super::live::HttpLiveStreamSource;
 use super::multi_host::{MultiHostSource, SourceFactory};
 use super::{
     ByteRange, HttpRangeObserved, HttpRangeSource, MediaSource, MediaSourceHint, Result,
@@ -98,7 +98,13 @@ impl DiagSource {
             prefetch_in_flight: obs.pending_stripes,
             downloaded_bytes: self.downloaded_bytes,
             est_bps: self.est_bps,
-            demux_cache_end: obs.stream_frontier,
+            // ⚠️ 宿主把它当**长流窗口终点**用（判"窗口是否已满"），而不是
+            // "顺序读交付前沿"：`stream_frontier` 在 seek 后会短暂归零，而
+            // `window` 已经跳到新位置 → 只发前沿会让宿主读到
+            // `cache_start > demux_cache_end` 的不自洽快照（宿主侧的窗口夹取
+            // 因此 panic，2026-10-16 实测整进程 abort）。
+            // 取两者较大者：恒 ≥ `cache_start`，语义回到"已交付到哪个绝对字节"。
+            demux_cache_end: obs.stream_frontier.max(end),
             // 整片缓存：窗口从 0 起且已覆盖总长。
             whole_file_cached: length.is_some_and(|total| total > 0 && start == 0 && end >= total),
             transient_wait: self.transient_wait,

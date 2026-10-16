@@ -2761,7 +2761,12 @@ fn d3d11va_pool_size(
         .map(|value| value.max(1))
         .unwrap_or_else(|| d3d11va_pool_floor(context, consumer_queue_frames));
     let legacy = d3d11va_pool_legacy_pool_size(d3d11va_context_codec_id(context));
-    by_budget.clamp(floor, legacy)
+    // ⚠️ `floor` 由消费端队列容量与片源参考帧数推导，**可能大于**旧固定池深
+    // （未知 codec 的 `legacy = 10`、而队列较大时 `floor` 可达 20+）。
+    // `i32::clamp` 在 `min > max` 时会直接 panic，而这里跑在解码线程上——
+    // 一旦触发就是整进程 abort（与 `f64::clamp` 那条同源）。上限至少抬到下界，
+    // 使夹取始终良定义：此时等价于"预算不足就退到下界"，与该函数的既定语义一致。
+    by_budget.clamp(floor, legacy.max(floor))
 }
 
 #[cfg(target_os = "windows")]
