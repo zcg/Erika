@@ -19,7 +19,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use super::{ByteRange, HOST_SWITCH_REQ, MediaSource, Result, SourceCancellation, SourceError};
+use super::diag::HOST_SWITCH_REQ;
+use super::{ByteRange, MediaSource, Result, SourceCancellation, SourceError};
 
 /// 死连判定：超过该时长没收到字节、且上层仍在调用 `read_range`，视为连接已死。
 const STALL_MS: u64 = 6_000;

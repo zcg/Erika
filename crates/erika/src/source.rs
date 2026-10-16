@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+mod diag;
 mod http;
 mod legacy;
 mod multi_host;
@@ -31,11 +32,11 @@ pub use multi_host::MultiHostSource;
 /// 上游同名类型不支持 `diag_slot`；能力还原到新内核后删除本别名。
 #[doc(hidden)]
 pub use legacy::HttpRangeSource as LocalHttpRangeSource;
-pub use legacy::{
-    HttpLiveStreamSource, SourceDiagSnapshot, source_diag_snapshot, source_diag_snapshot_slot,
-};
+pub use diag::{SourceDiagSnapshot, source_diag_snapshot, source_diag_snapshot_slot};
+pub use legacy::HttpLiveStreamSource;
+pub(crate) use diag::SOURCE_DIAG_SLOTS;
 pub(crate) use legacy::{
-    SOURCE_DIAG_SLOTS, source_from_uri_with_hint_and_headers_slot,
+    source_from_uri_with_hint_and_headers_slot,
     source_from_uri_with_hint_and_headers_slot_and_read_ahead,
 };
 
@@ -5230,26 +5231,4 @@ mod probe_tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 本地增强层：宿主驱动的主机切换请求（上游内核之上，删除时整块拿走即可）
-// ---------------------------------------------------------------------------
-
-use std::sync::atomic::AtomicU64;
-
-/// 宿主在下一个 HTTP 决策点强制换 host 的请求计数器（0 = 视频，1 = 音频）。
-///
-/// 宿主（bili-rs）判定当前 CDN 节点已经劣化时调用 [`request_host_switch`]，
-/// 源在下一个重连/预取决策点观察到计数变化后换节点，而不是等 TCP 自己超时。
-static HOST_SWITCH_REQ: [AtomicU64; SOURCE_DIAG_SLOTS] = [AtomicU64::new(0), AtomicU64::new(0)];
-
-/// 请求 `slot` 对应的源在下一个决策点切换 host。
-///
-/// 返回 `false` 表示 `slot` 越界（只有 0/1 两槽）。本函数只递增计数器，
-/// 不做任何 I/O，可在 UI 线程安全调用。
-pub fn request_host_switch(slot: usize) -> bool {
-    let Some(counter) = HOST_SWITCH_REQ.get(slot) else {
-        return false;
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
-    true
-}
+pub use diag::request_host_switch;
