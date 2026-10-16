@@ -142,11 +142,8 @@ impl HttpIo {
                 tokio::pin!(future);
                 tokio::select! {
                     biased;
-                    // `SourceError` has no dedicated cancellation variant yet; a
-                    // cancelled exchange is reported as a source read failure, which
-                    // is how every caller already treats an interrupted read.
                     _ = cancellation.cancelled() => {
-                        Err(SourceError::Http("source read cancelled".to_string()))
+                        Err(SourceError::Cancelled)
                     }
                     result = &mut future => result,
                 }
@@ -399,7 +396,10 @@ mod tests {
         });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         cancellation.cancel();
-        assert!(matches!(worker.join().unwrap(), Err(SourceError::Http(_))));
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(SourceError::Cancelled)
+        ));
         assert!(dropped_rx.try_recv().is_ok());
     }
 }

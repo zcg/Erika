@@ -20,55 +20,13 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use thiserror::Error;
-
 use super::HOST_SWITCH_REQ;
 use super::http::{self, BodyReader, SourceCancellation};
 use super::multi_host::{self, MultiHostSource};
+use super::{ByteRange, MediaSource, Result, SourceError};
 
 use crate::core::MediaSourceHint;
 use crate::trace;
-
-#[derive(Debug, Error)]
-pub enum SourceError {
-    #[error("io error: {0}")]
-    Io(String),
-    #[error("http error: {0}")]
-    Http(String),
-    /// **暂时性**读取失败：传输层断连/超时/body 读错误/5xx —— 源可能马上又能用。
-    ///
-    /// 与 [`SourceError::Http`] 的区别就是"该不该等"：调用方（
-    /// [`HttpRangeSource::read_range_with_transient_wait`]）会吸收本变体，
-    /// 退避重试并等待字节回来（mpv `paused-for-cache` 语义）；
-    /// 而 `Http` 是**终局**（4xx/签名过期、Range 被忽略、Content-Range 违约、
-    /// 帧内数据错位）——那些重试多少次都不会好，必须立刻让宿主换源。
-    ///
-    /// 分类由 `fetch_http_range` 产生：重试耗尽时按 `http_error_is_retryable`
-    /// （传输错误与 5xx = 可重试 → 本变体；4xx = 不可重试 → `Http`）判定。
-    #[error("transient http error: {0}")]
-    Transient(String),
-    #[error("unsupported source URI: {0}")]
-    Unsupported(String),
-    #[error("invalid owned file descriptor URI: {0}")]
-    InvalidFileDescriptorUri(String),
-}
-
-pub type Result<T> = std::result::Result<T, SourceError>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ByteRange {
-    pub start: u64,
-    pub length: Option<u64>,
-}
-
-impl ByteRange {
-    pub fn suffix_from(start: u64) -> Self {
-        Self {
-            start,
-            length: None,
-        }
-    }
-}
 
 /// 宿主可轮询的 `HttpRangeSource` 实时诊断快照（网络/缓冲状态）。
 ///
@@ -1008,41 +966,6 @@ pub fn source_diag_snapshot_slot(slot: usize) -> SourceDiagSnapshot {
         snap.http_request_bytes = profile.bytes.load(Ordering::Relaxed);
     }
     snap
-}
-
-pub trait MediaSource: Send {
-    fn uri(&self) -> &str;
-    fn len(&mut self) -> Result<Option<u64>>;
-    /// 是否支持任意位置随机读取（seek）。默认 `true`；直播流等不可 seek
-    /// 源返回 `false`，AVIO 据此清掉 `seekable` 位（flv demuxer 进入 live
-    /// 模式），且 `avformat` 内部的 seek 会被拒绝。
-    fn seekable(&self) -> bool {
-        true
-    }
-    fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>>;
-    /// 播放层在已知目标读取位置时给出预取提示（例如 seek 到缓存窗口外时
-    /// avformat 即将从该字节位置开始读）。默认无操作；`HttpRangeSource` 用它
-    /// 把目标窗口提前拉入后台多段预取，避免窗口外 seek 后 demux 线程同步阻塞
-    /// 在单个慢 HTTP 请求上。
-    fn prefetch_hint(&mut self, _target: u64) {}
-
-    /// 返回一个线程安全的取消句柄，用于中断阻塞中的源读取。
-    ///
-    /// 存在的理由（宿主拆除路径）：`ureq` 时代从外部中断在途请求是做不到的，关窗
-    /// 只能靠"2s 超时后 detach demux 线程"兜底，而 detach 出去的线程仍在读网络。
-    /// reqwest/Tokio 的原生能力是丢弃 future 即可中断 connect/TLS/headers/body，
-    /// 这条缝把它暴露给上层，让 join 不必依赖超时。
-    ///
-    /// 默认 `None`：本地文件、直播等源没有可取消的在途请求。
-    fn cancellation(&self) -> Option<SourceCancellation> {
-        None
-    }
-
-    /// 释放可放弃的预读缓冲，把内存还给宿主（播放中内存压力下由上层调用）。
-    ///
-    /// 契约与上游同名能力同义：只释放**可再取回**的数据 —— 后续 `read_range`
-    /// 仍必须从源重新读到同样的字节，位置语义不变。默认无操作。
-    fn release_buffer(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -9324,36 +9247,6 @@ fn trace_read_return(event: &str, range: ByteRange, src: &HttpRangeSource, bytes
     ));
 }
 
-pub fn source_from_uri(uri: &str) -> Result<Box<dyn MediaSource>> {
-    source_from_uri_with_hint(uri, MediaSourceHint::Auto)
-}
-
-/// Reads an entire URI through the same MediaSource abstraction used by FFmpeg.
-///
-/// This is intentionally synchronous for small sidecar assets such as danmaku or
-/// subtitle files. On Android it also establishes and completes the ownership
-/// transfer for `fd://` descriptors within the native call.
-pub fn read_uri_to_end(uri: &str) -> Result<Vec<u8>> {
-    let mut source = source_from_uri(uri)?;
-    source.read_range(ByteRange::suffix_from(0))
-}
-
-pub fn source_from_uri_with_hint(
-    uri: &str,
-    source_hint: MediaSourceHint,
-) -> Result<Box<dyn MediaSource>> {
-    source_from_uri_with_hint_and_headers(uri, source_hint, Vec::new(), Vec::new())
-}
-
-pub fn source_from_uri_with_hint_and_headers(
-    uri: &str,
-    source_hint: MediaSourceHint,
-    http_headers: Vec<(String, String)>,
-    candidates: Vec<(String, f64)>,
-) -> Result<Box<dyn MediaSource>> {
-    source_from_uri_with_hint_and_headers_slot(uri, source_hint, http_headers, 0, candidates)
-}
-
 /// 同 `source_from_uri_with_hint_and_headers`，但指定诊断槽位
 /// （DASH 双流：video=0 / audio=1，各源独立发布/清空诊断互不覆盖）。
 pub(crate) fn source_from_uri_with_hint_and_headers_slot(
@@ -9370,25 +9263,6 @@ pub(crate) fn source_from_uri_with_hint_and_headers_slot(
         diag_slot,
         candidates,
         None,
-    )
-}
-
-/// `http_read_ahead_bytes` only applies to HTTP(S) sources and overrides the
-/// per-request read-ahead window; `None` keeps the default resolution
-/// (env override, then the engine default).
-pub fn source_from_uri_with_options(
-    uri: &str,
-    source_hint: MediaSourceHint,
-    http_headers: Vec<(String, String)>,
-    http_read_ahead_bytes: Option<u64>,
-) -> Result<Box<dyn MediaSource>> {
-    source_from_uri_with_hint_and_headers_slot_and_read_ahead(
-        uri,
-        source_hint,
-        http_headers,
-        0,
-        Vec::new(),
-        http_read_ahead_bytes,
     )
 }
 
@@ -9964,7 +9838,7 @@ mod tests {
             b"cde"
         );
         assert_eq!(
-            read_uri_to_end(&format!("file://{}", path.display())).unwrap(),
+            crate::source::read_uri_to_end(&format!("file://{}", path.display())).unwrap(),
             b"abcdef"
         );
 
@@ -9973,7 +9847,7 @@ mod tests {
 
     #[test]
     fn source_from_uri_rejects_unknown_scheme() {
-        match source_from_uri("smb://example/video.mkv") {
+        match crate::source::source_from_uri("smb://example/video.mkv") {
             Ok(_) => panic!("unexpectedly accepted unsupported source"),
             Err(error) => assert!(matches!(error, SourceError::Unsupported(_))),
         }
@@ -9981,13 +9855,18 @@ mod tests {
 
     #[test]
     fn source_hint_controls_selection() {
-        let source =
-            source_from_uri_with_hint("https://example.invalid/video.mp4", MediaSourceHint::Http)
-                .unwrap();
+        let source = crate::source::source_from_uri_with_hint(
+            "https://example.invalid/video.mp4",
+            MediaSourceHint::Http,
+        )
+        .unwrap();
         assert_eq!(source.uri(), "https://example.invalid/video.mp4");
 
         assert!(matches!(
-            source_from_uri_with_hint("file:///tmp/video.mp4", MediaSourceHint::Http),
+            crate::source::source_from_uri_with_hint(
+                "file:///tmp/video.mp4",
+                MediaSourceHint::Http
+            ),
             Err(SourceError::Unsupported(_))
         ));
     }

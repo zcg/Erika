@@ -2,7 +2,7 @@
 //! 逐包对比（stream/size/pos/data 头）——第一个差异点即 HTTP 读取 bug 位置。
 
 use erika::ffmpeg::Demuxer;
-use erika::source::{ByteRange, HttpRangeSource, LocalFileSource, MediaSource};
+use erika::source::{ByteRange, LocalFileSource, LocalHttpRangeSource, MediaSource};
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.2 Safari/605.1.15";
 
@@ -69,9 +69,9 @@ fn compare_http_vs_local_packet_sequences() {
     ];
 
     // HTTP 双流
-    let http_video = HttpRangeSource::with_http_headers(video_url.clone(), headers.clone());
+    let http_video = LocalHttpRangeSource::with_http_headers(video_url.clone(), headers.clone());
     let http_audio =
-        HttpRangeSource::with_http_headers_and_diag_slot(audio_url, headers.clone(), 1);
+        LocalHttpRangeSource::with_http_headers_and_diag_slot(audio_url, headers.clone(), 1);
     let http_demux =
         Demuxer::open_video_audio(Box::new(http_video), Box::new(http_audio)).expect("http demux");
     let http_recs = collect(http_demux, 200);
@@ -81,7 +81,7 @@ fn compare_http_vs_local_packet_sequences() {
     // 定位"先读大块再读小块"的窗口状态 bug（本地文件对照）。
     let local_file =
         std::fs::read(std::env::temp_dir().join("cur_video_1MB.bin")).expect("read local file");
-    let mut http_seq = HttpRangeSource::with_http_headers(video_url, headers.clone());
+    let mut http_seq = LocalHttpRangeSource::with_http_headers(video_url, headers.clone());
     let first = http_seq
         .read_range(ByteRange {
             start: 0,

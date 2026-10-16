@@ -1,4 +1,4 @@
-//! 临时诊断测试：HTTP 双流（HttpRangeSource）+ Software 解码前 200 包，
+//! 临时诊断测试：HTTP 双流（LocalHttpRangeSource）+ Software 解码前 200 包，
 //! 并同时跑一个本地双流 demux（同序列）逐包对照——第一个差异包即 HTTP
 //! 读取 bug 的字节级证据（stream/size/pos/head）。
 //!
@@ -6,7 +6,7 @@
 //! 与 `%TEMP%\cur_audio_1MB.bin`（本地对照）。
 
 use erika::ffmpeg::{Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer};
-use erika::source::{ByteRange, HttpRangeSource, LocalFileSource, MediaSource};
+use erika::source::{ByteRange, LocalFileSource, LocalHttpRangeSource, MediaSource};
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.2 Safari/605.1.15";
 
@@ -82,9 +82,12 @@ fn decode_http_dash(disable_prefetch: bool) {
         ),
         ("User-Agent".to_string(), UA.to_string()),
     ];
-    let video_source = HttpRangeSource::with_http_headers(video_url.clone(), headers.clone());
-    let audio_source =
-        HttpRangeSource::with_http_headers_and_diag_slot(audio_url.clone(), headers.clone(), 1);
+    let video_source = LocalHttpRangeSource::with_http_headers(video_url.clone(), headers.clone());
+    let audio_source = LocalHttpRangeSource::with_http_headers_and_diag_slot(
+        audio_url.clone(),
+        headers.clone(),
+        1,
+    );
     let mut demuxer = Demuxer::open_video_audio(Box::new(video_source), Box::new(audio_source))
         .expect("open dual http");
 
@@ -98,7 +101,8 @@ fn decode_http_dash(disable_prefetch: bool) {
         move |url: String, name: &'static str| -> (std::path::PathBuf, Vec<u8>) {
             let path = temp.join(name);
             if !path.exists() {
-                let mut src = HttpRangeSource::with_http_headers(url, headers_for_fetch.clone());
+                let mut src =
+                    LocalHttpRangeSource::with_http_headers(url, headers_for_fetch.clone());
                 let data = src
                     .read_range(ByteRange {
                         start: 0,
