@@ -34,8 +34,6 @@ pub(crate) use diag::SOURCE_DIAG_SLOTS;
 pub use diag::{SourceDiagSnapshot, source_diag_snapshot, source_diag_snapshot_slot};
 /// 本地旧实现的 `HttpRangeSource`（待删）：集成测试用的诊断槽入口。
 /// 上游同名类型不支持 `diag_slot`；能力还原到新内核后删除本别名。
-#[doc(hidden)]
-pub use legacy::HttpRangeSource as LocalHttpRangeSource;
 pub use live::HttpLiveStreamSource;
 pub(crate) use vod::{
     source_from_uri_with_hint_and_headers_slot,
@@ -2583,6 +2581,154 @@ mod tests {
         .into_bytes();
         raw.extend_from_slice(body);
         raw
+    }
+
+    /// 数据驱动的本地 HTTP range 服务器：持有完整字节，按请求里的 Range
+    /// 头切出正确的 206 响应，并把每个请求头记进返回的日志。与
+    /// spawn_mock_http_server 的脚本式响应不同，它不要求调用方预先猜出
+    /// 请求次数与顺序——预取会开多少连接、跳读要哪个区间，都照答。
+    fn spawn_range_http_server(data: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let body = Arc::new(data);
+        let log = Arc::clone(&heads);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let body = Arc::clone(&body);
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || {
+                    let Ok(peek) = stream.try_clone() else { return };
+                    let mut reader = BufReader::new(peek);
+                    let mut head = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                    }
+                    log.lock().unwrap().push(head.clone());
+                    let total = body.len() as u64;
+                    let range = head.lines().find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("range: bytes=")
+                            .map(|spec| spec.trim().to_string())
+                    });
+                    let (start, end) = match range.as_deref() {
+                        Some(spec) => {
+                            let (first, last) = spec.split_once('-').unwrap_or((spec, ""));
+                            let start = first.trim().parse::<u64>().unwrap_or(0);
+                            let end = match last.trim() {
+                                "" => total.saturating_sub(1),
+                                value => value.parse::<u64>().unwrap_or(total - 1),
+                            };
+                            (start.min(total - 1), end.min(total - 1))
+                        }
+                        None => (0, total.saturating_sub(1)),
+                    };
+                    let end = end.max(start);
+                    let slice = &body[start as usize..=end as usize];
+                    let response = if head.starts_with("HEAD") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes()
+                    } else if range.is_some() {
+                        http_206_response(start, total, slice)
+                    } else {
+                        let mut raw = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes();
+                        raw.extend_from_slice(&body);
+                        raw
+                    };
+                    let _ = stream.write_all(&response);
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (uri, heads)
+    }
+
+    /// HTTP range 源必须与本地文件逐字节一致——包括 avformat 的真实读取
+    /// 模式：先整块读，再往前跳一小段，然后接着往下读，之后可能再回退。
+    /// 窗口状态机一旦在「大块 → 跳读 → 继续 → 回退」之间算错偏移，就会
+    /// 拿到错位字节而不报错，只在解码阶段表现为花屏或解码失败。
+    #[test]
+    fn http_range_reads_match_the_local_file_byte_for_byte() {
+        let mut seed = 0x1234_5678u32;
+        let data: Vec<u8> = (0..3 * 1024 * 1024)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let (uri, heads) = spawn_range_http_server(data.clone());
+        let mut source = HttpRangeSource::new(uri);
+
+        let head = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(256 * 1024),
+            })
+            .expect("read 0-256K");
+        assert_eq!(&head[..], &data[..256 * 1024], "整块读 0-256K 与本地不一致");
+
+        let probe_start = 262_932usize;
+        let jump = source
+            .read_range(ByteRange {
+                start: probe_start as u64,
+                length: Some(512),
+            })
+            .expect("read 262932");
+        assert_eq!(
+            &jump[..],
+            &data[probe_start..probe_start + 512],
+            "跳读 262932 处错位"
+        );
+
+        let tail_start = 512 * 1024usize;
+        let tail = source
+            .read_range(ByteRange {
+                start: tail_start as u64,
+                length: Some(128 * 1024),
+            })
+            .expect("read 512K+");
+        assert_eq!(
+            &tail[..],
+            &data[tail_start..tail_start + 128 * 1024],
+            "跳读之后继续读错位"
+        );
+
+        let back_start = 200_000usize;
+        let back = source
+            .read_range(ByteRange {
+                start: back_start as u64,
+                length: Some(64 * 1024),
+            })
+            .expect("read back 200000");
+        assert_eq!(
+            &back[..],
+            &data[back_start..back_start + 64 * 1024],
+            "回退读错位"
+        );
+
+        let tail_len = 4096usize;
+        let last = source
+            .read_range(ByteRange {
+                start: (data.len() - tail_len) as u64,
+                length: Some(tail_len as u64),
+            })
+            .expect("read tail");
+        assert_eq!(&last[..], &data[data.len() - tail_len..], "尾部读错位");
+
+        assert!(
+            !heads.lock().unwrap().is_empty(),
+            "本地 range 服务器至少应收到一次请求"
+        );
     }
 
     fn recv_request_head(requests: &mpsc::Receiver<String>) -> String {
