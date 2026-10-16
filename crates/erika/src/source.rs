@@ -9408,6 +9408,70 @@ pub fn source_from_uri_with_options(
     )
 }
 
+/// HTTP Range 源的内核装配：读窗口 + 候选 + 顺序长读 + 整片预载。
+fn build_http_range_source(
+    uri: &str,
+    http_headers: Vec<(String, String)>,
+    diag_slot: usize,
+    candidates: Vec<(String, f64)>,
+    http_read_ahead_bytes: Option<u64>,
+) -> Result<Box<dyn MediaSource>> {
+    let mut s = HttpRangeSource::with_http_headers_and_options(
+        uri,
+        http_headers,
+        diag_slot,
+        http_read_ahead_bytes,
+    );
+    s.set_candidates(candidates);
+    // 生产 VOD 路径：**顺序长读**（一条连接覆盖整段播放）+ 整片预载
+    // 桶（暂停后在同一条流式连接上补片）。两者的分工见
+    // `full_preload_stream_loop` 的注释：demux 活跃时桶不连，
+    // 任一时刻只有一个下载者。
+    Ok(Box::new(s.enable_sequential_stream().enable_full_preload()))
+}
+
+/// HTTP VOD 源的统一装配点：内核 + 多 host 换源包装层。
+///
+/// - 候选 < 2：直接返回内核，行为与包装层引入前完全一致（零额外间接
+///   调用），单源播放零风险。
+/// - 候选 >= 2：由 `MultiHostSource` 统一负责换源决策，内核自身的换源
+///   关闭（候选传空），避免两层各自换源互相干扰。当前 `uri` 以最高
+///   优先级置顶，保证首次打开仍走宿主指定的源。
+fn http_range_source_multi_host(
+    uri: &str,
+    http_headers: Vec<(String, String)>,
+    diag_slot: usize,
+    candidates: Vec<(String, f64)>,
+    http_read_ahead_bytes: Option<u64>,
+) -> Result<Box<dyn MediaSource>> {
+    if candidates.len() < 2 {
+        return build_http_range_source(
+            uri,
+            http_headers,
+            diag_slot,
+            candidates,
+            http_read_ahead_bytes,
+        );
+    }
+    let top = candidates
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut ordered = Vec::with_capacity(candidates.len() + 1);
+    ordered.push((uri.to_string(), top + 1.0));
+    ordered.extend(candidates);
+    let factory: multi_host::SourceFactory = Box::new(move |target: &str| {
+        build_http_range_source(
+            target,
+            http_headers.clone(),
+            diag_slot,
+            Vec::new(),
+            http_read_ahead_bytes,
+        )
+    });
+    MultiHostSource::new(factory, ordered, diag_slot)
+        .map(|source| Box::new(source) as Box<dyn MediaSource>)
+}
 /// 诊断槽位 + 多 host 候选 + per-request read-ahead 的完整工厂，其余入口均委托至此。
 pub(crate) fn source_from_uri_with_hint_and_headers_slot_and_read_ahead(
     uri: &str,
@@ -9428,18 +9492,13 @@ pub(crate) fn source_from_uri_with_hint_and_headers_slot_and_read_ahead(
         MediaSourceHint::LocalFile => source_from_local_uri(uri),
         MediaSourceHint::Http => {
             if uri.starts_with("http://") || uri.starts_with("https://") {
-                let mut s = HttpRangeSource::with_http_headers_and_options(
+                http_range_source_multi_host(
                     uri,
                     http_headers,
                     diag_slot,
+                    candidates,
                     http_read_ahead_bytes,
-                );
-                s.set_candidates(candidates);
-                // 生产 VOD 路径：**顺序长读**（一条连接覆盖整段播放）+ 整片预载
-                // 桶（暂停后在同一条流式连接上补片）。两者的分工见
-                // `full_preload_stream_loop` 的注释：demux 活跃时桶不连，
-                // 任一时刻只有一个下载者。
-                Ok(Box::new(s.enable_sequential_stream().enable_full_preload()))
+                )
             } else {
                 Err(SourceError::Unsupported(uri.to_string()))
             }
@@ -9474,14 +9533,13 @@ fn source_from_auto_uri_with_slot(
         return Ok(Box::new(LocalFileSource::open(path)?));
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        let mut s = HttpRangeSource::with_http_headers_and_options(
+        return http_range_source_multi_host(
             uri,
             http_headers,
             diag_slot,
+            candidates,
             http_read_ahead_bytes,
         );
-        s.set_candidates(candidates);
-        return Ok(Box::new(s.enable_sequential_stream().enable_full_preload()));
     }
     let path = Path::new(uri);
     if path.exists() {
