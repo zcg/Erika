@@ -225,7 +225,7 @@ fn runtime() -> &'static Runtime {
 ///
 /// Unlike [`HttpIo::run`] there is no cancellation token: callers on this path
 /// (bounded range reads, probes) are already bounded by
-/// [`HttpFetch::timeout`](super::HttpFetch), and the streaming reader has its own
+/// `HttpFetch::timeout`, and the streaming reader has its own
 /// [`BodyReader`] exit. Making cancellation reachable from host teardown is a
 /// separate step; this keeps the port mechanical.
 pub(super) fn block_on<T: Send + 'static>(
