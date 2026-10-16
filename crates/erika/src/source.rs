@@ -2730,6 +2730,214 @@ mod tests {
         );
     }
 
+    /// 生成一段可重复的伪随机字节，用于逐字节比对。
+    fn lcg_bytes(len: usize) -> Vec<u8> {
+        let mut seed = 0x1234_5678u32;
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// 从 `start` 起读满 `len` 字节；短读就继续读，模拟 demux 侧的真实读法。
+    fn read_exact_at(source: &mut HttpRangeSource, start: u64, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let offset = start + out.len() as u64;
+            let want = (len - out.len()) as u64;
+            let got = source
+                .read_range(ByteRange {
+                    start: offset,
+                    length: Some(want),
+                })
+                .expect("read_range");
+            if got.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&got);
+        }
+        out
+    }
+
+    fn get_request_count(log: &Arc<Mutex<Vec<String>>>) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("GET "))
+            .count()
+    }
+
+    /// 整段顺序播放应当由**一条开放式请求**覆盖：后台流线程发一次
+    /// `Range: bytes=anchor-`，此后一路跟随读指针推进窗口，而不是每读一段就
+    /// 重新发一次请求。这条命题直接决定 CDN 侧看到的请求数（也就是被限流的
+    /// 概率），是流内核最值得守住的契约。
+    #[test]
+    fn one_open_ended_request_covers_a_whole_sequential_playback() {
+        let total = 24 * 1024 * 1024usize;
+        let data = lcg_bytes(total);
+        let (uri, log) = spawn_range_http_server(data.clone());
+        let mut source = HttpRangeSource::new(uri);
+        let chunk = 256 * 1024usize;
+        let mut offset = 0usize;
+        while offset < total {
+            let n = chunk.min(total - offset);
+            let got = read_exact_at(&mut source, offset as u64, n);
+            assert_eq!(got.len(), n, "short read at {offset}");
+            assert_eq!(
+                &got[..],
+                &data[offset..offset + n],
+                "byte mismatch at {offset}"
+            );
+            offset += n;
+        }
+        let gets = get_request_count(&log);
+        assert!(
+            gets <= 3,
+            "the stream should cover the playback with one open-ended GET; saw {gets}:\n{}",
+            log.lock().unwrap().join("\n")
+        );
+    }
+
+    /// 读指针爬得很慢时，预取窗口必须停在预算内——否则一条快源会在几秒内把
+    /// 整个文件拉进内存。这里读 256 KiB 后放着不动，再检查缓存规模。
+    #[test]
+    fn the_prefetch_window_stays_bounded_while_the_reader_crawls() {
+        let total = 32 * 1024 * 1024usize;
+        let data = lcg_bytes(total);
+        let (uri, _log) = spawn_range_http_server(data.clone());
+        let mut source = HttpRangeSource::new(uri);
+        let head = read_exact_at(&mut source, 0, 256 * 1024);
+        assert_eq!(&head[..], &data[..256 * 1024]);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let observed = source.observed_state();
+        let buffered = observed.window.1.saturating_sub(observed.window.0);
+        let budget = HttpRangeSource::DEFAULT_READ_AHEAD_BYTES
+            + HTTP_CACHE_RETAIN_BYTES
+            + HTTP_CACHE_TRIM_SLACK
+            + HTTP_REQUEST_MAX_BYTES;
+        assert!(
+            buffered <= budget,
+            "cache grew to {buffered} bytes, past the {budget}-byte budget (window {:?})",
+            observed.window
+        );
+    }
+
+    /// 回退到已经读过的位置（回退缓冲区内）应当零请求：mpv/VLC 的回退语义，
+    /// 也是用户拖回去重看几秒时不产生流量尖峰的前提。
+    #[test]
+    fn a_rewind_inside_the_back_buffer_costs_no_request() {
+        let total = 16 * 1024 * 1024usize;
+        let data = lcg_bytes(total);
+        let (uri, log) = spawn_range_http_server(data.clone());
+        let mut source = HttpRangeSource::new(uri);
+        let played = read_exact_at(&mut source, 0, 8 * 1024 * 1024);
+        assert_eq!(&played[..], &data[..8 * 1024 * 1024]);
+        let before = get_request_count(&log);
+        let rewind_at = 1024 * 1024usize;
+        let got = read_exact_at(&mut source, rewind_at as u64, 128 * 1024);
+        assert_eq!(&got[..], &data[rewind_at..rewind_at + 128 * 1024]);
+        let after = get_request_count(&log);
+        assert_eq!(
+            before, after,
+            "a rewind inside the retained tail must be served from cache; requests went {before} -> {after}"
+        );
+    }
+
+    /// 模拟「CDN 每传 N 字节就掐断连接」的源：声明完整的 `Content-Range` 与
+    /// `Content-Length`，但只写 `cut_bytes` 字节就关连接。
+    fn spawn_truncating_http_server(
+        data: Vec<u8>,
+        cut_bytes: usize,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let body = Arc::new(data);
+        let log = Arc::clone(&heads);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let body = Arc::clone(&body);
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || {
+                    let Ok(peek) = stream.try_clone() else { return };
+                    let mut reader = BufReader::new(peek);
+                    let mut head = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                    }
+                    log.lock().unwrap().push(head.clone());
+                    let total = body.len() as u64;
+                    let start = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("range: bytes=")
+                                .map(|spec| spec.trim().to_string())
+                        })
+                        .and_then(|spec| {
+                            spec.split_once('-')
+                                .map(|(first, _)| first.trim().to_string())
+                        })
+                        .and_then(|first| first.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        .min(total.saturating_sub(1));
+                    let response = if head.starts_with("HEAD") {
+                        format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes()
+                    } else {
+                        let remaining = (total - start) as usize;
+                        let end = total.saturating_sub(1);
+                        let mut raw = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {remaining}\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes();
+                        let send = cut_bytes.min(remaining);
+                        raw.extend_from_slice(&body[start as usize..start as usize + send]);
+                        raw
+                    };
+                    let _ = stream.write_all(&response);
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (uri, heads)
+    }
+
+    /// CDN 每传 1 MiB 就掐断连接是这类源的家常便饭。内核必须在「有进展」的前提
+    /// 下一直续传（`HTTP_STREAM_MAX_RESUMES` 的注释声称任何进展都会重置计数），
+    /// 否则真实网络上一集番剧会中途断掉，而这正是用户最不能接受的失败形态。
+    #[test]
+    fn a_cdn_that_cuts_every_megabyte_is_resumed_transparently() {
+        let total = 6 * 1024 * 1024usize;
+        let data = lcg_bytes(total);
+        let (uri, log) = spawn_truncating_http_server(data.clone(), 1024 * 1024);
+        let mut source = HttpRangeSource::new(uri);
+        let got = read_exact_at(&mut source, 0, total);
+        assert_eq!(
+            got.len(),
+            total,
+            "the source must deliver the whole file across cuts"
+        );
+        assert_eq!(
+            &got[..],
+            &data[..],
+            "bytes must survive the resume boundaries"
+        );
+        let gets = get_request_count(&log);
+        assert!(
+            gets > 1,
+            "the test server must actually have cut the stream (saw {gets} GETs)"
+        );
+    }
     fn recv_request_head(requests: &mpsc::Receiver<String>) -> String {
         requests
             .recv_timeout(Duration::from_secs(5))
