@@ -403,7 +403,8 @@ pub(super) static SOURCE_HTTP_REQUEST_BYTES: [AtomicU64; SOURCE_DIAG_SLOTS] =
 /// 真的在读 socket）的时间片上采样，因此不会被"客户端故意不读"的背压钳成
 /// 消费速率。由顺序长读线程直接写、宿主的 500ms poll 直接读——不经过 demux
 /// 线程，所以 demux 阻塞在长 join 上时宿主照样能读到新鲜值。
-pub(super) static SOURCE_FILL_BPS: [AtomicU64; SOURCE_DIAG_SLOTS] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(super) static SOURCE_FILL_BPS: [AtomicU64; SOURCE_DIAG_SLOTS] =
+    [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// 发布填窗期吞吐到全局槽（宿主 poll 读它）。
 pub(super) fn store_fill_bps(slot: usize, bps: f64) {
@@ -484,7 +485,8 @@ pub(super) struct BandwidthSample {
 
 /// 每槽位上一窗口的采样点。宿主 poll 与 `publish_diag` 共用——先到者触发结算，
 /// 后到者读到缓存值（窗口未满时复用），保证「同一窗口内多次读取得到同一值」。
-pub(super) static SOURCE_BW: Mutex<[Option<BandwidthSample>; SOURCE_DIAG_SLOTS]> = Mutex::new([None, None]);
+pub(super) static SOURCE_BW: Mutex<[Option<BandwidthSample>; SOURCE_DIAG_SLOTS]> =
+    Mutex::new([None, None]);
 
 pub(super) const BANDWIDTH_ESTIMATE_WINDOW: Duration = Duration::from_secs(2);
 
@@ -596,7 +598,8 @@ pub fn source_diag_snapshot_slot(slot: usize) -> SourceDiagSnapshot {
 ///
 /// 宿主判定当前 CDN 节点已经劣化时调用 [`request_host_switch`]，源在下一个
 /// 重连/预取决策点观察到计数变化后换节点，而不是等 TCP 自己超时。
-pub(super) static HOST_SWITCH_REQ: [AtomicU64; SOURCE_DIAG_SLOTS] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(super) static HOST_SWITCH_REQ: [AtomicU64; SOURCE_DIAG_SLOTS] =
+    [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// 请求 `slot` 对应的源在下一个决策点切换 host。
 ///

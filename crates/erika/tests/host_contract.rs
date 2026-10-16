@@ -115,7 +115,10 @@ fn host_can_build_both_request_kinds() {
     assert_eq!(vod.video_candidates.len(), 2);
     assert_eq!(vod.audio_candidates.len(), 1);
     assert_eq!(vod.http_read_ahead_bytes, Some(8 << 20));
-    assert_eq!(vod.audio_uri.as_deref(), Some("https://example.invalid/audio.m4s"));
+    assert_eq!(
+        vod.audio_uri.as_deref(),
+        Some("https://example.invalid/audio.m4s")
+    );
     assert_eq!(vod.http_headers.len(), 1);
     assert_eq!(vod.source_hint, MediaSourceHint::Auto);
 

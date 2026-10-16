@@ -28,7 +28,6 @@ use super::{ByteRange, MediaSource, Result, SourceError};
 use crate::core::MediaSourceHint;
 use crate::trace;
 
-
 /// 音频优先缓冲协调器（2026-09-02）。
 ///
 /// 播放 DASH 双流时，音频体积小（即便 192K 也仅数十 MB），应优先把它整条

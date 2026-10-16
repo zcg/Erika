@@ -28,13 +28,13 @@ pub use multi_host::MultiHostSource;
 
 // 本地增强层（待删）：旧实现里的直播 FLV 源与诊断槽快照。
 // 上游内核不引用这些名字，删除成本见 target/http-parity-plan.md §11。
+pub(crate) use diag::SOURCE_DIAG_SLOTS;
+pub use diag::{SourceDiagSnapshot, source_diag_snapshot, source_diag_snapshot_slot};
+pub use legacy::HttpLiveStreamSource;
 /// 本地旧实现的 `HttpRangeSource`（待删）：集成测试用的诊断槽入口。
 /// 上游同名类型不支持 `diag_slot`；能力还原到新内核后删除本别名。
 #[doc(hidden)]
 pub use legacy::HttpRangeSource as LocalHttpRangeSource;
-pub use diag::{SourceDiagSnapshot, source_diag_snapshot, source_diag_snapshot_slot};
-pub use legacy::HttpLiveStreamSource;
-pub(crate) use diag::SOURCE_DIAG_SLOTS;
 pub(crate) use legacy::{
     source_from_uri_with_hint_and_headers_slot,
     source_from_uri_with_hint_and_headers_slot_and_read_ahead,
