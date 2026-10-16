@@ -84,7 +84,10 @@ const FIRST_CANDIDATE: usize = 0;
 /// 取出 URL 的主机名（诊断展示用）；解析不出时退回原串。
 fn host_of(uri: &str) -> String {
     let rest = uri.split("://").nth(1).unwrap_or(uri);
-    rest.split(['/', '?', '#']).next().unwrap_or(rest).to_string()
+    rest.split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest)
+        .to_string()
 }
 
 /// 多 host 包装层。见模块文档。

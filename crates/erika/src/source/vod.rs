@@ -40,6 +40,21 @@ struct DiagSource {
     downloaded_bytes: u64,
     transient_wait: bool,
 }
+/// 本层负责发布的字段集合；其余字段由内核/换源层各自发布，合写同一槽位。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct DiagPatch {
+    content_length: Option<u64>,
+    cache_start: u64,
+    cache_end: u64,
+    prefetch_in_flight: usize,
+    downloaded_bytes: u64,
+    est_bps: f64,
+    demux_cache_end: u64,
+    whole_file_cached: bool,
+    transient_wait: bool,
+    fill_throughput_bps: f64,
+}
+
 impl DiagSource {
     fn new(inner: Box<dyn MediaSource>, slot: usize) -> Self {
         Self {
@@ -53,11 +68,10 @@ impl DiagSource {
         }
     }
 
-    /// 发布缓存窗口、吞吐与在途预取深度（宿主 500ms 轮询读取）。
-    fn publish(&mut self) {
-        let Some(obs) = self.inner.observed() else {
-            return;
-        };
+    /// 计算本层负责发布的字段。**纯计算，不碰全局状态**——单测直接检验它，
+    /// 避免与其它用例争用进程级诊断槽。
+    fn compose(&mut self) -> Option<DiagPatch> {
+        let obs = self.inner.observed()?;
         let now = Instant::now();
         let dt = now.duration_since(self.last_sample).as_secs_f64();
         // 进度取「流式交付字节」与「缓存窗口末端」的较大者：非流式源只有后者在涨。
@@ -77,24 +91,37 @@ impl DiagSource {
 
         let (start, end) = obs.window;
         let length = obs.content_length;
-        let pending = obs.pending_stripes;
-        let frontier = obs.stream_frontier;
-        let bps = self.est_bps;
-        let downloaded = self.downloaded_bytes;
-        let waiting = self.transient_wait;
-        // 整片缓存：窗口从 0 起且已覆盖总长。
-        let whole = length.is_some_and(|total| total > 0 && start == 0 && end >= total);
+        Some(DiagPatch {
+            content_length: length,
+            cache_start: start,
+            cache_end: end,
+            prefetch_in_flight: obs.pending_stripes,
+            downloaded_bytes: self.downloaded_bytes,
+            est_bps: self.est_bps,
+            demux_cache_end: obs.stream_frontier,
+            // 整片缓存：窗口从 0 起且已覆盖总长。
+            whole_file_cached: length.is_some_and(|total| total > 0 && start == 0 && end >= total),
+            transient_wait: self.transient_wait,
+            fill_throughput_bps: self.est_bps,
+        })
+    }
+
+    /// 发布缓存窗口、吞吐与在途预取深度（宿主 500ms 轮询读取）。
+    fn publish(&mut self) {
+        let Some(patch) = self.compose() else {
+            return;
+        };
         diag::update_snapshot(self.slot, move |snap| {
-            snap.content_length = length;
-            snap.cache_start = start;
-            snap.cache_end = end;
-            snap.prefetch_in_flight = pending;
-            snap.downloaded_bytes = downloaded;
-            snap.est_bps = bps;
-            snap.demux_cache_end = frontier;
-            snap.whole_file_cached = whole;
-            snap.transient_wait = waiting;
-            snap.fill_throughput_bps = bps;
+            snap.content_length = patch.content_length;
+            snap.cache_start = patch.cache_start;
+            snap.cache_end = patch.cache_end;
+            snap.prefetch_in_flight = patch.prefetch_in_flight;
+            snap.downloaded_bytes = patch.downloaded_bytes;
+            snap.est_bps = patch.est_bps;
+            snap.demux_cache_end = patch.demux_cache_end;
+            snap.whole_file_cached = patch.whole_file_cached;
+            snap.transient_wait = patch.transient_wait;
+            snap.fill_throughput_bps = patch.fill_throughput_bps;
         });
     }
 }
@@ -173,9 +200,8 @@ fn build_multi_host(
         return build_kernel(uri, http_headers, read_ahead);
     }
     let ordered = ordered_candidates(uri, candidates);
-    let factory: SourceFactory = Box::new(move |target: &str| {
-        build_kernel(target, http_headers.clone(), read_ahead)
-    });
+    let factory: SourceFactory =
+        Box::new(move |target: &str| build_kernel(target, http_headers.clone(), read_ahead));
     Ok(Box::new(MultiHostSource::new(factory, ordered, diag_slot)?))
 }
 
@@ -232,4 +258,117 @@ pub(crate) fn source_from_uri_with_hint_and_headers_slot(
         candidates,
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 只回放预设状态的内层源，用来验证包装层的发布逻辑。
+    struct StubSource {
+        obs: HttpRangeObserved,
+        fail_transient: bool,
+    }
+
+    impl MediaSource for StubSource {
+        fn uri(&self) -> &str {
+            "stub://kernel"
+        }
+
+        fn len(&mut self) -> Result<Option<u64>> {
+            Ok(self.obs.content_length)
+        }
+
+        fn read_range(&mut self, _range: ByteRange) -> Result<Vec<u8>> {
+            if self.fail_transient {
+                return Err(SourceError::Transient("stub".to_string()));
+            }
+            Ok(vec![0u8; 16])
+        }
+
+        fn observed(&self) -> Option<HttpRangeObserved> {
+            Some(self.obs)
+        }
+    }
+
+    fn stub(obs: HttpRangeObserved, fail_transient: bool) -> Box<dyn MediaSource> {
+        Box::new(StubSource {
+            obs,
+            fail_transient,
+        })
+    }
+    #[test]
+    fn composes_kernel_window_into_host_facing_fields() {
+        let obs = HttpRangeObserved {
+            window: (1024, 1024 + 4096),
+            content_length: Some(1_234_567),
+            stream_frontier: 5120,
+            progress_bytes: 5120,
+            pending_stripes: 2,
+            streaming: true,
+            prefetch_failures: 0,
+        };
+        let mut source = DiagSource::new(stub(obs, false), 1);
+        let patch = source.compose().expect("observable kernel");
+
+        assert_eq!(patch.content_length, Some(1_234_567));
+        assert_eq!(patch.cache_start, 1024);
+        assert_eq!(patch.cache_end, 1024 + 4096);
+        assert_eq!(patch.prefetch_in_flight, 2);
+        assert_eq!(patch.demux_cache_end, 5120);
+        assert!(!patch.whole_file_cached);
+        assert!(!patch.transient_wait);
+    }
+
+    #[test]
+    fn a_transient_read_marks_the_waiting_flag() {
+        let mut source = DiagSource::new(stub(HttpRangeObserved::default(), true), 1);
+        assert!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(16),
+                })
+                .is_err()
+        );
+        assert!(source.compose().expect("observable kernel").transient_wait);
+    }
+
+    #[test]
+    fn a_window_covering_the_whole_media_reports_fully_cached() {
+        let obs = HttpRangeObserved {
+            window: (0, 2048),
+            content_length: Some(2048),
+            ..HttpRangeObserved::default()
+        };
+        let mut source = DiagSource::new(stub(obs, false), 1);
+        assert!(
+            source
+                .compose()
+                .expect("observable kernel")
+                .whole_file_cached
+        );
+    }
+
+    #[test]
+    fn a_kernel_without_observation_publishes_nothing() {
+        struct Opaque;
+
+        impl MediaSource for Opaque {
+            fn uri(&self) -> &str {
+                "opaque://kernel"
+            }
+
+            fn len(&mut self) -> Result<Option<u64>> {
+                Ok(None)
+            }
+
+            fn read_range(&mut self, _range: ByteRange) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 8])
+            }
+        }
+
+        let mut source = DiagSource::new(Box::new(Opaque), 0);
+        assert!(source.compose().is_none());
+    }
 }
