@@ -17,6 +17,9 @@ use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 mod http;
+mod multi_host;
+
+pub use multi_host::MultiHostSource;
 
 use http::BodyReader;
 pub use http::SourceCancellation;
