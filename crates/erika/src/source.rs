@@ -20,6 +20,7 @@ mod diag;
 mod http;
 mod legacy;
 mod multi_host;
+mod vod;
 
 use http::HttpIo;
 pub use http::SourceCancellation;
@@ -35,7 +36,7 @@ pub use legacy::HttpLiveStreamSource;
 /// 上游同名类型不支持 `diag_slot`；能力还原到新内核后删除本别名。
 #[doc(hidden)]
 pub use legacy::HttpRangeSource as LocalHttpRangeSource;
-pub(crate) use legacy::{
+pub(crate) use vod::{
     source_from_uri_with_hint_and_headers_slot,
     source_from_uri_with_hint_and_headers_slot_and_read_ahead,
 };
@@ -105,6 +106,13 @@ pub trait MediaSource: Send {
     /// 默认无操作。本地 `HttpRangeSource` 用它把目标窗口提前拉入后台
     /// 多段预取，避免 demux 线程同步阻塞在单个慢 HTTP 请求上。
     fn prefetch_hint(&mut self, _target: u64) {}
+
+    /// 本地增强：只读观察点，供诊断包装层轮询。
+    ///
+    /// 默认 `None`（不暴露状态）；上游 HTTP 内核实现它以便宿主诊断继续工作。
+    fn observed(&self) -> Option<HttpRangeObserved> {
+        None
+    }
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>>;
 
     /// Release expendable read-ahead storage while keeping later reads valid.
@@ -2257,6 +2265,10 @@ impl MediaSource for HttpRangeSource {
                 .min(tail.len())
         });
         Ok(tail[..copy_len].to_vec())
+    }
+    /// 本地增强：把内核内部状态只读暴露给诊断包装层。
+    fn observed(&self) -> Option<HttpRangeObserved> {
+        Some(self.observed_state())
     }
 }
 
@@ -5232,3 +5244,60 @@ mod probe_tests {
 }
 
 pub use diag::request_host_switch;
+
+// ---------------------------------------------------------------------------
+// 本地增强层：上游内核的只读观察点（宿主诊断需要；删除时整块拿走即可）
+// ---------------------------------------------------------------------------
+
+/// 上游 [`HttpRangeSource`] 的可观察状态（只读快照，不参与任何决策）。
+///
+/// 上游内核把缓存窗口、流式前沿、预取进度都放在私有字段里，宿主诊断却需要
+/// 它们（进度浮窗、换源判据、ABR 升画质）。这里只**读出**已有状态，不改变
+/// 内核的任何行为，因此对上游逻辑是纯增量。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HttpRangeObserved {
+    /// 缓存窗口 `[start, end)`：已缓冲的字节区间。
+    pub window: (u64, u64),
+    /// 已探测到的媒体总长；`None` 表示分块/连接关闭型源。
+    pub content_length: Option<u64>,
+    /// 流式下载前沿（`stream_frontier`）；非流式时为 0。
+    pub stream_frontier: u64,
+    /// 流式 worker 累计交付的字节数（单调递增，可差分得吞吐）。
+    pub progress_bytes: u64,
+    /// 尚未被读走的 stripe 数——即"在途预取"。
+    pub pending_stripes: usize,
+    /// 流式会话是否存活。
+    pub streaming: bool,
+    /// 内核自身记录的预取失败次数。
+    pub prefetch_failures: u32,
+}
+impl HttpRangeSource {
+    /// 本地增强：只读观察点，供诊断包装层轮询。
+    ///
+    /// 只做读取与一次短锁，不发起 I/O、不改变任何内核状态。
+    pub fn observed_state(&self) -> HttpRangeObserved {
+        let (progress_bytes, pending_stripes, streaming) = match self.streams.as_ref() {
+            Some(session) => {
+                let inner = session
+                    .shared
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (inner.progress_bytes, inner.pending.len(), !inner.stopped)
+            }
+            None => (0, 0, false),
+        };
+        HttpRangeObserved {
+            window: (
+                self.cache_start,
+                self.cache_start + self.cache_bytes.len() as u64,
+            ),
+            content_length: self.content_length,
+            stream_frontier: self.stream_frontier,
+            progress_bytes,
+            pending_stripes,
+            streaming,
+            prefetch_failures: self.prefetch_failures,
+        }
+    }
+}

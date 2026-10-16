@@ -560,6 +560,19 @@ pub(super) fn refresh_bandwidth(slot: usize, total_rx: u64) -> f64 {
     bps
 }
 
+/// 本地增强：**部分更新**某个槽位的快照。
+///
+/// 新架构下诊断有两个发布者——外层多 host 包装发布 `active_host` 等换源状态，
+/// 内层内核包装发布缓存窗口与吞吐。二者各写各的字段，所以需要「读-改-写」
+/// 而不是整体替换。
+pub(super) fn update_snapshot(slot: usize, f: impl FnOnce(&mut SourceDiagSnapshot)) {
+    let Ok(mut slots) = SOURCE_DIAG.lock() else {
+        return;
+    };
+    if let Some(snapshot) = slots.get_mut(slot) {
+        f(snapshot);
+    }
+}
 pub fn source_diag_snapshot() -> SourceDiagSnapshot {
     source_diag_snapshot_slot(0)
 }

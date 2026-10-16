@@ -81,6 +81,12 @@ struct Candidate {
 /// 当前活跃下标（0 = `candidates[0]`）。
 const FIRST_CANDIDATE: usize = 0;
 
+/// 取出 URL 的主机名（诊断展示用）；解析不出时退回原串。
+fn host_of(uri: &str) -> String {
+    let rest = uri.split("://").nth(1).unwrap_or(uri);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest).to_string()
+}
+
 /// 多 host 包装层。见模块文档。
 pub struct MultiHostSource {
     /// 内层源的构造函数（换源时用）。
@@ -354,6 +360,24 @@ impl MultiHostSource {
     }
 }
 
+impl MultiHostSource {
+    /// 本地增强：把换源状态写进宿主诊断槽（部分更新，不碰缓存窗口字段）。
+    fn publish_host_state(&self) {
+        let host = host_of(&self.active_uri);
+        let idx = self.active;
+        let count = self.candidates.len();
+        let epoch = self.host_epoch;
+        let reason = self.last_switch_reason.clone();
+        super::diag::update_snapshot(self.diag_slot, move |snap| {
+            snap.active_host = host;
+            snap.active_idx = idx;
+            snap.candidate_count = count;
+            snap.host_epoch = epoch;
+            snap.last_host_switch_reason = reason;
+        });
+    }
+}
+
 impl MediaSource for MultiHostSource {
     fn uri(&self) -> &str {
         &self.active_uri
@@ -371,6 +395,7 @@ impl MediaSource for MultiHostSource {
         self.last_read_call = Some(Instant::now());
         // 宿主下发的强制换源在这里消费（本方法独占 `&mut self`，无需额外加锁）。
         self.consume_host_request();
+        self.publish_host_state();
         // 死连救援：超过 STALL_MS 没拿到字节，而上层仍在读（demux 在等数据）——
         // 再等下去只是白等，直接换 host。不走 `switch_budget_exhausted`：那是给
         // 「慢但没死」的自发换源限流用的，硬故障必须每次都能救。
@@ -419,6 +444,11 @@ impl MediaSource for MultiHostSource {
 
     fn release_buffer(&mut self) {
         self.inner.release_buffer();
+    }
+
+    /// 本地增强：把内层内核的只读观察点透传给诊断包装层。
+    fn observed(&self) -> Option<super::HttpRangeObserved> {
+        self.inner.observed()
     }
 }
 
