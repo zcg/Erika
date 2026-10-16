@@ -18,7 +18,6 @@ use thiserror::Error;
 
 mod diag;
 mod http;
-mod legacy;
 mod live;
 mod multi_host;
 mod vod;
