@@ -591,18 +591,22 @@ pub fn source_diag_snapshot_slot(slot: usize) -> SourceDiagSnapshot {
     // 数/总长）由 demux 线程写，demux 阻塞期间不动是合理的；但供给速度必须实时
     // ——宿主 500ms 一次的策略 poll 正是靠这里拿到真值。若 demux 正卡在长 join
     // 上（慢网常态），没有这一步 est_bps 与 downloaded_bytes 会一起冻结。
-    let total = live_rx_bytes(slot);
-    snap.downloaded_bytes = total;
-    snap.est_bps = refresh_bandwidth(slot, total);
+    // `downloaded_bytes` / `est_bps` 由源在每次 `read_range` 时发布（见
+    // `vod::DiagSource`），这里**不再覆盖**：拉模型依赖的 `SOURCE_RX` 登记点
+    // 随旧内核一起消失，覆盖只会把源发布的值清零。
+    let _ = refresh_bandwidth(slot, live_rx_bytes(slot));
     // 填窗期吞吐：由顺序长读线程直接写全局槽（不经过 demux 线程），这里取最新值
     // ——宿主 500ms 轮询必须在 demux 卡住时也能读到新鲜链路吞吐（判升画质用）。
-    snap.fill_throughput_bps = load_fill_bps(slot);
+    // `fill_throughput_bps` 同样由源发布；`load_fill_bps` 当前无写入者，
+    // 覆盖会把它清成 0。
+    let _ = load_fill_bps(slot);
     // HTTP 请求画像同理由**读取时刻直接读**（不依赖 demux 线程发布）：这两个
     // 量是进程级单调计数，demux 卡在长 join 上时它照样在涨（预取线程/整片
     // 预载桶是独立线程），宿主 1s 差分拿到的就是真值。
+    // `http_requests` / `http_request_bytes` 由源发布（内核 `HttpIo` 计数），
+    // 这里同样不覆盖。
     if let Some(profile) = http_request_profile(slot) {
-        snap.http_requests = profile.requests.load(Ordering::Relaxed);
-        snap.http_request_bytes = profile.bytes.load(Ordering::Relaxed);
+        let _ = (&profile.requests, &profile.bytes);
     }
     snap
 }

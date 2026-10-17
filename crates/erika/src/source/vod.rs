@@ -53,6 +53,8 @@ struct DiagPatch {
     whole_file_cached: bool,
     transient_wait: bool,
     fill_throughput_bps: f64,
+    requests: u64,
+    request_bytes: u64,
 }
 
 impl DiagSource {
@@ -109,6 +111,8 @@ impl DiagSource {
             whole_file_cached: length.is_some_and(|total| total > 0 && start == 0 && end >= total),
             transient_wait: self.transient_wait,
             fill_throughput_bps: self.est_bps,
+            requests: obs.requests,
+            request_bytes: obs.request_bytes,
         })
     }
 
@@ -128,6 +132,8 @@ impl DiagSource {
             snap.whole_file_cached = patch.whole_file_cached;
             snap.transient_wait = patch.transient_wait;
             snap.fill_throughput_bps = patch.fill_throughput_bps;
+            snap.http_requests = patch.requests;
+            snap.http_request_bytes = patch.request_bytes;
         });
     }
 }
@@ -313,11 +319,15 @@ mod tests {
             pending_stripes: 2,
             streaming: true,
             prefetch_failures: 0,
+            requests: 7,
+            request_bytes: 8192,
         };
         let mut source = DiagSource::new(stub(obs, false), 1);
         let patch = source.compose().expect("observable kernel");
 
         assert_eq!(patch.content_length, Some(1_234_567));
+        assert_eq!(patch.requests, 7);
+        assert_eq!(patch.request_bytes, 8192);
         assert_eq!(patch.cache_start, 1024);
         assert_eq!(patch.cache_end, 1024 + 4096);
         assert_eq!(patch.prefetch_in_flight, 2);

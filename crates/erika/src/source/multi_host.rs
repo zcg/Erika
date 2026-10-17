@@ -351,14 +351,12 @@ impl MultiHostSource {
     fn attempt(&mut self, range: ByteRange) -> Result<Vec<u8>> {
         let started = Instant::now();
         let out = self.inner.read_range(range);
-        let took = started.elapsed();
         let healthy = matches!(&out, Ok(bytes) if !bytes.is_empty());
         if healthy {
             self.note_supply_ok();
         } else if matches!(&out, Err(SourceError::Transient(_))) {
             self.note_transient();
         }
-        let _ = took;
         out
     }
 }

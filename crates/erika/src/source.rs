@@ -632,6 +632,7 @@ impl HttpRangeSource {
 
     fn fetch_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
         self.check_entity()?;
+        self.agent.note_request();
         let response = fetch_http_range(
             &self.agent,
             &self.uri,
@@ -644,6 +645,7 @@ impl HttpRangeSource {
                 self.entity_changed.store(true, Ordering::Release);
             }
         })?;
+        self.agent.note_request_bytes(response.bytes.len() as u64);
         self.check_entity()?;
         if self.content_length.is_none() {
             self.content_length = response.total_length;
@@ -1117,6 +1119,7 @@ fn open_stream_response(
     if let Some(validator) = validator.as_deref() {
         request = request.header("If-Range", validator);
     }
+    io.note_request();
     let response = io.run(async move {
         tokio::time::timeout(HTTP_STREAM_RESPONSE_TIMEOUT, request.send())
             .await
@@ -2936,6 +2939,36 @@ mod tests {
         assert!(
             gets > 1,
             "the test server must actually have cut the stream (saw {gets} GETs)"
+        );
+    }
+
+    /// 宿主从诊断槽读到的「累计已下载字节」必须真的在涨。这条断言的是**宿主可见
+    /// 的那条链路**（快照读取时刻的刷新），而不是内核内部计数：宿主拿
+    /// `downloaded_bytes` 显示已缓冲量并差分出 `download_speed_bps`，`est_bps` 还
+    /// 直接喂 ABR 升档判据——两者恒为零时浮窗与画质决策会一起失真。
+    #[test]
+    fn the_host_facing_downloaded_bytes_actually_grows() {
+        let total = 4 * 1024 * 1024usize;
+        let data = lcg_bytes(total);
+        let (uri, _log) = spawn_range_http_server(data.clone());
+        let mut source = crate::source::source_from_uri_with_hint_and_headers_slot_and_read_ahead(
+            &uri,
+            crate::core::MediaSourceHint::Http,
+            Vec::new(),
+            0,
+            Vec::new(),
+            None,
+        )
+        .expect("build source");
+        let _ = source.read_range(ByteRange {
+            start: 0,
+            length: Some(512 * 1024),
+        });
+        let snap = crate::source::diag::source_diag_snapshot_slot(0);
+        assert!(
+            snap.downloaded_bytes > 0,
+            "host-facing downloaded_bytes must reflect received bytes, got {}",
+            snap.downloaded_bytes
         );
     }
     fn recv_request_head(requests: &mpsc::Receiver<String>) -> String {
@@ -5624,6 +5657,10 @@ pub struct HttpRangeObserved {
     pub streaming: bool,
     /// 内核自身记录的预取失败次数。
     pub prefetch_failures: u32,
+    /// 已发出的 HTTP Range 请求数（含重试与断点续传）。
+    pub requests: u64,
+    /// 这些请求在 body 读循环里实际到达的字节数。
+    pub request_bytes: u64,
 }
 impl HttpRangeSource {
     /// 本地增强：只读观察点，供诊断包装层轮询。
@@ -5652,6 +5689,8 @@ impl HttpRangeSource {
             pending_stripes,
             streaming,
             prefetch_failures: self.prefetch_failures,
+            requests: self.agent.requests(),
+            request_bytes: self.agent.request_bytes(),
         }
     }
 }

@@ -44,12 +44,6 @@ impl HttpFetch {
         self.with_timeout(self.client.get(uri))
     }
 
-    /// HEAD 探测专用（`len()` 走这条路，拿不到 Content-Length 时才回退到
-    /// 一字节 Range 请求，见 `probe_http_total_length`）。
-    pub(super) fn head(&self, uri: &str) -> reqwest::RequestBuilder {
-        self.with_timeout(self.client.head(uri))
-    }
-
     pub(super) fn with_timeout(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.timeout {
             Some(timeout) => request.timeout(timeout),

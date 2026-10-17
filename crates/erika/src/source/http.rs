@@ -7,6 +7,7 @@
 
 use std::future::Future;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -98,6 +99,11 @@ impl SourceCancellation {
 pub(super) struct HttpIo {
     pub(super) client: reqwest::Client,
     pub(super) cancellation: SourceCancellation,
+    /// 本槽已发出的 Range 请求数（`child()` 共享同一对计数器，
+    /// 因此流线程的续传请求与同步 fetch 记在同一口径里）。
+    requests: Arc<AtomicU64>,
+    /// 这些请求在 body 读循环里实际到达的字节数。
+    request_bytes: Arc<AtomicU64>,
 }
 
 #[allow(dead_code)]
@@ -106,6 +112,8 @@ impl HttpIo {
         Self {
             client: shared_client().clone(),
             cancellation: SourceCancellation::default(),
+            requests: Arc::new(AtomicU64::new(0)),
+            request_bytes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -113,6 +121,8 @@ impl HttpIo {
         Self {
             client: self.client.clone(),
             cancellation: self.cancellation.child(),
+            requests: Arc::clone(&self.requests),
+            request_bytes: Arc::clone(&self.request_bytes),
         }
     }
 
@@ -126,6 +136,24 @@ impl HttpIo {
 
     pub(super) fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    /// 记一次**真正发出**的请求（重试与断点续传各记 1）。
+    pub(super) fn note_request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记本次请求在 body 读循环里实际到达的字节。
+    pub(super) fn note_request_bytes(&self, n: u64) {
+        self.request_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(super) fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn request_bytes(&self) -> u64 {
+        self.request_bytes.load(Ordering::Relaxed)
     }
 
     pub(super) fn run<T: Send + 'static>(
