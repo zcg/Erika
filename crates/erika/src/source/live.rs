@@ -63,6 +63,11 @@ impl HttpFetch {
 #[derive(Debug)]
 pub(super) enum HttpExchangeFailure {
     /// 服务端明确回了失败状态码。
+    ///
+    /// 现状：直播取流改走上游实现后，状态码分支由上游自己判定，本变体暂无构造点。
+    /// 保留它是因为下面 `is_retryable` 的语义（5xx 可重试 / 4xx 确定性）是本地
+    /// 实测出来的口径，接线直播侧的重试链时需要它。
+    #[allow(dead_code)]
     Status(u16),
     /// 传输层失败（连接复位 / 超时 / DNS-TLS 抖动 / body 中断），没有状态码。
     Transport(String),
@@ -70,6 +75,10 @@ pub(super) enum HttpExchangeFailure {
 
 impl HttpExchangeFailure {
     /// 传输层错误与 5xx 是链路问题，源很可能马上又能用；4xx 是确定性的。
+    ///
+    /// 现状：与 [`Self::Status`] 同因，暂无调用者；直播侧重试若改回本模块分类，
+    /// 这里就是唯一判据——不要在上游路径上另写一套 `status >= 500`。
+    #[allow(dead_code)]
     pub(super) fn is_retryable(&self) -> bool {
         match self {
             Self::Status(status) => *status >= 500,

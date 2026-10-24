@@ -407,6 +407,11 @@ pub(super) static SOURCE_FILL_BPS: [AtomicU64; SOURCE_DIAG_SLOTS] =
     [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// 发布填窗期吞吐到全局槽（宿主 poll 读它）。
+///
+/// 现状（内核切到上游实现后）：`source/vod.rs` 的顺序长读已由上游 `HttpIo` 接管，
+/// 本函数**暂无调用者**。保留它是为了让本地增强层（`supply_estimate_bps` 与
+/// 宿主的 500ms 供给估计）仍有唯一写入入口——接线时直接调这里，不要再起一套 EMA。
+#[allow(dead_code)]
 pub(super) fn store_fill_bps(slot: usize, bps: f64) {
     if let Some(entry) = SOURCE_FILL_BPS.get(slot) {
         entry.store(bps.to_bits(), Ordering::Relaxed);
@@ -438,6 +443,11 @@ pub(super) fn load_fill_bps(slot: usize) -> f64 {
 /// 新鲜度：读线程在窗口未满时每 ≥500ms 发布一次（`FillMeter`），进入背压
 /// （窗口满）时把该填窗期结算掉然后**冻结**读数——窗口满期间读到的就是"上一次
 /// 真实填窗期测到的链路吞吐"，不会被"我们故意不读"稀释成 0。
+///
+/// 现状：`store_fill_bps` 随上游接管顺序长读而暂无调用者，于是本函数目前恒返回
+/// `None`（判定为"未知"）。这正是它设计上要求调用方处理的取值——调用方应回退到
+/// 保守的固定预算，而不是把"未知"当"充裕"。
+#[allow(dead_code)]
 pub(super) fn supply_estimate_bps(slot: usize) -> Option<f64> {
     let bps = load_fill_bps(slot);
     (bps.is_finite() && bps > 0.0).then_some(bps)
@@ -466,11 +476,20 @@ pub(super) fn http_request_profile(slot: usize) -> Option<HttpRequestProfile> {
 
 impl HttpRequestProfile {
     /// 记录一次**真正发出**的 GET（重试与断点续传各记 1）。
+    ///
+    /// 现状：请求计数已由上游 `HttpIo` 自己发布到源诊断快照（
+    /// `SourceDiagSnapshot::http_requests` / `http_request_bytes`），本方法暂无
+    /// 调用者。保留是为了让宿主级测试仍能指向自己的静态计数器做隔离断言
+    /// （见本结构体的文档），接线时从读取路径调用即可。
+    #[allow(dead_code)]
     pub(super) fn record_request(&self) {
         self.requests.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 记录本次请求在 body 分块读循环里实际到达的字节。
+    ///
+    /// 现状同 [`Self::record_request`]：暂无调用者，保留为唯一的字节记账入口。
+    #[allow(dead_code)]
     pub(super) fn record_bytes(&self, n: u64) {
         self.bytes.fetch_add(n, Ordering::Relaxed);
     }
@@ -581,7 +600,7 @@ pub fn source_diag_snapshot() -> SourceDiagSnapshot {
 /// 各源独立发布/清空，宿主据此分别显示两条流的缓冲状态。
 /// 槽位越界或无对应源时返回零值。
 pub fn source_diag_snapshot_slot(slot: usize) -> SourceDiagSnapshot {
-    let mut snap = SOURCE_DIAG
+    let snap = SOURCE_DIAG
         .lock()
         .unwrap()
         .get(slot)

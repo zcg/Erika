@@ -349,7 +349,6 @@ impl MultiHostSource {
 
     /// 读一次（含供给记账）。
     fn attempt(&mut self, range: ByteRange) -> Result<Vec<u8>> {
-        let started = Instant::now();
         let out = self.inner.read_range(range);
         let healthy = matches!(&out, Ok(bytes) if !bytes.is_empty());
         if healthy {
