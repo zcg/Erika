@@ -388,6 +388,14 @@ impl TrackInfo {
     }
 }
 
+/// A container chapter on the same zero-based timeline as playback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterInfo {
+    pub title: String,
+    pub start: Duration,
+    pub end: Option<Duration>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TrackSelection {
     pub video: Option<i64>,
@@ -1137,6 +1145,7 @@ struct PlayerInner {
     audio_output_epoch: u64,
     surface: Option<PlatformSurface>,
     tracks: Vec<TrackInfo>,
+    chapters: Vec<ChapterInfo>,
     track_selection: TrackSelection,
     subscribers: Vec<Sender<PlayerEvent>>,
     video_frame_sender: Option<Sender<PlayerVideoFrame>>,
@@ -1342,6 +1351,7 @@ impl Player {
                 audio_output_epoch: 1,
                 surface: None,
                 tracks: Vec::new(),
+                chapters: Vec::new(),
                 track_selection: TrackSelection::default(),
                 subscribers: Vec::new(),
                 video_frame_sender: None,
@@ -1381,7 +1391,8 @@ impl Player {
         self.inner.lock().expect("player mutex poisoned").state
     }
 
-    pub(crate) fn is_stopped_at_end(&self) -> bool {
+    /// Playback stopped because the media ended, as opposed to `stop()`.
+    pub fn is_stopped_at_end(&self) -> bool {
         let inner = self.inner.lock().expect("player mutex poisoned");
         inner.state == PlayerState::Stopped && inner.ended
     }
@@ -1592,6 +1603,7 @@ impl Player {
             // 页即排队的预载（timer100 → preload）被静默丢弃 → 缓存永远
             // 建不起来，用户点播放只能黑屏现下现播。
             inner.tracks = info.tracks.clone();
+            inner.chapters = info.chapters.clone();
             inner.track_selection = info.track_selection();
             generation
         };
@@ -1904,6 +1916,15 @@ impl Player {
             .track_selection
     }
 
+    /// Chapters read while opening the current media; empty when absent.
+    pub fn chapters(&self) -> Vec<ChapterInfo> {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .chapters
+            .clone()
+    }
+
     pub fn stop(&self) -> Result<()> {
         self.ensure_not_closed()?;
         let commands = self.playback_commands()?;
@@ -2194,6 +2215,7 @@ impl Player {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             inner.media = None;
             inner.tracks.clear();
+            inner.chapters.clear();
             inner.track_selection = TrackSelection::default();
             inner.duration = None;
             inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
@@ -2278,6 +2300,7 @@ impl Player {
     fn transition_to_opening(&self) {
         let previous = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.chapters.clear();
             // A racing Play may have cloned the old worker sender before this
             // Open took the lifecycle lock, then queued behind Shutdown. The
             // old worker is joined above, so invalidate that orphaned intent
@@ -5999,6 +6022,60 @@ mod tests {
             events.recv().unwrap(),
             PlayerEvent::StateChanged(PlayerState::Ready)
         );
+    }
+
+    #[test]
+    fn container_chapters_reach_player_and_clear_on_reopen_or_failure() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let chapter_file = root.join("chapters/chapters.mkv");
+        let player = Player::new(PlayerConfig::default());
+        // `open` 是异步的（引擎在后台线程建 demuxer 与解码器，见 `Player::open`
+        // 的文档）。章节信息在 open 成功后才回填，所以这里必须等内核真的进入
+        // `Ready` 再读 `chapters()`，否则读到的永远是上一次的（首次为 0 条）。
+        let events = player.subscribe();
+        let mut open_and_wait = |request: MediaRequest| {
+            player.open(request).unwrap();
+            while events.recv().unwrap() != PlayerEvent::StateChanged(PlayerState::Ready) {}
+        };
+        open_and_wait(MediaRequest::new(chapter_file.to_string_lossy()));
+        let chapters = player.chapters();
+        assert_eq!(chapters.len(), 6);
+        assert_eq!(
+            chapters[1],
+            ChapterInfo {
+                title: "OP".into(),
+                start: Duration::from_secs(10),
+                end: Some(Duration::from_secs(20)),
+            }
+        );
+        assert_eq!(chapters[4].title, "ED");
+        assert_eq!(chapters[4].end, Some(Duration::from_secs(50)));
+        // 切到没有章节的文件：上一部的章节必须在新的 open 成功后被清掉。
+        open_and_wait(MediaRequest::new(
+            root.join("playback/playback-fixture.mkv").to_string_lossy(),
+        ));
+        assert!(player.chapters().is_empty());
+        open_and_wait(MediaRequest::new(chapter_file.to_string_lossy()));
+        assert_eq!(player.chapters().len(), 6);
+        // 打开不存在的文件：`open` 只负责提交（异步语义），失败在后台以
+        // `Error` 事件报告，同时把上一部的章节清空——不能依赖提交期返回 Err。
+        player
+            .open(MediaRequest::new(
+                root.join("missing.mkv").to_string_lossy(),
+            ))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match events.recv_timeout(Duration::from_millis(200)) {
+                Ok(PlayerEvent::Error(_)) => break,
+                Ok(_) => {}
+                Err(_) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("expected an error event for a missing file: {error}"),
+            }
+        }
+        assert!(player.chapters().is_empty());
+        player.close().unwrap();
+        assert!(player.chapters().is_empty());
     }
 
     #[test]

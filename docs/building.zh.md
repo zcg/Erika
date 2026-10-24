@@ -1,5 +1,10 @@
 # 构建 liberika
 
+浏览器使用当前源码的 `cargo run -p xtask -- web build`，步骤见
+[Web 构建与部署指南](web.zh.md)。该入口一次构建 Rust 弹幕、libass 和 FFmpeg
+解封装器，产出完整 JS/WASM 包；音视频由 WebCodecs 解码。下文说明原生平台的
+依赖与构建流程。
+
 liberika 是一个 Rust workspace,它链接一组**静态构建的原生依赖**(FFmpeg、所有目标的
 dav1d AV1 软解回退,以及可选的 libass 字幕栈)。这些原生库不随仓库 vendoring——你用 `xtask` 编排器构建一次,它会把
 产物安置到 `third_party/dist/` 下,Rust crate 再链接那个目录。

@@ -57,6 +57,18 @@ Metal 实现，在包括 Android 在内、具备 compute 能力的 Vulkan/wgpu a
 wgpu 实现，Windows 上由 D3D11 compute 实现。无 compute 的后端（主要是 GLES 3.0）会保留原生
 luma sampling，并明确报告 `Inactive` 状态和回退原因。
 
+### 高清字幕与高清弹幕的默认值
+
+原生 presenter 默认开启高清字幕和高清弹幕，Web 后端也默认开启这两项。
+文本字幕和弹幕字形以双倍分辨率采样，显示大小、排版和视频分辨率保持不变。
+Rust 宿主可以分别使用 `PresenterRuntime::set_subtitle_supersampling(false)` 和
+`DanmakuLayoutConfig { supersampling: false, ..Default::default() }` 关闭，
+后者通过 `PresenterRuntime::set_danmaku_config` 应用。
+
+原生字幕保留现有性能保护：源画布任一边超过 2048 像素，或面积超过
+2048 × 1080 像素时保持原始采样；连续 60 次字幕渲染平均耗时超过 4 ms 时，
+当前媒体回退到原始采样。弹幕中大于 128 px 的字形也保持原始采样。
+
 ## 4. Attach 一个 surface
 
 liberika 直接渲染进你拥有的平台 surface。宽高单位是**物理像素**,`scale` 是 DPI/backing

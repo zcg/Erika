@@ -4,6 +4,12 @@
 
 liberika は埋め込み可能な Rust メディア再生ライブラリです。ホストアプリは Rust API、C ABI (`erika_capi`)、または Flutter バインディング (`erika_flutter`) から呼び出せます。動画フレーム、字幕、弾幕はすべてエンジン内部に留まり、レンダラー内で合成され、native surface は直接表示し、Flutter texture は host で合成します。
 
+ブラウザーは JavaScript / TypeScript `Player` から組み込みます。
+[Web バックエンド（英語）](web.md) は Rust 弾幕とパッチ済み libass を WASM で再利用し、
+FFmpeg がコンテナーと MKV 添付フォントを読み取ります。WebCodecs、Web Audio、
+WebGL2 がデコード、再生クロック、最終合成を担当し、Erika Web に組み込み済みです。
+以下の概要はネイティブランタイムを説明します。Worker の構成とライフサイクルは Web ガイドを参照してください。
+
 ## システム概要
 
 ```text

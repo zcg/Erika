@@ -137,7 +137,9 @@ DFM+ 的碰撞结果依赖文本宽高。如果测量和实际绘制使用不同
 
 liberika 的 render plan 不把整张弹幕文本当一张位图。它把每个字形缓存、打包进持久 glyph atlas，然后输出一批 `DanmakuGlyphInstance`。每个 instance 包含屏幕 rect、atlas tex_rect、正文颜色、描边颜色、阴影颜色和偏移。Metal/WGPU 只需要绑定 atlas 纹理并画 alpha mask quad。
 
-当前 atlas 有 fill alpha 和 outline alpha 两份 mask，用于先画阴影/描边，再画正文。atlas 带 version，renderer 以 version/尺寸/stride 判断是否复用 GPU 纹理，避免每帧无意义重传整张 atlas。
+当前 atlas 有 fill alpha 和 outline alpha 两份 mask，后者包含向外膨胀后的整个字形。atlas 带 version，renderer 以 version/尺寸/stride 判断是否复用 GPU 纹理，避免每帧无意义重传整张 atlas。
+
+Metal 将同一条弹幕划成互不重叠的竖条，每条只查询效果范围与它相交的邻近字形。fragment shader 先分别合并整条弹幕的正文、描边和阴影覆盖率，再按正文覆盖描边、描边覆盖阴影的顺序合成预乘颜色，最后只应用一次整条弹幕的不透明度。相邻字形共享这个合成过程，不同弹幕仍按原顺序叠加。这样半透明白字不会透出自身的黑描边，也不需要每条弹幕的离屏纹理或额外 render pass。SDR 保持输出编码空间的混合语义，EDR 保持已有线性光输出。GPU 像素回读测试覆盖两种输出、1×/2× 字形、透明度、描边、阴影、抗锯齿及移动中的重叠边界。
 
 ## Renderer 合成位置
 
@@ -168,3 +170,10 @@ API 层应该把 NipaPlay 弹幕系统的输入面暴露给播放器和 Flutter 
 渲染层应该继续保持 liberika 原生。DFM+ 输出的是“当前 media time 下每条弹幕在哪里、是什么样式”，不是 GPU 纹理或 Flutter 资源。liberika renderer 根据这个输出生成/复用 glyph atlas、quad instances，并在 Metal/WGPU 中和视频同帧合成。
 
 同步层必须保持现在的 generation + media_time 契约。seek、stop、close、track switch、config change 都使旧计划失效；每帧查询只看视频 timeline；弹幕不拥有独立 wall-clock timer。这个契约是解决“视频跳了但弹幕没跳”的根本。
+
+
+### 实时调整
+
+相同全局延迟是 no-op，透明度只更新 paint config，不重建时间线或字形。字号拖动先按当前 prepared 字号的比例缩放 glyph rect，复用完成布局时冻结的 atlas/UV，不读取后台正在追加的图集；顶部和底部弹幕保持水平居中，底部保持下边缘。120ms 无新输入时提交精确字号重排，持续输入最多等待 500ms；等待期间仍可刷新时间窗口。仅字号变化不提升时间线 generation，旧字号的异步结果可继续按最新字号预览；其他布局/字体变化、seek 仍用 generation 拒绝过期结果。全局延迟变化会清空布局并同步尚未提交的字号。
+
+描边颜色只对接近黑色（RGB 最大通道不超过 64/255）的原色选白色，其余选黑色；判断与不透明度无关，避免饱和红色/蓝色被亮度对比算法误判。

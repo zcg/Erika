@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // Browser C dependencies are built and packaged by `cargo run -p xtask -- web build`.
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        return;
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_PROFILE");
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_TARGET");
@@ -379,11 +383,7 @@ fn ffmpeg_dist_dir() -> PathBuf {
             .join(native_profile())
             .join("ffmpeg");
     }
-    let mut dist = workspace_root().join("third_party/dist");
-    if let Some(target) = inferred_native_target() {
-        dist = dist.join(target);
-    }
-    dist.join(native_profile()).join("ffmpeg")
+    native_dist_root().join(native_profile()).join("ffmpeg")
 }
 
 fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
@@ -397,11 +397,24 @@ fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
             .join(native_profile())
             .join(name);
     }
-    let mut dist = workspace_root().join("third_party/dist");
+    native_dist_root().join(native_profile()).join(name)
+}
+
+/// The dist directory `xtask deps build` filled for this target: the one
+/// named after the target triple when it was built (`--target
+/// aarch64-apple-darwin`), else the host build's.
+fn native_dist_root() -> PathBuf {
+    let dist = workspace_root().join("third_party/dist");
     if let Some(target) = inferred_native_target() {
-        dist = dist.join(target);
+        return dist.join(target);
     }
-    dist.join(native_profile()).join(name)
+    if let Ok(target) = env::var("TARGET") {
+        let built = dist.join(target);
+        if built.join(native_profile()).is_dir() {
+            return built;
+        }
+    }
+    dist
 }
 
 fn native_profile() -> String {

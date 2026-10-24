@@ -175,6 +175,9 @@ fn configure_bundled_ffmpeg() -> Vec<PathBuf> {
         println!("cargo:rustc-link-lib=framework=VideoToolbox");
         println!("cargo:rustc-link-lib=iconv");
         println!("cargo:rustc-link-lib=bz2");
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            link_macos_compiler_runtime();
+        }
     } else if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         for lib in [
             "bcrypt",
@@ -210,6 +213,42 @@ fn configure_bundled_ffmpeg() -> Vec<PathBuf> {
     }
 
     vec![include_dir]
+}
+
+/// FFmpeg's VideoToolbox availability checks call __isPlatformVersionAtLeast.
+/// Clang/Swift link compiler-rt automatically, but Rust's -nodefaultlibs does
+/// not. Carry this dependency with FFmpeg so standalone Rust hosts link too.
+fn link_macos_compiler_runtime() {
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+    let output = std::process::Command::new("xcrun")
+        .args([
+            "--sdk",
+            "macosx",
+            "clang",
+            "--print-file-name=libclang_rt.osx.a",
+        ])
+        .output()
+        .expect("locate the macOS Clang runtime with xcrun");
+    assert!(
+        output.status.success(),
+        "cannot locate the macOS Clang runtime: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("Clang runtime path is UTF-8")
+            .trim(),
+    );
+    assert!(
+        archive.is_file(),
+        "macOS Clang runtime not found: {}",
+        archive.display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        archive.parent().expect("Clang runtime directory").display()
+    );
+    println!("cargo:rustc-link-lib=static=clang_rt.osx");
 }
 
 fn generate_bindings(include_dirs: &[PathBuf]) {
@@ -519,11 +558,7 @@ fn ffmpeg_dist_dir() -> PathBuf {
             .join(native_profile())
             .join("ffmpeg");
     }
-    let mut dist = workspace_root().join("third_party/dist");
-    if let Some(target) = inferred_native_target() {
-        dist = dist.join(target);
-    }
-    dist.join(native_profile()).join("ffmpeg")
+    native_dist_root().join(native_profile()).join("ffmpeg")
 }
 
 fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
@@ -537,11 +572,24 @@ fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
             .join(native_profile())
             .join(name);
     }
-    let mut dist = workspace_root().join("third_party/dist");
+    native_dist_root().join(native_profile()).join(name)
+}
+
+/// The dist directory `xtask deps build` filled for this target: the one
+/// named after the target triple when it was built (`--target
+/// aarch64-apple-darwin`), else the host build's.
+fn native_dist_root() -> PathBuf {
+    let dist = workspace_root().join("third_party/dist");
     if let Some(target) = inferred_native_target() {
-        dist = dist.join(target);
+        return dist.join(target);
     }
-    dist.join(native_profile()).join(name)
+    if let Ok(target) = env::var("TARGET") {
+        let built = dist.join(target);
+        if built.join(native_profile()).is_dir() {
+            return built;
+        }
+    }
+    dist
 }
 
 fn native_profile() -> String {

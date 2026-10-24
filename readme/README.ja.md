@@ -15,6 +15,13 @@
 
 現在のリリースは **0.2.1** です。[ドキュメント一覧](../docs/README.md) からガイドを選べます。
 
+**MKV 内の ASS 字幕と添付フォントを使って、ブラウザーで直接再生できます。**
+現在のソースには [Web / WASM バックエンド](../docs/web.md) が含まれ、Erika Web に
+組み込み済みです。WebCodecs が映像・音声をデコードし、WASM の libass が字幕の
+フォント・配置・縁取り・エフェクトを描画します。Rust 弾幕と字幕は同じ再生クロックに
+従い、WebGL2 で合成されます。サイト独自の UI を維持したまま、サーバーは元ファイルを
+HTTP Range で配信でき、字幕の事前抽出や映像への焼き付けは不要です。
+
 ## 機能
 
 - VideoToolbox、D3D11VA、MediaCodec、AVCodec によるハードウェアデコードとソフトウェアフォールバック。Linux は実験的に NVDEC / VA-API に対応。
@@ -22,11 +29,13 @@
 - ローカルファイルと HTTP(S)、カスタムヘッダー、先読みとリワインドキャッシュ。
 - 音声マスタークロック、再生・一時停止・シーク・倍速、トラック切替と外部字幕。
 - Rust、C ABI、Flutter、SwiftPM、OpenHarmony ArkTS から組み込み可能。
+- ブラウザーの JavaScript / TypeScript 組み込み：MKV の分離、ASS 添付フォント、字幕・弾幕の統合合成と独立したスーパーサンプリング。
 
 ## 組み込み
 
 | ホスト | インストール / 入口 | ガイド |
 |---|---|---|
+| ブラウザー / JavaScript / TypeScript | 現在のソースで `cargo run -p xtask -- web build` | [Web 組み込み・配信（英語）](../docs/web.md) |
 | Flutter | `flutter pub add erika_flutter`（0.2.1） | [プラグイン](../packages/erika_flutter/README.ja.md) |
 | Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加、0.2.1 以降 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
@@ -36,6 +45,20 @@
 
 2026-10-02 時点の OHPM 公開版は 0.1.9、0.2.1 は審査に提出済みです。
 ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.2.1) にあります。
+
+### ブラウザー
+
+```sh
+# 先に Emscripten、wasm-bindgen などのビルド依存を準備します。
+cargo run -p xtask -- web build
+python3 scripts/serve_web.py
+```
+
+`http://127.0.0.1:18765` でサンプルを開けます。`target/web/` のランタイムを配信し、
+`Player.create({ canvas })` と `player.open(fileOrURL)` で独自の UI に組み込みます。
+Web 版は現在のソースからビルドでき、npm には未公開です。音声・映像コーデックは
+ブラウザーの WebCodecs 対応範囲に依存します。依存、サンプル、Erika への組み込みは
+[ブラウザーガイド（英語）](../docs/web.md) を参照してください。
 
 ### Flutter
 
@@ -84,9 +107,11 @@ player.play()?;
 | Android 8+ | MediaCodec / software | wgpu Vulkan / GLES | AAudio | 4 ABI バンドル、Flutter |
 | OpenHarmony API 18+ | AVCodec / software | wgpu | OHAudio | arm64 バンドル、Flutter、OHPM |
 | Linux（実験的） | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust、C ABI、Flutter ソースビルド |
+| ブラウザー | WebCodecs | WebGL2 / Canvas | Web Audio | 現在のソースから JS / WASM パッケージをビルド |
 
 サーフェスと HDR の対応は [プラットフォーム表](../docs/platform_matrix.zh.md) にまとめています。
-Web の再生バックエンドは未実装です。
+ブラウザー版は現在 SDR 出力で、Chrome で検証済みです。HTTPS または localhost、
+WebCodecs の映像・音声デコード、OffscreenCanvas、WebGL2、Web Audio が必要です。
 
 ## 開発
 
@@ -109,8 +134,9 @@ cargo build -p erika_capi
 | `crates/erika_ffmpeg_sys` | FFmpeg bindings |
 | `packages/erika_flutter` | Flutter プラグイン |
 | `packages/erika_ohos` | OpenHarmony ArkTS SDK |
-| `examples` | ネイティブ、Flutter、ArkTS サンプル |
-| `xtask` | ネイティブ依存のビルド |
+| `packages/erika_web` | ブラウザー Player、Worker、WebGL2 合成と TypeScript 型 |
+| `examples` | ネイティブ、Flutter、ArkTS、ブラウザープレイヤーのサンプル |
+| `xtask` | ネイティブ依存と Web パッケージのビルド |
 | `docs` | ガイドと設計。過去の調査・検証記録は `investigations/` |
 
 変更履歴は [CHANGELOG](../CHANGELOG.md) にあります。

@@ -2349,7 +2349,7 @@ fn source_from_auto_uri(
         return source_from_local_uri(uri);
     }
     if let Some(path) = uri.strip_prefix("file://") {
-        return Ok(Box::new(LocalFileSource::open(path)?));
+        return Ok(Box::new(LocalFileSource::open(file_uri_path(path))?));
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
         return Ok(Box::new(HttpRangeSource::with_http_headers_and_window(
@@ -2383,8 +2383,70 @@ fn source_from_local_uri(uri: &str) -> Result<Box<dyn MediaSource>> {
     Ok(Box::new(LocalFileSource::open(local_path_from_uri(uri))?))
 }
 
-fn local_path_from_uri(uri: &str) -> &str {
-    uri.strip_prefix("file://").unwrap_or(uri)
+fn local_path_from_uri(uri: &str) -> PathBuf {
+    match uri.strip_prefix("file://") {
+        Some(path) => file_uri_path(path),
+        None => PathBuf::from(uri),
+    }
+}
+
+/// The local path of a `file:` URI, given what follows `file://`. RFC 8089
+/// URIs are percent-encoded (`file:///Videos/%E5%BD%B1.mkv`), as hosts such
+/// as Bern and the system file pickers hand them over. liberika itself
+/// writes URIs around raw paths (`LocalFileSource::uri`), so a raw path that
+/// exists wins when its decoding does not.
+fn file_uri_path(path: &str) -> PathBuf {
+    // `file://localhost/abs/path` and `file://localhostC:\path` both occur:
+    // the POSIX form keeps a `/` after the authority, while a Windows host that
+    // simply prefixes `file://localhost` onto `Path::display()` gets the drive
+    // letter right after it. Accept both, otherwise the authority stays glued
+    // to the path and `PathBuf::from` sees an invalid name ("os error 123").
+    let path = path
+        .strip_prefix("localhost")
+        .filter(|rest| rest.starts_with('/') || rest.as_bytes().get(1) == Some(&b':'))
+        .unwrap_or(path);
+    let raw = PathBuf::from(path);
+    let decoded = percent_decoded_path(path);
+    if decoded != raw && !decoded.exists() && raw.exists() {
+        raw
+    } else {
+        decoded
+    }
+}
+
+/// `text` with each valid `%XX` escape replaced by its byte; anything else
+/// is kept as written.
+fn percent_decoded_path(text: &str) -> PathBuf {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(decoded))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
+    }
 }
 
 fn http_read_ahead_bytes() -> u64 {
@@ -3244,6 +3306,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_uris_are_percent_decoded_unless_the_raw_path_exists() {
+        let dir = std::env::temp_dir().join(format!("erika-file-uri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = dir.join("影 #1 100%.mkv");
+        std::fs::write(&named, b"named").unwrap();
+        let encoded = format!("file://{}/%E5%BD%B1%20%231%20100%25.mkv", dir.display());
+        assert_eq!(read_uri_to_end(&encoded).unwrap(), b"named");
+        let local = format!(
+            "file://localhost{}/%E5%BD%B1%20%231%20100%25.mkv",
+            dir.display()
+        );
+        assert_eq!(read_uri_to_end(&local).unwrap(), b"named");
+        // A raw path written into a URI keeps working, also when it
+        // contains what looks like an escape.
+        let literal = dir.join("a%20b.mkv");
+        std::fs::write(&literal, b"literal").unwrap();
+        assert_eq!(
+            read_uri_to_end(&format!("file://{}", literal.display())).unwrap(),
+            b"literal"
+        );
+        assert_eq!(percent_decoded_path("%zz%4"), PathBuf::from("%zz%4"));
+        assert_eq!(percent_decoded_path("%+1"), PathBuf::from("%+1"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

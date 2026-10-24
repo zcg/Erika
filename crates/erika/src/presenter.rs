@@ -87,6 +87,11 @@ const VIDEO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
 const MAX_VIDEO_DECODE_RESUME_ATTEMPTS: u32 = 5;
 const DANMAKU_PLAN_REQUEST_QUANTUM: Duration = Duration::from_millis(250);
 const DANMAKU_PREPARE_REFRESH_MARGIN: Duration = Duration::from_secs(4);
+// Geometry previews are immediate. Rasterize the final value after idle,
+// with a bounded wait so a long drag still refreshes its timeline window.
+const DANMAKU_FONT_SIZE_SETTLE: Duration = Duration::from_millis(120);
+const DANMAKU_FONT_SIZE_MAX_WAIT: Duration = Duration::from_millis(500);
+const DANMAKU_RESIZE_SETTLE: Duration = Duration::from_millis(100);
 const DANMAKU_PLAN_LOOKAHEAD: Duration = Duration::from_secs(8);
 const DANMAKU_PLAN_LOOKBACK_PADDING: Duration = Duration::from_secs(2);
 const DANMAKU_MOTION_TRACE_INTERVAL: Duration = Duration::from_millis(500);
@@ -432,6 +437,9 @@ fn danmaku_position_hash(plan: Option<&DanmakuRenderPlan>) -> Option<u64> {
     Some(hash)
 }
 
+mod subtitle_resolution;
+use subtitle_resolution::SubtitleResolution;
+
 pub struct PresenterRuntime {
     player: Player,
     renderer: Box<dyn RendererBackend>,
@@ -455,6 +463,8 @@ pub struct PresenterRuntime {
     current_danmaku: Option<DanmakuRenderPlan>,
     current_danmaku_prepared: Option<CurrentDanmakuPrepared>,
     danmaku_plan_replacement_pending: bool,
+    danmaku_resize_settle_at: Option<Instant>,
+    danmaku_font_size_update: Option<DanmakuFontSizeUpdate>,
     rejected_video_import_route: Option<RejectedVideoImportRoute>,
     /// Rolling scene-average luminance (HDR10 without DoVi L1), injected
     /// into each software frame's `scene_avg_nits` to drive the tone-map
@@ -491,6 +501,7 @@ pub struct PresenterRuntime {
     /// 设备丢失自愈后待恢复的播放状态（reopen 完成前延迟应用）
     pending_device_lost_restore: Option<DeviceLostRestore>,
     subtitle_font_scale: f64,
+    subtitle_resolution: SubtitleResolution,
     subtitle_style: SubtitleStyleConfig,
     subtitle_memory_fonts: SubtitleMemoryFonts,
     subtitles: SubtitleFrameState,
@@ -647,6 +658,26 @@ struct CurrentDanmakuPrepared {
     window_end: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DanmakuFontSizeUpdate {
+    settle_at: Instant,
+    deadline: Instant,
+}
+
+impl DanmakuFontSizeUpdate {
+    fn retarget(pending: &mut Option<Self>, now: Instant) {
+        let deadline = pending.map_or(now + DANMAKU_FONT_SIZE_MAX_WAIT, |p| p.deadline);
+        *pending = Some(Self {
+            settle_at: now + DANMAKU_FONT_SIZE_SETTLE,
+            deadline,
+        });
+    }
+
+    fn ready(self, now: Instant) -> bool {
+        now >= self.settle_at || now >= self.deadline
+    }
+}
+
 impl AsyncDanmakuPlanner {
     fn new(
         engine: DfmLayoutEngine,
@@ -703,7 +734,11 @@ impl AsyncDanmakuPlanner {
     fn set_paint_config(&mut self, config: DanmakuLayoutConfig) {
         let (lock, _) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.config = config;
+        state.config.opacity = config.opacity;
+        state.config.shadow_offset = config.shadow_offset;
+        state.config.shadow_style = config.shadow_style;
+        state.config.enabled = config.enabled;
+        // Do not leak a pending font-size preview into background preparation.
         // Do not wake or invalidate an in-flight layout for a renderer-only
         // change. The worker will adopt this revision before its next request.
         state.config_revision = state.config_revision.saturating_add(1);
@@ -950,6 +985,8 @@ impl PresenterRuntime {
             current_danmaku: None,
             current_danmaku_prepared: None,
             danmaku_plan_replacement_pending: false,
+            danmaku_resize_settle_at: None,
+            danmaku_font_size_update: None,
             rejected_video_import_route: None,
             scene_luma_smoother: LumaSmoother::new(),
             last_scene_luma_generation: 0,
@@ -968,6 +1005,7 @@ impl PresenterRuntime {
             recovering: false,
             pending_device_lost_restore: None,
             subtitle_font_scale: DEFAULT_SUBTITLE_FONT_SCALE,
+            subtitle_resolution: SubtitleResolution::default(),
             subtitle_style: SubtitleStyleConfig::default(),
             subtitle_memory_fonts: SubtitleMemoryFonts::default(),
             subtitles: SubtitleFrameState::default(),
@@ -1074,8 +1112,22 @@ impl PresenterRuntime {
             .current_danmaku_viewport
             .is_none_or(|current| danmaku_viewport_requires_relayout(current, next_viewport));
         if requires_relayout {
-            self.clear_current_danmaku_state();
+            // The menu animates this surface every display tick. Clearing the
+            // prepared layout here blanks comments until the async worker can
+            // catch up. Keep it moving, remap to the new surface, and prepare
+            // only after the animation settles (also when playback is paused).
+            self.danmaku_planner.invalidate_requests();
+            self.danmaku_plan_replacement_pending =
+                self.current_danmaku_prepared.is_some() || self.current_danmaku.is_some();
+            self.danmaku_resize_settle_at = self
+                .danmaku_plan_replacement_pending
+                .then(|| Instant::now() + DANMAKU_RESIZE_SETTLE);
         }
+        self.current_danmaku_viewport = Some(next_viewport);
+        if let Some(plan) = self.current_danmaku.as_mut() {
+            plan.retarget(next_viewport);
+        }
+        self.request_current_danmaku_plan_for_current_time();
         if self.danmaku_trace.enabled {
             let now = Instant::now();
             let periodic_sample_due = self
@@ -1104,6 +1156,7 @@ impl PresenterRuntime {
     }
 
     pub fn open(&mut self, media: MediaRequest) -> Result<()> {
+        self.subtitle_resolution.reset_budget();
         self.quiesce_frame_output("open")?;
         self.reset_video_decode_resume_state();
         self.reset_audio_output_with_committed_rate();
@@ -1299,6 +1352,14 @@ impl PresenterRuntime {
         self.subtitle_font_scale = scale;
         self.refresh_current_overlay();
         true
+    }
+
+    /// Rasterize text subtitles at 2x precision without resizing the video or
+    /// the displayed text. Enabled by default. Sustained subtitle CPU cost
+    /// falls back to native resolution; large canvases also stay at native resolution.
+    pub fn set_subtitle_supersampling(&mut self, enabled: bool) {
+        self.subtitle_resolution.set_enabled(enabled);
+        self.refresh_current_overlay();
     }
 
     /// Sets the fallback subtitle font. An empty family or path clears that
@@ -1550,6 +1611,9 @@ impl PresenterRuntime {
     }
 
     pub fn set_danmaku_global_offset(&mut self, offset_micros: i64) {
+        if self.danmaku_session.global_offset() == offset_micros {
+            return;
+        }
         self.danmaku_session.set_global_offset(offset_micros);
         self.sync_danmaku_engine_timeline();
         self.bump_danmaku_generation();
@@ -1592,6 +1656,13 @@ impl PresenterRuntime {
     /// ⚠️ 这不是"优化调用开销"级别的返回值：调用方若忽略它，行为与改动前
     /// 完全一致（配置照样生效），只是会多续渲染窗口。属于向后兼容的加法。
     pub fn set_danmaku_config(&mut self, config: DanmakuLayoutConfig) -> DanmakuConfigChange {
+        // 先净化再比对：`sanitized()` 把 NaN/越界值收敛到合法区间，否则宿主
+        // 传 NaN 时「配置是否变了」的判断会恒为真。`apply_config` 内部同样会
+        // sanitize，这里是让下面的 `size_only` 比对也基于净化后的值。
+        let config = config.sanitized();
+        let mut previous_with_size = self.danmaku.config().clone();
+        previous_with_size.font_size = config.font_size;
+        let size_only = previous_with_size == config && self.current_danmaku_prepared.is_some();
         let change = self.danmaku.apply_config(config.clone());
         match change {
             DanmakuConfigChange::Unchanged => {}
@@ -1615,9 +1686,26 @@ impl PresenterRuntime {
                 if let Some(prepared) = &mut self.current_danmaku_prepared {
                     prepared.prepared.apply_paint_config(&config);
                 }
+                if size_only {
+                    // Size-only results remain usable while dragging: scale them
+                    // to the latest desired size. Keeping this generation also
+                    // prevents continuous input from starving a long-running plan.
+                    DanmakuFontSizeUpdate::retarget(
+                        &mut self.danmaku_font_size_update,
+                        Instant::now(),
+                    );
+                    self.refresh_current_danmaku_plan_from_prepared();
+                    self.request_current_danmaku_plan_for_current_time();
+                    // size-only 也是一次真实的配置变化（字号变了），宿主据此
+                    // 续渲染窗口才不会漏掉重绘；这里必须把 change 交回去，
+                    // 不能沿用上游的裸 `return`。
+                    return change;
+                }
+                self.danmaku_font_size_update = None;
                 self.danmaku_planner
                     .set_config(config, self.danmaku.rasterizer_clone());
                 self.bump_danmaku_generation_for_config_change();
+                self.refresh_current_danmaku_plan_from_prepared();
                 // A paused player may not produce another video frame. Keep the
                 // existing surface viewport and enqueue the replacement plan now so
                 // display ticks can redraw the retained frame with the new settings.
@@ -2761,12 +2849,9 @@ impl PresenterRuntime {
             width.min(u32::MAX as usize) as u32,
             height.min(u32::MAX as usize) as u32,
         );
-        let mut overlay = self
-            .overlay
-            .render(pts, OverlayViewport::new(viewport.width, viewport.height));
-        let subtitle_style = self.subtitle_ass_style(overlay.viewport);
-        self.subtitles
-            .append_to_overlay(pts, &mut overlay, &subtitle_style);
+        let source = OverlayViewport::new(viewport.width, viewport.height);
+        self.subtitle_resolution.source = Some(source);
+        let overlay = self.render_playback_overlay(pts, source);
         if subtitle_diag_enabled() {
             eprintln!(
                 "[erika-subtitle-diag] stage=update_overlay pts={} gen={} video={}x{} overlay={}",
@@ -2815,7 +2900,9 @@ impl PresenterRuntime {
             let prepared_items = result.prepared.items().len();
             if accepted {
                 result.prepared.apply_paint_config(self.danmaku.config());
-                self.danmaku_plan_replacement_pending = false;
+                self.danmaku_plan_replacement_pending =
+                    result.prepared.font_size() != self.danmaku.config().font_size;
+                self.danmaku_resize_settle_at = None;
                 self.current_danmaku_prepared = Some(CurrentDanmakuPrepared {
                     request: result.request,
                     prepared: result.prepared,
@@ -2856,16 +2943,21 @@ impl PresenterRuntime {
             }
             return;
         };
-        if !self.danmaku_prepared_covers_current_time(prepared) {
-            if !self.danmaku_plan_replacement_pending {
-                self.current_danmaku = None;
-            }
+        if !self.danmaku_prepared_time_is_current(prepared) {
+            self.current_danmaku = None;
             return;
         }
         let layout = prepared
             .prepared
             .frame_layout(self.current_media_time, self.current_generation);
-        let plan = prepared.rasterizer.render_plan(&layout);
+        let scale = self.danmaku.config().font_size / prepared.prepared.font_size();
+        let mut plan =
+            prepared
+                .rasterizer
+                .render_plan_scaled(&layout, scale, prepared.prepared.atlas());
+        if let Some(viewport) = self.current_danmaku_viewport {
+            plan.retarget(viewport);
+        }
         self.current_danmaku = Some(plan);
         self.record_current_danmaku_stats();
     }
@@ -2890,7 +2982,24 @@ impl PresenterRuntime {
         if !self.danmaku.config().enabled {
             return;
         }
-        if !self.danmaku_plan_replacement_pending
+        if self
+            .danmaku_resize_settle_at
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        let size_waiting = self
+            .danmaku_font_size_update
+            .is_some_and(|pending| !pending.ready(Instant::now()));
+        if self.danmaku_font_size_update.is_some() && !size_waiting {
+            self.danmaku_font_size_update = None;
+            self.danmaku_planner.set_config(
+                self.danmaku.config().clone(),
+                self.danmaku.rasterizer_clone(),
+            );
+            self.danmaku_plan_replacement_pending = true;
+        }
+        if (!self.danmaku_plan_replacement_pending || size_waiting)
             && self
                 .current_danmaku_prepared
                 .as_ref()
@@ -2920,8 +3029,13 @@ impl PresenterRuntime {
     }
 
     fn danmaku_prepared_covers_current_time(&self, prepared: &CurrentDanmakuPrepared) -> bool {
+        self.current_danmaku_viewport.is_some_and(|viewport| {
+            !danmaku_viewport_requires_relayout(prepared.request.key.viewport, viewport)
+        }) && self.danmaku_prepared_time_is_current(prepared)
+    }
+
+    fn danmaku_prepared_time_is_current(&self, prepared: &CurrentDanmakuPrepared) -> bool {
         prepared.request.key.generation == self.current_generation
-            && Some(prepared.request.key.viewport) == self.current_danmaku_viewport
             && prepared.window_start <= self.current_media_time
             && self.current_media_time <= prepared.window_end
     }
@@ -2955,25 +3069,15 @@ impl PresenterRuntime {
             .max(1);
         if player_time != self.current_media_time {
             self.current_media_time = player_time;
-            if let Some(viewport) = self
-                .current_overlay
-                .as_ref()
-                .map(|overlay| overlay.viewport)
-            {
-                let mut overlay = self.overlay.render(
-                    player_time,
-                    OverlayViewport::new(viewport.width, viewport.height),
-                );
-                let subtitle_style = self.subtitle_ass_style(overlay.viewport);
-                self.subtitles
-                    .append_to_overlay(player_time, &mut overlay, &subtitle_style);
+            if let Some(source) = self.subtitle_resolution.source {
+                let overlay = self.render_playback_overlay(player_time, source);
                 if subtitle_diag_enabled() {
                     eprintln!(
                         "[erika-subtitle-diag] stage=clock_overlay player={} gen={} overlay_viewport={}x{} overlay={}",
                         duration_label(Some(player_time)),
                         self.current_generation,
-                        viewport.width,
-                        viewport.height,
+                        overlay.viewport.width,
+                        overlay.viewport.height,
                         overlay_debug_summary(&overlay),
                     );
                 }
@@ -2993,21 +3097,36 @@ impl PresenterRuntime {
     }
 
     fn refresh_current_overlay(&mut self) {
-        let Some(viewport) = self
-            .current_overlay
-            .as_ref()
-            .map(|overlay| overlay.viewport)
-        else {
+        let Some(source) = self.subtitle_resolution.source else {
             return;
         };
-        let mut overlay = self.overlay.render(
-            self.current_media_time,
-            OverlayViewport::new(viewport.width, viewport.height),
-        );
-        let subtitle_style = self.subtitle_ass_style(overlay.viewport);
+        self.current_overlay = Some(self.render_playback_overlay(self.current_media_time, source));
+    }
+
+    fn render_playback_overlay(&mut self, pts: Duration, source: OverlayViewport) -> OverlayFrame {
+        let viewport = self.subtitle_resolution.viewport(source);
+        let started = Instant::now();
+        let mut overlay = self.overlay.render(pts, viewport);
+        // Script coordinates and user font sizes stay in the original video
+        // space. Only libass's raster canvas has a higher resolution.
+        let subtitle_style = self.subtitle_ass_style(source);
         self.subtitles
-            .append_to_overlay(self.current_media_time, &mut overlay, &subtitle_style);
-        self.current_overlay = Some(overlay);
+            .append_to_overlay(pts, &mut overlay, &subtitle_style);
+        if viewport != source
+            && !overlay.subtitle_alpha_planes.is_empty()
+            && self.subtitle_resolution.record(started.elapsed())
+        {
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "subtitle_resolution",
+                    "stage": "budget_fallback",
+                    "width": source.width,
+                    "height": source.height,
+                })
+                .to_string(),
+            );
+        }
+        overlay
     }
 
     fn subtitle_ass_style(&self, viewport: OverlayViewport) -> SubtitleAssStyle {
@@ -3369,9 +3488,16 @@ impl PresenterRuntime {
     }
 
     fn invalidate_current_danmaku_plan(&mut self) {
+        if self.danmaku_font_size_update.take().is_some() {
+            self.danmaku_planner.set_config(
+                self.danmaku.config().clone(),
+                self.danmaku.rasterizer_clone(),
+            );
+        }
         self.current_danmaku = None;
         self.current_danmaku_prepared = None;
         self.danmaku_plan_replacement_pending = false;
+        self.danmaku_resize_settle_at = None;
     }
 
     fn clear_current_danmaku_state(&mut self) {
@@ -3386,6 +3512,7 @@ impl PresenterRuntime {
     ) {
         self.rejected_video_import_route = None;
         self.current_overlay = None;
+        self.subtitle_resolution.source = None;
         self.subtitles.clear();
         self.clear_current_danmaku_state();
         self.current_media_time = media_time;
@@ -3969,6 +4096,7 @@ fn run_async_danmaku_planner(
                 request.key.viewport,
             );
             engine.sync_timeline(&window);
+            engine.recycle_raster_caches_if_needed();
             let prepared = engine.prepare(request.key.viewport, request.key.generation);
             let rasterizer = engine.rasterizer_clone();
             let elapsed = started.elapsed();
@@ -4414,14 +4542,7 @@ impl SubtitleFrameState {
         let mut subtitle_changed = false;
 
         #[cfg(feature = "libass")]
-        match self.ass_renderer.render(
-            pts,
-            overlay.viewport,
-            style.font_scale,
-            &style.style,
-            &style.memory_fonts,
-            style.memory_font_revision,
-        ) {
+        match self.ass_renderer.render(pts, overlay.viewport, style) {
             Ok(Some(bitmaps)) => {
                 subtitle_changed |= bitmaps.changed;
                 overlay.subtitle_alpha_planes.extend(bitmaps.parts);
@@ -4446,7 +4567,13 @@ impl SubtitleFrameState {
             if !frame.frame.bitmap.planes.is_empty() {
                 overlay
                     .subtitle_planes
-                    .extend(frame.frame.bitmap.planes.iter().cloned());
+                    .extend(frame.frame.bitmap.planes.iter().cloned().map(|plane| {
+                        if plane.canvas_width == 0 || plane.canvas_height == 0 {
+                            plane.with_canvas(style.play_res_width, style.play_res_height)
+                        } else {
+                            plane
+                        }
+                    }));
                 subtitle_changed = true;
             }
         }
@@ -4591,36 +4718,33 @@ impl CachedAssTrackRenderer {
         &mut self,
         pts: Duration,
         viewport: OverlayViewport,
-        font_scale: f64,
-        style: &SubtitleStyleConfig,
-        memory_fonts: &Arc<[SubtitleFontAttachment]>,
-        memory_font_revision: u64,
+        style: &SubtitleAssStyle,
     ) -> crate::subtitle::Result<Option<SubtitleBitmapSet>> {
-        if self.memory_font_revision != memory_font_revision {
+        if self.memory_font_revision != style.memory_font_revision {
             if let (Some(track_id), Some(resources)) = (self.track_id, self.resources.as_ref()) {
                 let mut renderer = LibassSubtitleRenderer::from_ass_track_with_style_and_fonts(
                     track_id,
                     resources,
                     LibassRenderConfig::default(),
-                    style,
-                    memory_fonts.clone(),
+                    &style.style,
+                    style.memory_fonts.clone(),
                 )?;
                 for (chunk, start, end) in &self.chunks {
                     renderer.process_chunk(chunk, *start, *end)?;
                 }
                 self.renderer = Some(renderer);
             }
-            self.memory_font_revision = memory_font_revision;
+            self.memory_font_revision = style.memory_font_revision;
         }
-        if &self.style != style {
-            self.style = style.clone();
+        if self.style != style.style {
+            self.style = style.style.clone();
         }
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(None);
         };
-        renderer.set_play_res_height(viewport.height);
-        renderer.set_style(style);
-        renderer.set_font_scale(font_scale);
+        renderer.set_play_res_height(style.play_res_height);
+        renderer.set_style(&style.style);
+        renderer.set_font_scale(style.font_scale);
         match renderer.render(SubtitleRenderRequest::new(
             pts,
             viewport.width,
@@ -4738,6 +4862,7 @@ mod tests {
             subtitle_alpha_planes: vec![],
             subtitle_changed: false,
         });
+        presenter.subtitle_resolution.source = Some(OverlayViewport::new(640, 360));
         // Replaying the same display target after other work must not move it.
         for hz in [60.0, 120.0] {
             for frame in 1..=6 {
@@ -5321,6 +5446,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     #[test]
+    fn subtitle_supersampling_keeps_bitmap_pixels_and_supplies_missing_canvas() {
+        let mut state = SubtitleFrameState::default();
+        state.push(subtitle_frame(Duration::ZERO, Some(Duration::from_secs(3))));
+        let mut overlay = empty_overlay();
+        overlay.viewport = OverlayViewport::new(1280, 720);
+        let style = SubtitleAssStyle {
+            play_res_width: 640,
+            play_res_height: 360,
+            ..SubtitleAssStyle::default()
+        };
+        state.append_to_overlay(Duration::from_secs(1), &mut overlay, &style);
+        let plane = &overlay.subtitle_planes[0];
+        assert_eq!(plane.rgba.len(), 4);
+        assert_eq!(plane.scaled_rect(1280, 720), (0, 0, 2, 2));
+    }
+
+    #[test]
     fn subtitle_state_expires_old_frames_and_empty_frame_clears_track() {
         let mut state = SubtitleFrameState::default();
         state.push(subtitle_frame(
@@ -5404,6 +5546,135 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         #[cfg(not(feature = "libass"))]
         assert!(!overlay.subtitle_planes.is_empty());
         assert!(overlay.subtitle_changed);
+    }
+
+    #[cfg(feature = "libass")]
+    #[test]
+    fn supersampling_preserves_text_and_ass_size_with_and_without_user_overrides() {
+        for ass in [false, true] {
+            for override_mask in [0, crate::subtitle::SUBTITLE_OVERRIDE_ALL] {
+                let mut state = SubtitleFrameState::default();
+                state.push(if ass {
+                    ass_subtitle_frame(
+                        2,
+                        1,
+                        Duration::ZERO,
+                        Duration::from_secs(2),
+                        1,
+                        Arc::new(AssTrackResources::new(
+                            2,
+                            Arc::<[u8]>::from(ass_test_header().as_bytes()),
+                            Arc::<[SubtitleFontAttachment]>::from([]),
+                        )),
+                    )
+                } else {
+                    text_subtitle_frame(
+                        2,
+                        Duration::ZERO,
+                        Some(Duration::from_secs(2)),
+                        "Sharper subtitles",
+                    )
+                });
+                let style = SubtitleAssStyle {
+                    play_res_width: 640,
+                    play_res_height: 360,
+                    font_scale: 1.25,
+                    style: SubtitleStyleConfig {
+                        override_mask,
+                        ..SubtitleStyleConfig::default()
+                    },
+                    ..SubtitleAssStyle::default()
+                };
+                let mut normal = empty_overlay();
+                state.append_to_overlay(Duration::from_millis(500), &mut normal, &style);
+                let mut high = empty_overlay();
+                high.viewport = OverlayViewport::new(1280, 720);
+                state.append_to_overlay(Duration::from_millis(500), &mut high, &style);
+                let bounds = |overlay: &OverlayFrame| {
+                    let parts = &overlay.subtitle_alpha_planes;
+                    assert!(!parts.is_empty());
+                    // libass pads bitmaps for SIMD alignment. Compare visible
+                    // coverage, not that transparent allocation padding.
+                    let mut bounds = [
+                        f64::INFINITY,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::NEG_INFINITY,
+                    ];
+                    for part in parts {
+                        for y in 0..part.placement.height as usize {
+                            for x in 0..part.placement.width as usize {
+                                if part.alpha[y * part.stride + x] < 8 {
+                                    continue;
+                                }
+                                let x = part.placement.x as f64 + x as f64;
+                                let y = part.placement.y as f64 + y as f64;
+                                bounds[0] = bounds[0].min(x);
+                                bounds[1] = bounds[1].min(y);
+                                bounds[2] = bounds[2].max(x + 1.0);
+                                bounds[3] = bounds[3].max(y + 1.0);
+                            }
+                        }
+                    }
+                    bounds
+                };
+                for (normal, high) in bounds(&normal).into_iter().zip(bounds(&high)) {
+                    assert!(
+                        (normal - high / 2.0).abs() <= 3.0,
+                        "ass={ass} override={override_mask}: normal={normal}, high={high}"
+                    );
+                }
+                // Returning to native resolution must invalidate libass's atlas.
+                let mut restored = empty_overlay();
+                state.append_to_overlay(Duration::from_millis(500), &mut restored, &style);
+                assert!(restored.subtitle_changed);
+                assert_eq!(bounds(&restored), bounds(&normal));
+            }
+        }
+    }
+
+    #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
+    #[test]
+    fn subtitle_quality_toggles_refresh_paused_frames_without_accumulating_scale() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.subtitles.push(text_subtitle_frame(
+            2,
+            Duration::ZERO,
+            Some(Duration::from_secs(3)),
+            "Paused subtitle",
+        ));
+        presenter.update_overlay(Duration::from_secs(1), 1, 640, 360);
+        assert_eq!(
+            presenter.current_overlay.as_ref().unwrap().viewport,
+            OverlayViewport::new(1280, 720)
+        );
+        presenter.set_subtitle_supersampling(false);
+        assert_eq!(
+            presenter.current_overlay.as_ref().unwrap().viewport,
+            OverlayViewport::new(640, 360)
+        );
+        presenter.set_subtitle_supersampling(true);
+        for _ in 0..3 {
+            presenter.refresh_current_overlay();
+            assert_eq!(
+                presenter.current_overlay.as_ref().unwrap().viewport,
+                OverlayViewport::new(1280, 720)
+            );
+        }
+        presenter.set_subtitle_supersampling(false);
+        assert_eq!(
+            presenter.current_overlay.as_ref().unwrap().viewport,
+            OverlayViewport::new(640, 360)
+        );
+        assert!(
+            !presenter
+                .current_overlay
+                .as_ref()
+                .unwrap()
+                .subtitle_alpha_planes
+                .is_empty()
+        );
     }
 
     #[cfg(feature = "libass")]
@@ -6098,6 +6369,343 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         );
     }
 
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn live_danmaku_presenter() -> PresenterRuntime {
+        let viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
+        let timeline = DanmakuTimeline::new(
+            (0..30)
+                .map(|i| crate::danmaku::DanmakuItem {
+                    id: i + 1,
+                    pts: Duration::from_secs(i),
+                    text: "实时调整弹幕".into(),
+                    mode: DanmakuMode::Scroll,
+                    font_size: 25.0,
+                    color: crate::danmaku::DanmakuColor::WHITE,
+                    opacity: 1.0,
+                    is_self: false,
+                    // 测试夹具不涉及发送者级屏蔽规则：留空 = 来源未提供。
+                    user_id: String::new(),
+                    user_name: String::new(),
+                    user_level: 0,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut presenter = PresenterRuntime::new(PresenterConfig {
+            danmaku: Some(timeline),
+            ..PresenterConfig::default()
+        })
+        .unwrap();
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::new(Mutex::new(None)),
+        });
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.current_danmaku_viewport = Some(viewport);
+        presenter.current_danmaku_prepared = Some(CurrentDanmakuPrepared {
+            request: AsyncDanmakuPlanRequest {
+                key: DanmakuPlanKey {
+                    media_time: presenter.current_media_time,
+                    viewport,
+                    generation: presenter.current_generation,
+                },
+            },
+            prepared: presenter
+                .danmaku
+                .prepare(viewport, presenter.current_generation),
+            rasterizer: presenter.danmaku.rasterizer_clone(),
+            window_start: Duration::ZERO,
+            window_end: Duration::from_secs(10),
+        });
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        presenter
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn live_opacity_with_unchanged_delay_keeps_layout_and_atlas() {
+        let mut presenter = live_danmaku_presenter();
+        let original = presenter.current_danmaku.as_ref().unwrap().clone();
+        let generation = presenter.current_generation;
+        for opacity in [0.8, 0.2, 0.5, 0.0, 1.0] {
+            let mut config = presenter.danmaku.config().clone();
+            config.opacity = opacity;
+            presenter.set_danmaku_config(config);
+            // The application sends both on every slider update.
+            presenter.set_danmaku_global_offset(0);
+            assert_eq!(presenter.current_generation, generation);
+            assert!(presenter.danmaku_planner.last_requested.is_none());
+            let plan = presenter.current_danmaku.as_ref().unwrap();
+            if opacity == 0.0 {
+                assert!(plan.items.is_empty());
+            } else {
+                assert_eq!(plan.items.len(), original.items.len());
+                assert_eq!(
+                    plan.atlas.as_ref().unwrap().version,
+                    original.atlas.as_ref().unwrap().version
+                );
+                for (glyph, before) in plan.items.iter().zip(&original.items) {
+                    assert_eq!(glyph.rect, before.rect);
+                    assert_eq!(glyph.color_rgba, [1.0, 1.0, 1.0, opacity]);
+                }
+            }
+        }
+        presenter.set_danmaku_global_offset(100_000);
+        assert!(
+            presenter.current_generation > generation,
+            "a real delay change must still invalidate the timeline"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn live_font_size_previews_reuse_atlas_then_replace_while_paused() {
+        let mut presenter = live_danmaku_presenter();
+        let original = presenter.current_danmaku.as_ref().unwrap().clone();
+        let base_size = presenter.danmaku.config().font_size;
+        let generation = presenter.current_generation;
+        for font_size in [22.0, 38.0, 24.0, 36.0, 40.0] {
+            let mut config = presenter.danmaku.config().clone();
+            config.font_size = font_size;
+            presenter.set_danmaku_config(config);
+            presenter.set_danmaku_global_offset(0);
+            let plan = presenter.current_danmaku.as_ref().unwrap();
+            assert_eq!(presenter.current_generation, generation);
+            assert!(
+                presenter.danmaku_planner.last_requested.is_none(),
+                "pointer events must not each shape a new font size"
+            );
+            assert_eq!(plan.items.len(), original.items.len());
+            assert_eq!(
+                plan.atlas.as_ref().unwrap().version,
+                original.atlas.as_ref().unwrap().version
+            );
+            assert_eq!(plan.items[0].tex_rect, original.items[0].tex_rect);
+            assert!(
+                (plan.items[0].rect[2] / original.items[0].rect[2] - font_size / base_size).abs()
+                    < 1e-5
+            );
+        }
+        // Opacity changes during the size preview must not submit that size early.
+        let mut config = presenter.danmaku.config().clone();
+        config.opacity = 0.5;
+        presenter.set_danmaku_config(config);
+        assert_eq!(
+            presenter
+                .danmaku_planner
+                .shared
+                .0
+                .lock()
+                .unwrap()
+                .config
+                .font_size,
+            base_size
+        );
+        let previous_x = presenter.current_danmaku.as_ref().unwrap().items[0].rect[0];
+        presenter.current_media_time += Duration::from_millis(100);
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        assert!(presenter.current_danmaku.as_ref().unwrap().items[0].rect[0] < previous_x);
+
+        // No clock/video advance: the final replacement must finish while paused.
+        presenter
+            .danmaku_font_size_update
+            .as_mut()
+            .unwrap()
+            .settle_at = Instant::now();
+        presenter.request_current_danmaku_plan_for_current_time();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while presenter.danmaku_plan_replacement_pending && Instant::now() < deadline {
+            presenter.refresh_stale_danmaku_plan();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!presenter.danmaku_plan_replacement_pending);
+        assert_eq!(
+            presenter
+                .current_danmaku_prepared
+                .as_ref()
+                .unwrap()
+                .prepared
+                .font_size(),
+            40.0
+        );
+        let plan = presenter.current_danmaku.as_ref().unwrap();
+        assert!(!plan.is_empty());
+        assert_eq!(plan.items[0].color_rgba[3], 0.5);
+        assert_eq!(plan.media_time, presenter.current_media_time);
+    }
+
+    #[test]
+    fn continuous_font_input_has_a_bounded_prepare_deadline() {
+        let start = Instant::now();
+        let mut pending = None;
+        for millis in (0..500).step_by(16) {
+            DanmakuFontSizeUpdate::retarget(&mut pending, start + Duration::from_millis(millis));
+        }
+        assert!(pending.unwrap().ready(start + Duration::from_millis(500)));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn font_size_drag_refreshes_time_window_and_seek_flushes_pending_size() {
+        let mut presenter = live_danmaku_presenter();
+        let mut config = presenter.danmaku.config().clone();
+        config.font_size = 40.0;
+        presenter.set_danmaku_config(config);
+        // A drag near the old window boundary can still request the next
+        // time window using its cached font size, without waiting for idle.
+        presenter.current_media_time = Duration::from_secs(9);
+        presenter.request_current_danmaku_plan_for_current_time();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while presenter
+            .current_danmaku_prepared
+            .as_ref()
+            .unwrap()
+            .window_end
+            <= Duration::from_secs(10)
+            && Instant::now() < deadline
+        {
+            presenter.apply_ready_danmaku_plans();
+            thread::sleep(Duration::from_millis(5));
+        }
+        presenter.current_media_time = Duration::from_secs(11);
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        assert!(!presenter.current_danmaku.as_ref().unwrap().is_empty());
+        presenter.bump_danmaku_generation();
+        assert!(presenter.danmaku_font_size_update.is_none());
+        assert_eq!(
+            presenter
+                .danmaku_planner
+                .shared
+                .0
+                .lock()
+                .unwrap()
+                .config
+                .font_size,
+            40.0
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn danmaku_resize_retains_motion_and_replaces_layout_while_paused() {
+        let viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
+        let timeline = DanmakuTimeline::new(vec![crate::danmaku::DanmakuItem {
+            id: 1,
+            pts: Duration::ZERO,
+            text: "持续移动的弹幕".into(),
+            mode: DanmakuMode::Scroll,
+            font_size: 25.0,
+            color: crate::danmaku::DanmakuColor::WHITE,
+            opacity: 1.0,
+            is_self: false,
+            // 测试夹具不涉及发送者级屏蔽规则：留空 = 来源未提供。
+            user_id: String::new(),
+            user_name: String::new(),
+            user_level: 0,
+        }])
+        .unwrap();
+        let mut presenter = PresenterRuntime::new(PresenterConfig {
+            danmaku: Some(timeline),
+            ..PresenterConfig::default()
+        })
+        .unwrap();
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::new(Mutex::new(None)),
+        });
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.current_danmaku_viewport = Some(viewport);
+        presenter.current_danmaku_prepared = Some(CurrentDanmakuPrepared {
+            request: AsyncDanmakuPlanRequest {
+                key: DanmakuPlanKey {
+                    media_time: presenter.current_media_time,
+                    viewport,
+                    generation: presenter.current_generation,
+                },
+            },
+            prepared: presenter
+                .danmaku
+                .prepare(viewport, presenter.current_generation),
+            rasterizer: presenter.danmaku.rasterizer_clone(),
+            window_start: Duration::ZERO,
+            window_end: Duration::from_secs(10),
+        });
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        let original = presenter.current_danmaku.as_ref().unwrap().clone();
+        let stale = presenter.current_danmaku_prepared.as_ref().unwrap().clone();
+        let mut previous_x = original.items[0].rect[0] / viewport.width as f32;
+        for (step, (width, height, scale)) in [(1152, 648, 1.8), (1024, 576, 1.6), (960, 540, 1.5)]
+            .into_iter()
+            .enumerate()
+        {
+            presenter.resize_surface(width, height, scale).unwrap();
+            let immediate = presenter.current_danmaku.as_ref().unwrap();
+            assert!(
+                !immediate.is_empty(),
+                "resize must never clear the visible plan"
+            );
+            presenter.current_media_time = Duration::from_millis(1100 + step as u64 * 100);
+            presenter.refresh_current_danmaku_plan_from_prepared();
+            let plan = presenter.current_danmaku.as_ref().unwrap();
+            assert_eq!(
+                plan.viewport,
+                DanmakuViewport::with_scale(width, height, scale as f32)
+            );
+            assert!(Arc::ptr_eq(
+                plan.atlas.as_ref().unwrap(),
+                original.atlas.as_ref().unwrap()
+            ));
+            let x = plan.items[0].rect[0] / width as f32;
+            assert!(
+                x < previous_x,
+                "retained comments must keep moving during resize"
+            );
+            previous_x = x;
+            assert!(
+                presenter.danmaku_planner.last_requested.is_none(),
+                "animation must not rasterize every intermediate size"
+            );
+        }
+        let stale_result = AsyncDanmakuPlanResult {
+            request: stale.request,
+            prepared: stale.prepared,
+            rasterizer: stale.rasterizer,
+            window_start: stale.window_start,
+            window_end: stale.window_end,
+            elapsed: Duration::ZERO,
+        };
+        assert!(!presenter.danmaku_plan_result_is_current(&stale_result));
+        // No video frames or clock advancement: a paused resize must still
+        // request, accept, and display a replacement at the final dimensions.
+        presenter.danmaku_resize_settle_at = Some(Instant::now());
+        presenter.request_current_danmaku_plan_for_current_time();
+        assert_eq!(
+            presenter.danmaku_planner.last_requested.unwrap().viewport,
+            presenter.current_danmaku_viewport.unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while presenter.danmaku_plan_replacement_pending && Instant::now() < deadline {
+            presenter.refresh_stale_danmaku_plan();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!presenter.danmaku_plan_replacement_pending);
+        let plan = presenter.current_danmaku.as_ref().unwrap();
+        assert!(!plan.is_empty());
+        assert_eq!(plan.media_time, presenter.current_media_time);
+        assert_eq!(
+            presenter
+                .current_danmaku_prepared
+                .as_ref()
+                .unwrap()
+                .request
+                .key
+                .viewport,
+            plan.viewport
+        );
+        // A seek/generation change must not bring the retained old comments back.
+        presenter.current_generation += 1;
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        assert!(presenter.current_danmaku.is_none());
+    }
+
     #[test]
     fn danmaku_viewport_ignores_one_pixel_surface_jitter() {
         let current = DanmakuViewport::with_scale(2560, 1440, 2.0);
@@ -6213,7 +6821,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         let first_x = presenter.current_danmaku.as_ref().unwrap().items[0].rect[0];
 
         let mut config = DanmakuLayoutConfig::default();
-        config.font_size += 4.0;
+        // Font-size-only updates now preview the retained layout without a
+        // generation change. Exercise a full relayout for this fallback test.
+        config.scroll_duration_seconds += 4.0;
         presenter.set_danmaku_config(config);
         assert!(presenter.danmaku_plan_replacement_pending);
         assert!(presenter.current_danmaku_prepared.is_some());

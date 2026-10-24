@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Enabled native subtitle supersampling by default. Subtitle and danmaku
+  supersampling now default to on in both native and Web backends, with the
+  existing size limits, native subtitle CPU fallback and explicit opt-out
+  controls preserved.
+- Removed the duplicate Web fallback-font asset. libass now uses the complete
+  font already embedded in the Rust WASM, eliminating a separate font request
+  and about 6.07 MiB of package data (2.74 MiB with gzip). Incremental Web builds
+  also remove the old standalone font file.
+- Added a browser backend and `cargo run -p xtask -- web build` to bundle the
+  native Rust danmaku engine, patched libass/text libraries and an FFmpeg
+  demuxer as WASM. WebCodecs decodes audio/video, Web Audio drives the clock,
+  and WebGL2 composites video, subtitles and danmaku.
+- Added browser MKV playback with embedded ASS/SSA and font attachments,
+  external ASS/SSA/SRT/WebVTT, independent subtitle/danmaku supersampling,
+  live style updates, appended danmaku files, local comments, track selection,
+  chapters and PNG capture. Local files use chunked reads; remote sources use
+  a bounded HTTP Range cache.
+- Integrated the Web backend into Erika's browser application and verified it
+  in Chrome with H.264/AAC/ASS MKV, VP9/Opus WebM, 2,000 comments, playback
+  controls, screenshots, UI transitions and player cleanup. Web distribution
+  currently uses source builds; see the [browser guide](docs/web.md).
 - Fixed HTTP(S) reads and persistent prefetch for origins that ignore Range
   and return `200` with the whole file, including HLS playlists and segments
   without Content-Length. Replayed prefixes are discarded before caching,

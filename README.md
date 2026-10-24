@@ -15,6 +15,12 @@
 
 当前版本：**0.2.1**。从 [文档目录](docs/README.md) 选择接入、构建或内核设计说明。
 
+**浏览器也能直接播放 MKV，并保留随片 ASS 字幕和字体附件。** 当前源码提供
+[Web / WASM 后端](docs/web.zh.md)，已接入 Erika Web：浏览器 WebCodecs 解码音视频，
+WASM 内的 libass 还原字幕字体、定位、描边与特效，Rust 弹幕与字幕按同一播放时钟
+交给 WebGL2 合成。网站可以保留自己的界面，服务器提供原文件和 HTTP Range，
+无需先在服务端拆出字幕或烧录进画面。
+
 ## 能力
 
 - 硬件解码与软件回退：VideoToolbox、D3D11VA、MediaCodec、AVCodec；Linux 提供 NVDEC / VA-API。
@@ -22,11 +28,13 @@
 - 本地文件与 HTTP(S) 播放，支持自定义请求头、后台预读和回退缓存。
 - 音频主时钟同步、暂停、seek、倍速、多音轨、外挂字幕和多轨弹幕。
 - Rust、C ABI、Flutter、SwiftPM 与 OpenHarmony ArkTS 接入。
+- 浏览器 JavaScript / TypeScript 接入：MKV 解封装、ASS 字体附件、统一字幕与弹幕合成，字幕和弹幕可独立双倍采样。
 
 ## 选择接入方式
 
 | 宿主 | 安装或入口 | 指南 |
 |---|---|---|
+| 浏览器 / JavaScript / TypeScript | 当前源码运行 `cargo run -p xtask -- web build` | [Web 接入与部署](docs/web.zh.md) |
 | Flutter | `flutter pub add erika_flutter`，当前 0.2.1 | [插件使用指南](packages/erika_flutter/README.zh.md) |
 | Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/liberika-swift`，从 0.2.1 开始 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](packages/erika_ohos/README.md) |
@@ -36,6 +44,19 @@
 
 截至 2026-10-02，OHPM 公开版为 0.1.9，0.2.1 已提交审核。原生二进制从
 [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.2.1) 下载。
+
+### 浏览器
+
+```sh
+# 准备 Emscripten、wasm-bindgen 等依赖后，一次构建全部 WASM 与运行时资源。
+cargo run -p xtask -- web build
+python3 scripts/serve_web.py
+```
+
+打开 `http://127.0.0.1:18765` 运行示例。将 `target/web/` 中的运行时资源放到网站，
+通过 `Player.create({ canvas })` 和 `player.open(fileOrURL)` 接入自己的界面。
+Web 构建入口属于当前源码，尚未发布到 npm；音视频编码由浏览器 WebCodecs 支持范围决定。
+构建依赖、完整示例和 Erika 接入说明见 [浏览器指南](docs/web.zh.md)。
 
 ### Flutter
 
@@ -83,9 +104,11 @@ player.play()?;
 | Android 8+ | MediaCodec / 软解 | wgpu Vulkan / GLES | AAudio | 四个 ABI 预编译、Flutter |
 | OpenHarmony API 18+ | AVCodec / 软解 | wgpu | OHAudio | arm64 预编译、Flutter、OHPM |
 | Linux（实验性） | NVDEC / VA-API / 软解 | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust、C ABI、Flutter 源码构建 |
+| 浏览器 | WebCodecs | WebGL2 / Canvas | Web Audio | 当前源码构建 JS / WASM 包 |
 
 各平台的视频表面和 HDR 路径在 [平台矩阵](docs/platform_matrix.zh.md) 中汇总。
-Web 尚无播放后端。
+浏览器后端当前输出 SDR，已在 Chrome 验证；需要 HTTPS 或 localhost，以及
+WebCodecs 视频／音频解码、OffscreenCanvas、WebGL2 和 Web Audio。
 
 ## 开发
 
@@ -108,8 +131,9 @@ cargo build -p erika_capi
 | `crates/erika_ffmpeg_sys` | FFmpeg bindings |
 | `packages/erika_flutter` | Flutter 插件 |
 | `packages/erika_ohos` | OpenHarmony ArkTS SDK |
-| `examples` | 原生、Flutter 与 ArkTS 示例 |
-| `xtask` | 原生依赖构建 |
+| `packages/erika_web` | 浏览器 Player、Worker、WebGL2 合成与 TypeScript 类型 |
+| `examples` | 原生、Flutter、ArkTS 与浏览器播放器示例 |
+| `xtask` | 原生依赖与完整 Web 包构建 |
 | `docs` | 接入与设计文档；`investigations/` 保存历史调查和验证记录 |
 
 版本变化见 [CHANGELOG](CHANGELOG.md)。

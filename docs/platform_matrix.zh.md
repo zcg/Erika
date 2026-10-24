@@ -1,6 +1,7 @@
 # liberika 平台能力矩阵
 
-以下为 0.2.1 的接入与分发范围。Linux 目前为实验性源码构建目标。
+以下原生平台以 0.2.1 为基线；浏览器后端是当前源码新增的构建目标，已接入 Erika Web。
+Linux 目前为实验性源码构建目标。
 
 | 平台 | 最低版本 | 解码 / 渲染 | 音频 | 分发与构建 |
 |---|---|---|---|---|
@@ -11,8 +12,20 @@
 | Android | 8 / API 26 | MediaCodec / 软解 + wgpu | AAudio | 四个 ABI；Flutter |
 | OpenHarmony | API 18 | AVCodec / 软解 + wgpu | OHAudio | arm64；Flutter / ArkTS OHPM |
 | Linux（实验性） | FFmpeg 8.x | NVDEC / VA-API / 软解 + wgpu | PulseAudio / pipewire-pulse | Rust / C ABI / Flutter 源码构建，无预编译包 |
+| 浏览器 | HTTPS / localhost；WebCodecs 视频与音频、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | 当前源码构建 JS / WASM；尚未发布到 npm |
 
-所有行均提供 C ABI Presenter；硬件解码能力取决于编码格式、设备及驱动。
+原生平台提供 C ABI Presenter；浏览器通过 JavaScript / TypeScript `Player` 接入。
+硬件解码能力取决于编码格式、设备及驱动；浏览器会在运行时检查编码配置支持。
+
+## 浏览器播放
+
+浏览器中的 FFmpeg WASM 负责解封装，libass 使用 MKV 内嵌 ASS/SSA 和字体附件绘制
+字幕，Rust DFM 引擎绘制弹幕；字幕和弹幕共用播放时钟与 WebGL2 合成器，支持独立
+双倍采样。外部字幕支持 ASS/SSA、SRT、WebVTT。服务器提供原文件与 HTTP Range。
+
+当前输出 SDR，音视频由浏览器 WebCodecs 解码；HDR/EDR、Dolby Vision、ArtCNN、
+位图字幕和内嵌非 ASS 字幕转换尚未移植。完整要求、已知限制与构建部署步骤见
+[浏览器指南](web.zh.md)。
 
 ## 视频表面与 HDR
 
@@ -35,3 +48,7 @@ Linux VA-API → Vulkan 直接导入和 WSL GPU 复制路径为实验性实现�
 原生构建覆盖六个预编译平台；Linux native workflow 使用 Xvfb、Mesa 和 PulseAudio
 运行源码播放检查。Flutter consumer workflow 检查六个预编译平台。
 HDR 输出和平台生命周期的设备实验保存在 [验证记录目录](investigations/README.md)。
+
+Web workflow 构建完整 WASM 包并运行独立播放器回归。Erika Web 应用已在 macOS 的
+Chrome 155.0.8059.85 验证 H.264/AAC/ASS/字体附件 MKV、VP9/Opus WebM、2000 条
+弹幕、实时参数、章节、截图与播放器生命周期；Safari / Firefox 尚未验证。

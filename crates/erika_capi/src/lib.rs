@@ -1747,6 +1747,7 @@ fn danmaku_config_from_c(
     DanmakuLayoutConfig {
         enabled: config.enabled,
         font_size: config.font_size,
+        supersampling: base.supersampling,
         opacity: config.opacity,
         display_area: config.display_area,
         scroll_duration_seconds: config.scroll_duration_seconds,

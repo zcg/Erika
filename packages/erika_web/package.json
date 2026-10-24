@@ -1,0 +1,13 @@
+{
+  "name": "@liberika/web",
+  "version": "0.1.8",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "license": "MPL-2.0",
+  "description": "liberika browser backend with WebCodecs, libass and native Rust danmaku"
+}

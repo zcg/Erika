@@ -65,6 +65,22 @@ and wgpu compute on capable Vulkan-class adapters, including Android. Backends
 without compute (notably GLES 3.0) retain native luma sampling and report an
 explicit `Inactive` status and fallback reason.
 
+### Subtitle and danmaku quality defaults
+
+The native presenter enables subtitle and danmaku supersampling by default,
+matching the Web backend. Text subtitles and danmaku glyphs rasterize at 2x
+resolution while their displayed size, layout and video resolution stay the same.
+Rust hosts can disable them independently with
+`PresenterRuntime::set_subtitle_supersampling(false)` and
+`DanmakuLayoutConfig { supersampling: false, ..Default::default() }`, applying
+the latter through `PresenterRuntime::set_danmaku_config`.
+
+Native subtitles retain the existing performance limits: source canvases with
+either dimension above 2048 pixels or area above 2048 × 1080 pixels stay at
+native resolution. An average subtitle render cost above 4 ms over 60 renders
+falls back to native resolution for the current media. Danmaku glyphs larger
+than 128 px also retain native resolution.
+
 ## 4. Attach a surface
 
 liberika renders directly into a platform surface you own. Width/height are

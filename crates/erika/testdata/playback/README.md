@@ -46,3 +46,13 @@ the generator or either subtitle source:
 Review the resulting binary and checksum diff before committing it. Different
 FFmpeg versions are rejected because encoder or Matroska muxer changes can
 otherwise produce a structurally valid but byte-different fixture.
+
+The companion `../chapters/chapters.mkv` is a silent, synthetic 60-second
+video for chapter navigation. Its metadata defines Prologue at 0 s, OP at
+10–20 s, Part A at 20 s, Part B at 35 s, ED at 40–50 s, and Preview at 50 s.
+`bash ../chapters/generate.sh` rebuilds it from the adjacent FFmetadata file
+and FFmpeg's color source. `container_chapters_reach_player_and_clear_on_reopen_or_failure`
+checks that the demuxer exposes these chapters and that reopening an unmarked
+file or failing to open a new file clears them. This companion is also
+original synthetic material under MPL-2.0; it does not change the playback
+fixture or its hashes above.

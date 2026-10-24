@@ -38,36 +38,9 @@ pub enum SubtitleError {
 
 pub type Result<T> = std::result::Result<T, SubtitleError>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubtitleFontAttachment {
-    pub name: String,
-    pub mime_type: Option<String>,
-    pub families: Vec<String>,
-    pub data: Arc<[u8]>,
-}
-
-pub const MAX_MEMORY_SUBTITLE_FONT_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_MEMORY_SUBTITLE_FONT_TOTAL_BYTES: usize = 128 * 1024 * 1024;
-
-impl SubtitleFontAttachment {
-    pub fn new(
-        name: impl Into<String>,
-        mime_type: Option<String>,
-        families: Vec<String>,
-        data: impl Into<Arc<[u8]>>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            mime_type,
-            families,
-            data: data.into(),
-        }
-    }
-
-    pub fn byte_len(&self) -> usize {
-        self.data.len()
-    }
-}
+pub use crate::font::{
+    MAX_MEMORY_SUBTITLE_FONT_BYTES, MAX_MEMORY_SUBTITLE_FONT_TOTAL_BYTES, SubtitleFontAttachment,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssTrackResources {
@@ -1631,8 +1604,8 @@ impl LibassSubtitleRenderer {
         );
     }
 
-    /// Height the override metrics are normalized against, which must be the
-    /// height the frame is rendered at — not the script's own `PlayResY`. libass
+    /// Logical height the override metrics are normalized against: the video's
+    /// height before subtitle supersampling, not the script's own `PlayResY`. libass
     /// scales the override style by `PlayResY / 288`, and cancelling that against
     /// the frame height is what makes the metrics land on the same pixels as the
     /// non-override baseline whatever `PlayResY` a script declares.

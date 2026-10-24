@@ -81,6 +81,16 @@ fn main() -> Result<()> {
 
     match args.remove(0).as_str() {
         "deps" => deps(args),
+        "web" => {
+            if args.first().map(String::as_str) != Some("build") {
+                bail!("usage: cargo run -p xtask -- web build [--skip-native]");
+            }
+            let root = workspace_root()?;
+            run(Command::new("python3")
+                .arg(root.join("scripts/build_web.py"))
+                .args(&args[1..])
+                .current_dir(root))
+        }
         "pkg-config-shim" => pkg_config_shim(args),
         "check" => check(args),
         "help" | "--help" | "-h" => {
@@ -5470,6 +5480,7 @@ mod tests {
 
 fn print_help() {
     println!("Erika xtask");
+    println!("  cargo run -p xtask -- web build [--skip-native]");
     println!("  cargo run -p xtask -- deps plan --profile lgpl");
     println!("  cargo run -p xtask -- deps fetch --profile lgpl [--all]");
     println!("  cargo run -p xtask -- deps status --profile lgpl");

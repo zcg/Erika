@@ -2,6 +2,12 @@
 
 > Translations: [中文](building.zh.md) · [日本語](building.ja.md)
 
+For browsers, use `cargo run -p xtask -- web build` from current source and
+follow the [Web build and deployment guide](web.md). That entry point builds
+the Rust danmaku engine, libass and FFmpeg demuxer into a complete JS/WASM
+package; audio/video decoding uses WebCodecs. The steps below cover native
+platform dependencies and builds.
+
 liberika is a Rust workspace that links a set of **statically built native
 dependencies** (FFmpeg, dav1d for AV1 software decode on every target, and optionally
 the libass subtitle stack). Those native libraries are not vendored — you build them once with the `xtask` orchestrator,

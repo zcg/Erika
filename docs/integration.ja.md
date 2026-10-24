@@ -61,6 +61,20 @@ Apple platform では Metal、Android を含む compute-capable Vulkan/wgpu adap
 wgpu、Windows では D3D11 compute が実行します。compute 非対応 backend（主に GLES 3.0）は
 native luma sampling を維持し、`Inactive` status と fallback reason を明示します。
 
+### 字幕・弾幕の高画質設定の既定値
+
+ネイティブ presenter では、Web backend と同様に字幕と弾幕のスーパーサンプリングが
+既定で有効です。テキスト字幕と弾幕の字形を 2 倍の解像度で描画し、表示サイズ、
+レイアウト、映像の解像度は維持します。Rust ホストでは
+`PresenterRuntime::set_subtitle_supersampling(false)` と
+`DanmakuLayoutConfig { supersampling: false, ..Default::default() }` で個別に無効化できます。
+後者は `PresenterRuntime::set_danmaku_config` で適用します。
+
+ネイティブ字幕の既存の性能制限は維持されます。元のキャンバスの幅または高さが
+2048 ピクセルを超える場合、または面積が 2048 × 1080 ピクセルを超える場合は、
+元の解像度を使います。60 回の字幕描画の平均処理時間が 4 ms を超えると、
+現在のメディアでは元の解像度に戻ります。128 px より大きい弾幕の字形も元の解像度を使います。
+
 ## 4. surface を attach する
 
 liberika は所有する surface に直接描画します。幅・高さは**物理ピクセル**、`scale` は

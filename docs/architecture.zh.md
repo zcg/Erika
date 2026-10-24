@@ -4,6 +4,11 @@
 
 liberika 是一个可嵌入的 Rust 媒体播放库。宿主应用可以通过 Rust API、C ABI (`erika_capi`) 或 Flutter 绑定 (`erika_flutter`) 调用它。视频帧、字幕和弹幕都留在引擎内部，并在渲染器里合成，原生 surface 直接呈现，Flutter texture 交给宿主合成。
 
+浏览器通过 JavaScript / TypeScript `Player` 接入：[Web 后端](web.zh.md) 在 WASM
+中复用 Rust 弹幕和补丁版 libass，使用 FFmpeg 解封装并读取 MKV 字体附件，
+WebCodecs、Web Audio 和 WebGL2 分别提供解码、播放时钟及最终合成。Erika Web
+已采用这条路径。下文概览描述原生运行时；浏览器的 Worker 数据流和生命周期见 Web 指南。
+
 ## 系统概览
 
 ```text

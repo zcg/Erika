@@ -1,3 +1,6 @@
+mod danmaku;
+use danmaku::{DanmakuBatch, DanmakuBatchGlyph, DanmakuBatchInstance};
+
 use std::ffi::c_void;
 use std::mem;
 use std::ptr::NonNull;
@@ -1535,6 +1538,7 @@ impl MetalRendererImpl {
         let sampler = self.video_sampler_state()?;
         let viewport_width = overlay.frame.viewport.width;
         let viewport_height = overlay.frame.viewport.height;
+        let layout = layout.with_source_size(viewport_width, viewport_height);
         for plane in &overlay.frame.subtitle_planes {
             let texture = self.create_overlay_texture(
                 plane.width as usize,
@@ -1786,28 +1790,26 @@ impl MetalRendererImpl {
                 1,
             );
         }
-        let shadow_count = plan
-            .items
-            .iter()
-            .filter(|item| item.shadow_rgba[3] > 0.0)
-            .count();
-        let outline_count = plan
-            .items
-            .iter()
-            .filter(|item| item.outline_rgba[3] > 0.0)
-            .count();
-        let effect_count = shadow_count
-            .checked_add(outline_count)
-            .ok_or_else(|| PlayerError::Renderer("danmaku instance count overflow".to_string()))?;
-        let fill_count = plan.items.len();
-        let total_instances = effect_count
-            .checked_add(fill_count)
-            .ok_or_else(|| PlayerError::Renderer("danmaku instance count overflow".to_string()))?;
-        let total_bytes = instance_bytes_len(total_instances)?;
+        let batch = DanmakuBatch::new(&plan.items);
+        let total_instances = batch.instances.len();
+        if total_instances == 0 {
+            return Ok(());
+        }
+        let glyph_offset = total_instances * mem::size_of::<DanmakuBatchInstance>();
+        let total_bytes = glyph_offset + batch.glyphs.len() * mem::size_of::<DanmakuBatchGlyph>();
         self.stats.last_danmaku_vertex_bytes = total_bytes;
         self.stats.last_danmaku_vertex_count = total_instances;
         let buffer = self.acquire_danmaku_vertex_buffer(total_bytes, command_buffer)?;
-        write_danmaku_instances_direct(&buffer, plan, total_instances)?;
+        unsafe {
+            let dst = buffer.contents().as_ptr().cast::<u8>();
+            std::ptr::copy_nonoverlapping(batch.instances.as_ptr().cast::<u8>(), dst, glyph_offset);
+            std::ptr::copy_nonoverlapping(
+                batch.glyphs.as_ptr().cast::<u8>(),
+                dst.add(glyph_offset),
+                total_bytes - glyph_offset,
+            );
+            encoder.setFragmentBuffer_offset_atIndex(Some(&buffer), glyph_offset, 2);
+        }
         self.stats.last_danmaku_vertex_build_duration = build_started.elapsed();
         self.stats.last_danmaku_vertex_copy_duration = Duration::ZERO;
 
@@ -2662,31 +2664,6 @@ struct DanmakuBatchUniforms {
     ui_nits: [f32; 4],
 }
 
-const DANMAKU_FILL_ATLAS_TEXTURE: u32 = 0;
-const DANMAKU_OUTLINE_ATLAS_TEXTURE: u32 = 1;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct DanmakuBatchInstance {
-    rect: [f32; 4],
-    tex_rect: [f32; 4],
-    color: [f32; 4],
-    atlas_texture: u32,
-    _reserved0: [u32; 3],
-}
-
-impl DanmakuBatchInstance {
-    fn new(rect: [f32; 4], tex_rect: [f32; 4], color: [f32; 4], atlas_texture: u32) -> Self {
-        Self {
-            rect,
-            tex_rect,
-            color,
-            atlas_texture,
-            _reserved0: [0; 3],
-        }
-    }
-}
-
 impl OverlayUniforms {
     fn from_plane(
         x: i32,
@@ -2754,114 +2731,6 @@ fn overlay_uniform_pointer(uniforms: &OverlayUniforms) -> NonNull<c_void> {
             .cast_mut(),
     )
     .expect("overlay uniform pointer is non-null")
-}
-
-fn instance_bytes_len(instance_count: usize) -> Result<usize> {
-    instance_count
-        .checked_mul(mem::size_of::<DanmakuBatchInstance>())
-        .ok_or_else(|| PlayerError::Renderer("danmaku batch instance buffer overflow".to_string()))
-}
-
-fn write_danmaku_instances_direct(
-    buffer: &ProtocolObject<dyn MTLBuffer>,
-    plan: &DanmakuRenderPlan,
-    total_instances: usize,
-) -> Result<()> {
-    if total_instances == 0 {
-        return Ok(());
-    }
-    let byte_len = instance_bytes_len(total_instances)?;
-    let end = byte_len;
-    if end > buffer.length() {
-        return Err(PlayerError::Renderer(
-            "danmaku instance buffer too small".to_string(),
-        ));
-    }
-    unsafe {
-        let dst = buffer.contents().as_ptr() as *mut DanmakuBatchInstance;
-        let mut write_index = 0usize;
-        let written = for_each_ordered_danmaku_instance(&plan.items, |instance| {
-            dst.add(write_index).write(instance);
-            write_index += 1;
-        });
-        debug_assert_eq!(written, total_instances);
-        debug_assert_eq!(write_index, total_instances);
-    }
-    Ok(())
-}
-
-fn for_each_ordered_danmaku_instance(
-    items: &[crate::danmaku::DanmakuGlyphInstance],
-    mut emit: impl FnMut(DanmakuBatchInstance),
-) -> usize {
-    // Scanning for the next different `item_id` only yields whole danmaku
-    // while each item's glyphs stay contiguous: one run per distinct item. If
-    // that ever stops holding, items silently split into several groups and
-    // the shadow/outline/fill layering breaks again with no other symptom.
-    debug_assert_eq!(
-        items
-            .windows(2)
-            .filter(|pair| pair[0].item_id != pair[1].item_id)
-            .count()
-            + usize::from(!items.is_empty()),
-        items
-            .iter()
-            .map(|item| item.item_id)
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        "danmaku glyph instances must stay grouped by item_id"
-    );
-
-    let mut emitted = 0usize;
-    let mut group_start = 0usize;
-    while group_start < items.len() {
-        let item_id = items[group_start].item_id;
-        let group_end = items[group_start..]
-            .iter()
-            .position(|item| item.item_id != item_id)
-            .map_or(items.len(), |offset| group_start + offset);
-        let group = &items[group_start..group_end];
-
-        // Preserve danmaku z-order as complete visual units. Drawing every
-        // outline on the surface before every fill lets a lower item's fill
-        // erase the upper item's edge where they overlap.
-        for item in group {
-            if item.shadow_rgba[3] > 0.0 {
-                let mut rect = item.rect;
-                rect[0] += item.shadow_offset[0];
-                rect[1] += item.shadow_offset[1];
-                emit(DanmakuBatchInstance::new(
-                    rect,
-                    item.tex_rect,
-                    item.shadow_rgba,
-                    DANMAKU_OUTLINE_ATLAS_TEXTURE,
-                ));
-                emitted += 1;
-            }
-        }
-        for item in group {
-            if item.outline_rgba[3] > 0.0 {
-                emit(DanmakuBatchInstance::new(
-                    item.rect,
-                    item.tex_rect,
-                    item.outline_rgba,
-                    DANMAKU_OUTLINE_ATLAS_TEXTURE,
-                ));
-                emitted += 1;
-            }
-        }
-        for item in group {
-            emit(DanmakuBatchInstance::new(
-                item.rect,
-                item.tex_rect,
-                item.color_rgba,
-                DANMAKU_FILL_ATLAS_TEXTURE,
-            ));
-            emitted += 1;
-        }
-        group_start = group_end;
-    }
-    emitted
 }
 
 fn draw_danmaku_instance_batch(
@@ -3875,19 +3744,27 @@ struct DanmakuBatchUniforms {
 
 struct DanmakuBatchInstance {
     float4 rect;
+    uint glyph_start;
+    uint glyph_count;
+    float opacity;
+    uint reserved;
+};
+
+struct DanmakuBatchGlyph {
+    float4 rect;
     float4 tex_rect;
     float4 color;
-    uint atlas_texture;
-    uint reserved0;
-    uint reserved1;
-    uint reserved2;
+    float4 outline;
+    float4 shadow;
+    float4 shadow_offset;
 };
 
 struct DanmakuBatchOut {
     float4 position [[position]];
-    float2 tex_coord;
-    float4 color;
-    uint atlas_texture [[flat]];
+    float2 pixel_position;
+    uint glyph_start [[flat]];
+    uint glyph_count [[flat]];
+    float opacity [[flat]];
 };
 
 vertex DanmakuBatchOut erika_danmaku_batch_vertex(
@@ -3896,27 +3773,35 @@ vertex DanmakuBatchOut erika_danmaku_batch_vertex(
     constant DanmakuBatchInstance* instances [[buffer(0)]],
     constant DanmakuBatchUniforms& uniforms [[buffer(1)]]) {
     constexpr float2 corners[6] = {
-        float2(0.0, 0.0),
-        float2(1.0, 0.0),
-        float2(0.0, 1.0),
-        float2(1.0, 0.0),
-        float2(1.0, 1.0),
-        float2(0.0, 1.0),
+        float2(0.0, 0.0), float2(1.0, 0.0), float2(0.0, 1.0),
+        float2(1.0, 0.0), float2(1.0, 1.0), float2(0.0, 1.0),
     };
-    DanmakuBatchInstance glyph = instances[instance_id];
-    float2 corner = corners[vertex_id];
-    float2 position = glyph.rect.xy + corner * glyph.rect.zw;
-    float2 tex_coord = glyph.tex_rect.xy + corner * glyph.tex_rect.zw;
-    float2 ndc = float2(
-        position.x / max(uniforms.viewport.x, 1.0) * 2.0 - 1.0,
-        1.0 - position.y / max(uniforms.viewport.y, 1.0) * 2.0
-    );
+    DanmakuBatchInstance strip = instances[instance_id];
+    float2 position = strip.rect.xy + corners[vertex_id] * strip.rect.zw;
     DanmakuBatchOut out;
-    out.position = float4(ndc, 0.0, 1.0);
-    out.tex_coord = tex_coord;
-    out.color = glyph.color;
-    out.atlas_texture = glyph.atlas_texture;
+    out.position = float4(
+        position.x / max(uniforms.viewport.x, 1.0) * 2.0 - 1.0,
+        1.0 - position.y / max(uniforms.viewport.y, 1.0) * 2.0, 0.0, 1.0);
+    out.pixel_position = position;
+    out.glyph_start = strip.glyph_start;
+    out.glyph_count = strip.glyph_count;
+    out.opacity = strip.opacity;
     return out;
+}
+
+float danmaku_mask(texture2d<float, access::sample> atlas, sampler atlas_sampler,
+                   float2 position, float4 rect, float4 tex_rect) {
+    float2 local = (position - rect.xy) / max(rect.zw, float2(0.0001));
+    if (any(local < 0.0) || any(local >= 1.0)) return 0.0;
+    return atlas.sample(atlas_sampler, tex_rect.xy + local * tex_rect.zw).r;
+}
+
+float4 danmaku_layer_over(float4 below, float4 color, float mask,
+                         constant DanmakuBatchUniforms& uniforms) {
+    float alpha = color.a * mask;
+    if (alpha <= 0.0) return below;
+    float3 rgb = sdr_ui_color_to_target_output(color.rgb, uniforms.target_transfer, uniforms.ui_nits);
+    return float4(rgb * alpha, alpha) + below * (1.0 - alpha);
 }
 
 fragment float4 erika_danmaku_batch_fragment(
@@ -3924,17 +3809,32 @@ fragment float4 erika_danmaku_batch_fragment(
     texture2d<float, access::sample> fill_atlas [[texture(0)]],
     texture2d<float, access::sample> outline_atlas [[texture(1)]],
     sampler atlas_sampler [[sampler(0)]],
-    constant DanmakuBatchUniforms& uniforms [[buffer(1)]]) {
-    float mask = in.atlas_texture == 0
-        ? fill_atlas.sample(atlas_sampler, in.tex_coord).r
-        : outline_atlas.sample(atlas_sampler, in.tex_coord).r;
-    float3 rgb = sdr_ui_color_to_target_output(
-        in.color.rgb,
-        uniforms.target_transfer,
-        uniforms.ui_nits
-    );
-    return float4(rgb, in.color.a * mask);
+    constant DanmakuBatchUniforms& uniforms [[buffer(1)]],
+    const device DanmakuBatchGlyph* glyphs [[buffer(2)]]) {
+    float4 fill = 0.0, outline = 0.0, shadow = 0.0;
+    // Strips do not overlap within a comment. Only neighboring glyphs whose
+    // effects cross this strip are visited, in original text order. This
+    // preserves the union of adjacent glyphs and prevents repeated opacity
+    // at glyph boundaries without a temporary full-screen texture.
+    for (uint i = in.glyph_start; i < in.glyph_start + in.glyph_count; ++i) {
+        DanmakuBatchGlyph glyph = glyphs[i];
+        float f = danmaku_mask(fill_atlas, atlas_sampler, in.pixel_position, glyph.rect, glyph.tex_rect);
+        float o = danmaku_mask(outline_atlas, atlas_sampler, in.pixel_position, glyph.rect, glyph.tex_rect);
+        fill = danmaku_layer_over(fill, glyph.color, f, uniforms);
+        outline = danmaku_layer_over(outline, glyph.outline, o, uniforms);
+        if (glyph.shadow.a > 0.0) {
+            float s = danmaku_mask(outline_atlas, atlas_sampler,
+                in.pixel_position - glyph.shadow_offset.xy, glyph.rect, glyph.tex_rect);
+            shadow = danmaku_layer_over(shadow, glyph.shadow, s, uniforms);
+        }
+    }
+    float4 composed = fill + (outline + shadow * (1.0 - outline.a)) * (1.0 - fill.a);
+    if (composed.a <= 0.0) discard_fragment();
+    // The pipeline uses straight-alpha blending. RGB is unpremultiplied
+    // here; the complete comment's opacity affects alpha exactly once.
+    return float4(composed.rgb / max(composed.a, 0.000001), composed.a * in.opacity);
 }
+
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -4061,12 +3961,8 @@ fn create_plane_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DANMAKU_FILL_ATLAS_TEXTURE, DANMAKU_OUTLINE_ATLAS_TEXTURE, DanmakuBatchInstance,
-        VIDEO_SHADER_SOURCE, for_each_ordered_danmaku_instance, metal_pixel_format, ui_output_nits,
-    };
+    use super::{VIDEO_SHADER_SOURCE, metal_pixel_format, ui_output_nits};
     use crate::core::{ColorPrimaries, TransferFunction};
-    use crate::danmaku::DanmakuGlyphInstance;
     use crate::renderer::metal::MetalDrawablePixelFormat;
     use crate::renderer::pipeline::TargetColorState;
     use objc2_metal::MTLPixelFormat;
@@ -4345,65 +4241,6 @@ mod tests {
             std::mem::offset_of!(super::DanmakuBatchUniforms, ui_nits),
             16
         );
-    }
-
-    #[test]
-    fn danmaku_batch_instances_keep_each_item_effects_below_its_fill() {
-        fn glyph(
-            item_id: u64,
-            fill_marker: f32,
-            outline_marker: f32,
-            shadow_marker: f32,
-        ) -> DanmakuGlyphInstance {
-            DanmakuGlyphInstance {
-                item_id,
-                rect: [0.0, 0.0, 10.0, 10.0],
-                tex_rect: [0.0, 0.0, 1.0, 1.0],
-                color_rgba: [fill_marker, 0.0, 0.0, 1.0],
-                outline_rgba: [outline_marker, 0.0, 0.0, 1.0],
-                shadow_rgba: [shadow_marker, 0.0, 0.0, 1.0],
-                shadow_offset: [1.0, 1.0],
-            }
-        }
-
-        let items = [
-            glyph(1, 0.13, 0.12, 0.11),
-            glyph(1, 0.23, 0.22, 0.21),
-            glyph(2, 0.33, 0.32, 0.31),
-        ];
-        let mut order = Vec::new();
-        let count = for_each_ordered_danmaku_instance(&items, |instance| {
-            order.push((instance.atlas_texture, instance.color[0]));
-        });
-
-        assert_eq!(count, 9);
-        assert_eq!(
-            order,
-            vec![
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.11),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.21),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.12),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.22),
-                (DANMAKU_FILL_ATLAS_TEXTURE, 0.13),
-                (DANMAKU_FILL_ATLAS_TEXTURE, 0.23),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.31),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.32),
-                (DANMAKU_FILL_ATLAS_TEXTURE, 0.33),
-            ]
-        );
-    }
-
-    #[test]
-    fn danmaku_batch_instance_and_shader_texture_selector_stay_aligned() {
-        assert_eq!(std::mem::size_of::<DanmakuBatchInstance>(), 64);
-        assert_eq!(
-            std::mem::offset_of!(DanmakuBatchInstance, atlas_texture),
-            48
-        );
-        assert!(VIDEO_SHADER_SOURCE.contains("uint atlas_texture;"));
-        assert!(VIDEO_SHADER_SOURCE.contains("fill_atlas [[texture(0)]]"));
-        assert!(VIDEO_SHADER_SOURCE.contains("outline_atlas [[texture(1)]]"));
-        assert!(VIDEO_SHADER_SOURCE.contains("out.atlas_texture = glyph.atlas_texture;"));
     }
 
     #[test]

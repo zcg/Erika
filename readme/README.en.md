@@ -15,6 +15,14 @@ The host application provides a rendering surface and sends playback commands â€
 
 Current release: **0.2.1**. Start with the [documentation index](../docs/README.md).
 
+**Play MKV in the browser with its ASS subtitles and attached fonts.** The current
+source includes a [Web / WASM backend](../docs/web.md), integrated into Erika Web.
+WebCodecs decodes audio/video; libass in WASM renders subtitle fonts, positioning,
+outlines and effects; Rust danmaku and subtitles share the playback clock and
+WebGL2 compositor. Sites can keep their own UI and serve the original file with
+HTTP Range, without first extracting subtitles or burning them into video on
+the server.
+
 ## Features
 
 - Hardware decoding with software fallback: VideoToolbox, D3D11VA, MediaCodec, AVCodec, and experimental Linux NVDEC / VA-API.
@@ -22,11 +30,13 @@ Current release: **0.2.1**. Start with the [documentation index](../docs/README.
 - Local files and HTTP(S), custom headers, background read-ahead and a bounded rewind cache.
 - Audio-master synchronization, pause, seek, playback rate, media tracks and external subtitles.
 - Rust, C ABI, Flutter, SwiftPM and native OpenHarmony ArkTS integration.
+- Browser JavaScript / TypeScript integration: MKV demuxing, ASS font attachments, unified subtitle/danmaku composition and independent text supersampling.
 
 ## Integration
 
 | Host | Install / entry point | Guide |
 |---|---|---|
+| Browser / JavaScript / TypeScript | `cargo run -p xtask -- web build` from current source | [Web integration and deployment](../docs/web.md) |
 | Flutter | `flutter pub add erika_flutter` (0.2.1) | [Plugin guide](../packages/erika_flutter/README.md) |
 | Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode, from 0.2.1 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
@@ -36,6 +46,20 @@ Current release: **0.2.1**. Start with the [documentation index](../docs/README.
 
 As of 2026-10-02, OHPM serves 0.1.9; 0.2.1 has been submitted for review.
 Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.2.1).
+
+### Browser
+
+```sh
+# Install Emscripten, wasm-bindgen and the other build prerequisites first.
+cargo run -p xtask -- web build
+python3 scripts/serve_web.py
+```
+
+Open `http://127.0.0.1:18765` for the demo. Deploy the runtime from `target/web/`
+and use `Player.create({ canvas })` and `player.open(fileOrURL)` in your own UI.
+The Web build is available in current source and has not been published to npm.
+Audio/video codecs depend on browser WebCodecs support. See the [browser guide](../docs/web.md)
+for prerequisites, a complete example and the Erika integration.
 
 ### Flutter
 
@@ -84,9 +108,12 @@ subscriptions; `PresenterRuntime` owns rendering and audio. C hosts use
 | Android 8+ | MediaCodec / software | wgpu Vulkan / GLES | AAudio | Four ABI bundles, Flutter |
 | OpenHarmony API 18+ | AVCodec / software | wgpu | OHAudio | arm64 bundle, Flutter, OHPM |
 | Linux (experimental) | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust, C ABI and Flutter source builds |
+| Browser | WebCodecs | WebGL2 / Canvas | Web Audio | JS / WASM package built from current source |
 
 The [platform matrix](../docs/platform_matrix.zh.md) summarizes surface and HDR
-paths. Web has no playback backend yet.
+paths. The browser backend currently outputs SDR and has been verified in Chrome.
+It requires HTTPS or localhost, WebCodecs video/audio decoding, OffscreenCanvas,
+WebGL2 and Web Audio.
 
 ## Development
 
@@ -109,8 +136,9 @@ See [building](../docs/building.md), [releasing](../docs/releasing.md) and
 | `crates/erika_ffmpeg_sys` | FFmpeg bindings |
 | `packages/erika_flutter` | Flutter plugin |
 | `packages/erika_ohos` | OpenHarmony ArkTS SDK |
-| `examples` | Native, Flutter and ArkTS examples |
-| `xtask` | Native dependency builds |
+| `packages/erika_web` | Browser Player, Worker, WebGL2 compositor and TypeScript types |
+| `examples` | Native, Flutter, ArkTS and browser player examples |
+| `xtask` | Native dependencies and complete Web package builds |
 | `docs` | Guides and design; historical investigation and validation records in `investigations/` |
 
 Version history: [CHANGELOG](../CHANGELOG.md).

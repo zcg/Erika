@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::core::{ColorPrimaries, FrameRate, TrackInfo, TrackKind, TransferFunction, VideoParams};
+use crate::core::{
+    ChapterInfo, ColorPrimaries, FrameRate, TrackInfo, TrackKind, TransferFunction, VideoParams,
+};
 use crate::renderer::pipeline::{
     Chromaticity, ColorRange, ContentLightMetadata, DoviComponentCurve, DoviFramePq,
     DoviSourceMetadata, HdrMetadata, MasteringDisplayMetadata, MatrixCoefficients, RgbMatrix,
@@ -197,6 +199,7 @@ pub struct MediaProbe {
     pub uri: String,
     pub duration: Option<Duration>,
     pub tracks: Vec<TrackInfo>,
+    pub chapters: Vec<ChapterInfo>,
     pub video: Vec<VideoProbe>,
     pub audio: Vec<AudioProbe>,
     pub subtitles: Vec<SubtitleTrackConfig>,
@@ -5128,6 +5131,7 @@ fn inspect_format_context(
             uri: uri.to_string(),
             duration,
             tracks,
+            chapters: inspect_chapters(raw, duration),
             video,
             audio,
             subtitles,
@@ -5135,6 +5139,62 @@ fn inspect_format_context(
         },
         stream_time_bases,
     )
+}
+
+/// Read once from the already-open demuxer, without another probe or IO.
+fn inspect_chapters(
+    raw: *const sys::AVFormatContext,
+    duration: Option<Duration>,
+) -> Vec<ChapterInfo> {
+    let origin = format_timeline_origin_micros(raw);
+    let mut chapters = Vec::new();
+    let count = unsafe { (*raw).nb_chapters as usize };
+    let entries = unsafe { (*raw).chapters };
+    if entries.is_null() {
+        return chapters;
+    }
+    for index in 0..count {
+        let entry = unsafe { *entries.add(index) };
+        if entry.is_null() {
+            continue;
+        }
+        let entry = unsafe { &*entry };
+        if entry.time_base.num <= 0 || entry.time_base.den <= 0 || entry.start == i64::MIN {
+            continue;
+        }
+        let time = |value| {
+            let micros = unsafe {
+                sys::av_rescale_q(
+                    value,
+                    entry.time_base,
+                    sys::AVRational {
+                        num: 1,
+                        den: 1_000_000,
+                    },
+                )
+            };
+            Duration::from_micros(micros.saturating_sub(origin).max(0) as u64)
+        };
+        let start = time(entry.start);
+        if duration.is_some_and(|duration| start >= duration) {
+            continue;
+        }
+        let end = (entry.end != i64::MIN && entry.end > entry.start)
+            .then(|| time(entry.end))
+            .map(|end| duration.map_or(end, |duration| end.min(duration)))
+            .filter(|end| *end > start);
+        chapters.push(ChapterInfo {
+            title: metadata_value(entry.metadata, "title")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            start,
+            end,
+        });
+    }
+    chapters.sort_by_key(|chapter| chapter.start);
+    chapters.dedup_by_key(|chapter| chapter.start);
+    chapters
 }
 
 fn infer_single_video_bit_rate(tracks: &mut [TrackInfo], container_bit_rate: Option<u64>) {
@@ -6842,6 +6902,51 @@ mod tests {
         assert_eq!((video.width, video.height), (160, 90));
         assert_eq!(video.bit_rate, None);
         assert_eq!(video.frame_rate, FrameRate::new(30, 1));
+    }
+
+    #[test]
+    fn chapters_use_container_time_bases_and_the_playback_origin() {
+        let mut first: sys::AVChapter = unsafe { mem::zeroed() };
+        first.time_base = sys::AVRational { num: 1, den: 1000 };
+        first.start = 15_000;
+        first.end = 35_000;
+        unsafe {
+            sys::av_dict_set(&mut first.metadata, c"title".as_ptr(), c"OP".as_ptr(), 0);
+        }
+        let mut last: sys::AVChapter = unsafe { mem::zeroed() };
+        last.time_base = sys::AVRational { num: 1, den: 1 };
+        last.start = 95;
+        last.end = 120;
+        let mut invalid: sys::AVChapter = unsafe { mem::zeroed() };
+        invalid.time_base = sys::AVRational { num: 1, den: 0 };
+        let mut entries = [
+            &mut last as *mut _,
+            &mut invalid as *mut _,
+            &mut first as *mut _,
+        ];
+        let mut context: sys::AVFormatContext = unsafe { mem::zeroed() };
+        context.start_time = 5_000_000;
+        context.chapters = entries.as_mut_ptr();
+        context.nb_chapters = entries.len() as u32;
+        let chapters = inspect_chapters(&context, Some(Duration::from_secs(100)));
+        unsafe {
+            sys::av_dict_free(&mut first.metadata);
+        }
+        assert_eq!(
+            chapters,
+            vec![
+                ChapterInfo {
+                    title: "OP".into(),
+                    start: Duration::from_secs(10),
+                    end: Some(Duration::from_secs(30))
+                },
+                ChapterInfo {
+                    title: String::new(),
+                    start: Duration::from_secs(90),
+                    end: Some(Duration::from_secs(100))
+                },
+            ]
+        );
     }
 
     #[test]

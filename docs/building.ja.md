@@ -2,6 +2,11 @@
 
 > 翻訳：[English](building.md) · [中文](building.zh.md)
 
+ブラウザー向けには現在のソースで `cargo run -p xtask -- web build` を使います。
+[Web ビルド・配信ガイド（英語）](web.md) を参照してください。Rust 弾幕エンジン、
+libass、FFmpeg demuxer を含む JS/WASM パッケージを一括ビルドし、音声・映像は
+WebCodecs でデコードします。以下はネイティブプラットフォームの依存とビルド手順です。
+
 liberika は一連の**静的ビルドされたネイティブ依存**（FFmpeg、全ターゲット向け dav1d AV1
 ソフトウェアフォールバック、オプションの libass 字幕スタック）をリンクする Rust workspace です。これらのネイティブライブラリは vendoring
 されていません——`xtask` オーケストレータで一度ビルドすると `third_party/dist/` 配下に

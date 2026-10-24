@@ -60,6 +60,20 @@ impl PresentationLayout {
         }
     }
 
+    /// Map a different raster coordinate space into the same displayed video
+    /// rectangle, including its letterboxing and any custom aspect ratio.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "ios", target_os = "tvos")),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_source_size(self, width: u32, height: u32) -> Self {
+        Self {
+            source_width: width.max(1) as f32,
+            source_height: height.max(1) as f32,
+            ..self
+        }
+    }
+
     #[cfg_attr(
         not(any(target_os = "macos", target_os = "ios", target_os = "tvos")),
         allow(dead_code)
@@ -138,6 +152,17 @@ mod tests {
         assert!(PresentationLayout::aspect_fit(1920, 1080, 3840, 2160).is_source_upscaled());
         assert!(!PresentationLayout::aspect_fit(1920, 1080, 1920, 1080).is_source_upscaled());
         assert!(!PresentationLayout::aspect_fit(1920, 1080, 1000, 1000).is_source_upscaled());
+    }
+
+    #[test]
+    fn supersampled_subtitles_keep_their_displayed_size_and_position() {
+        let video = PresentationLayout::aspect_fit(1920, 1080, 1000, 1000);
+        let subtitles = video.with_source_size(3840, 2160);
+        assert_eq!(subtitles.target_rect, video.target_rect);
+        assert_rect_close(
+            subtitles.map_source_rect(1200.0, 1920.0, 1440.0, 120.0),
+            video.map_source_rect(600.0, 960.0, 720.0, 60.0),
+        );
     }
 
     #[test]

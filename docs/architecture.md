@@ -7,6 +7,13 @@ the engine through the Rust API, a C ABI (`erika_capi`), or Flutter bindings
 (`erika_flutter`). Video frames, subtitles, and danmaku stay inside the engine
 and are composited in the renderer — they do not flow through the host.
 
+The [browser backend](web.md) exposes a JavaScript/TypeScript `Player`. It
+reuses Rust danmaku and patched libass in WASM, with FFmpeg container demuxing
+and MKV font attachments; WebCodecs, Web Audio and WebGL2 provide decoding,
+the media clock and final composition. Erika Web uses this path. The overview
+below describes the native runtime; the browser guide documents its Worker
+pipeline and lifecycle.
+
 ## System Overview
 
 ```text
